@@ -1,0 +1,15 @@
+{
+  "id": "browser_relay",
+  "name": "Browser Relay",
+  "version": "0.1.0",
+  "description": "Local Chrome extension relay for agent-flow browser automation.",
+  "routes": [
+    "/v1/browser_relay/config",
+    "/v1/browser_relay/command",
+    "/v1/browser_relay/next",
+    "/v1/browser_relay/result",
+    "/v1/browser_relay/result/{command_id}",
+    "/v1/browser_relay/status"
+  ]
+}
+

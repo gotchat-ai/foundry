@@ -1,0 +1,10 @@
+{
+  "id": "model_loader.model_deck",
+  "name": "Model Deck Loader",
+  "version": "0.2.0",
+  "description": "Schema-driven deck loader + local loader stubs for diffusers/video/3d.",
+  "dependencies": [
+    "model_deck",
+    "model_loader.gguf"
+  ]
+}

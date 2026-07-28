@@ -1,0 +1,7 @@
+{
+  "id": "setup_wizard",
+  "name": "Setup Wizard",
+  "kind": "plugin",
+  "description": "Guided onboarding for admins to configure domains, runtimes, and starter models.",
+  "path": "./plugins/setup_wizard/plugin.js"
+}

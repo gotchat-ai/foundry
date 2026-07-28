@@ -1,0 +1,3 @@
+This is a synthetic project note used for Agent Workflow skill testing.
+It contains no personal data and no real credentials.
+The note references a made-up document processing task for a fictional system.

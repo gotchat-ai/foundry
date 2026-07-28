@@ -1,0 +1,10 @@
+{
+  "id": "theme_demo_helper",
+  "name": "Theme Demo Helper",
+  "type": "control",
+  "gui_plugin_id": "theme_demo",
+  "description": "Shared admin theme defaults for the Theme Demo GUI plugin.",
+  "routes": [
+    "/v1/theme_demo/default_theme"
+  ]
+}

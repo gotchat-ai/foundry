@@ -1,0 +1,180 @@
+{
+  "recommended_loader_id": "model_loader.model_deck.vlm",
+  "fields": [
+    {
+      "key": "model_path",
+      "type": "path",
+      "required": true,
+      "label": "VLM GGUF model path"
+    },
+    {
+      "key": "mmproj_path",
+      "type": "path",
+      "required": true,
+      "label": "MMProj / vision proj path"
+    },
+    {
+      "key": "chat_handler",
+      "type": "enum",
+      "choices": [
+        "auto",
+        "llava_15",
+        "qwen25vl",
+        "qwen3vl"
+      ],
+      "default": "auto",
+      "label": "Chat handler"
+    },
+    {
+      "key": "image_detail",
+      "type": "enum",
+      "choices": [
+        "low",
+        "high",
+        "auto"
+      ],
+      "default": "auto",
+      "label": "Vision detail"
+    },
+    {
+      "key": "image_min_tokens",
+      "type": "int",
+      "default": 0,
+      "label": "Image min tokens (0=default)"
+    },
+    {
+      "key": "n_ctx",
+      "type": "int",
+      "default": 8192,
+      "label": "Context length"
+    },
+    {
+      "key": "n_gpu_layers",
+      "type": "int",
+      "default": -1,
+      "label": "GPU layers (-1=auto)"
+    },
+    {
+      "key": "n_gpu_layers_offset",
+      "type": "int",
+      "default": 0,
+      "label": "GPU layers offset (CPU layers)"
+    },
+    {
+      "key": "backend_mode",
+      "type": "enum",
+      "default": "embedded",
+      "choices": [
+        { "value": "embedded", "label": "Embedded GGUF" },
+        { "value": "llama_server", "label": "llama.cpp Server" }
+      ],
+      "label": "Backend mode"
+    },
+    {
+      "key": "llama_server_url",
+      "type": "text",
+      "default": "",
+      "label": "llama-server URL (optional)"
+    },
+    {
+      "key": "llama_server_managed_id",
+      "type": "text",
+      "default": "",
+      "label": "Managed llama-server id (optional)"
+    },
+    {
+      "key": "main_gpu",
+      "type": "int",
+      "default": 0,
+      "label": "Main GPU device id (0=default)"
+    },
+    {
+      "key": "gpu_selection_mode",
+      "type": "enum",
+      "default": "auto",
+      "choices": [
+        { "value": "auto", "label": "Auto GPU placement" },
+        { "value": "single", "label": "Single GPU only" },
+        { "value": "split", "label": "Split across GPUs" }
+      ],
+      "label": "GPU selection mode"
+    },
+    {
+      "key": "gpu_split_mode",
+      "type": "enum",
+      "default": "layer",
+      "choices": [
+        { "value": "layer", "label": "Layer split (recommended)" },
+        { "value": "row", "label": "Row split" },
+        { "value": "none", "label": "Disable split mode" }
+      ],
+      "label": "GPU split mode"
+    },
+    {
+      "key": "gpu_split_devices",
+      "type": "text",
+      "default": "",
+      "label": "Split GPU device ids (e.g. 0,1)"
+    },
+    {
+      "key": "gpu_split_percent",
+      "type": "text",
+      "default": "",
+      "label": "Split percentages (e.g. 70,30)"
+    },
+    {
+      "key": "offload_kqv",
+      "type": "bool",
+      "default": false,
+      "label": "Offload K/Q/V + KV cache to GPU"
+    },
+    {
+      "key": "flash_attn",
+      "type": "bool",
+      "default": false,
+      "label": "Flash Attention (if supported)"
+    },
+    {
+      "key": "mmap",
+      "type": "bool",
+      "default": null,
+      "label": "Memory-map model file"
+    },
+    {
+      "key": "temp",
+      "type": "float",
+      "default": 0.2,
+      "label": "Temperature"
+    },
+    {
+      "key": "top_p",
+      "type": "float",
+      "default": 0.9,
+      "label": "Top-p"
+    },
+    {
+      "key": "top_k",
+      "type": "int",
+      "default": 40,
+      "label": "Top-k"
+    },
+    {
+      "key": "repeat_penalty",
+      "type": "float",
+      "default": 1.05,
+      "label": "Repeat penalty"
+    },
+    {
+      "key": "grounding_temp",
+      "type": "float",
+      "default": 0.0,
+      "label": "Grounding temperature"
+    },
+    {
+      "key": "verbose",
+      "type": "bool",
+      "default": false,
+      "label": "Verbose"
+    }
+  ]
+}

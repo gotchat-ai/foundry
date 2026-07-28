@@ -1,0 +1,10 @@
+{
+  "id": "setup_wizard",
+  "name": "Setup Wizard",
+  "version": "0.1.0",
+  "description": "Guided setup flow for recommended model and runtime configuration.",
+  "dependencies": [
+    "model_deck",
+    "permissions_manager"
+  ]
+}

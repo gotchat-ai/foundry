@@ -1,0 +1,43 @@
+{
+  "recommended_loader_id": "model_loader.model_deck.retrieval",
+  "fields": [
+    {
+      "key": "model_path",
+      "type": "path",
+      "required": true,
+      "label": "Embedding/Reranker model path"
+    },
+    {
+      "key": "mode",
+      "type": "enum",
+      "choices": [
+        "embed",
+        "rerank"
+      ],
+      "default": "embed",
+      "label": "Mode"
+    },
+    {
+      "key": "pooling",
+      "type": "enum",
+      "choices": [
+        "mean",
+        "cls"
+      ],
+      "default": "mean",
+      "label": "Pooling"
+    },
+    {
+      "key": "normalize",
+      "type": "bool",
+      "default": true,
+      "label": "Normalize embeddings"
+    },
+    {
+      "key": "batch_size",
+      "type": "int",
+      "default": 64,
+      "label": "Batch size"
+    }
+  ]
+}

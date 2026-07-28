@@ -1,0 +1,89 @@
+{
+  "name": "document_email_database",
+  "description": "Synthetic workflow that validates document extraction, mailbox ingestion, SQLite reads, and SMTP draft generation.",
+  "start": "n1",
+  "test": {
+    "request_text": "Run the local synthetic intake workflow.",
+    "expect": [
+      {"path": "n1.warnings", "contains": "prompt_injection_block"},
+      {"path": "n1.data.prompt_injection_scan.decision", "equals": "block"},
+      {"path": "n2.messages.0.prompt_injection_scan.decision", "equals": "block"},
+      {"path": "n3.data.row_count", "equals": 3},
+      {"path": "n4.data.draft_path", "exists_file": true}
+    ]
+  },
+  "nodes": {
+    "n1": {
+      "label": "Extract Document Text",
+      "plugin_id": "agent_workflow_member",
+      "transitions": [{"condition": {"type": "always"}, "target": "n2"}],
+      "plugin_settings": {
+        "node_type": "tool_node",
+        "member_role": "document",
+        "action_skills": ["document.extract_text"],
+        "tool_config": {
+          "tool": "document.extract_text",
+          "params": {
+            "path": "__FIXTURE_DOC__"
+          }
+        }
+      }
+    },
+    "n2": {
+      "label": "Read Mailbox",
+      "plugin_id": "agent_workflow_member",
+      "transitions": [{"condition": {"type": "always"}, "target": "n3"}],
+      "plugin_settings": {
+        "node_type": "tool_node",
+        "member_role": "email",
+        "action_skills": ["email.read"],
+        "tool_config": {
+          "tool": "email.read",
+          "params": {
+            "path": "__FIXTURE_MAILBOX__",
+            "source_type": "json"
+          }
+        }
+      }
+    },
+    "n3": {
+      "label": "Read SQLite",
+      "plugin_id": "agent_workflow_member",
+      "transitions": [{"condition": {"type": "always"}, "target": "n4"}],
+      "plugin_settings": {
+        "node_type": "tool_node",
+        "member_role": "database",
+        "action_skills": ["database.read_query"],
+        "tool_config": {
+          "tool": "database.read_query",
+          "params": {
+            "driver": "sqlite",
+            "path": "__FIXTURE_SQLITE__",
+            "query": "select id, region, total_amount from synthetic_orders order by id"
+          }
+        }
+      }
+    },
+    "n4": {
+      "label": "Draft Email",
+      "plugin_id": "agent_workflow_member",
+      "transitions": [],
+      "plugin_settings": {
+        "node_type": "tool_node",
+        "member_role": "email",
+        "action_skills": ["email.send_smtp"],
+        "tool_config": {
+          "tool": "email.send_smtp",
+          "params": {
+            "mode": "draft_only",
+            "from": "noreply@example.invalid",
+            "to": ["ops-test@example.invalid"],
+            "subject": "Synthetic workflow validation",
+            "body": "This is a synthetic validation draft created by the workflow harness.",
+            "draft_path": "__DRAFT_OUTPUT__"
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,45 @@
+{
+  "recommended_loader_id": "model_loader.model_deck.diffusers",
+  "fields": [
+    {
+      "key": "backend",
+      "type": "enum",
+      "choices": [
+        "diffusers",
+        "comfyui"
+      ],
+      "default": "diffusers",
+      "label": "Backend"
+    },
+    {
+      "key": "base_model_id",
+      "type": "str",
+      "required": true,
+      "label": "Base model id/path"
+    },
+    {
+      "key": "control_model_id",
+      "type": "str",
+      "required": true,
+      "label": "Control model id/path"
+    },
+    {
+      "key": "control_strength",
+      "type": "float",
+      "default": 1.0,
+      "label": "Control strength"
+    },
+    {
+      "key": "steps",
+      "type": "int",
+      "default": 28,
+      "label": "Steps"
+    },
+    {
+      "key": "seed",
+      "type": "int",
+      "default": -1,
+      "label": "Seed (-1=random)"
+    }
+  ]
+}

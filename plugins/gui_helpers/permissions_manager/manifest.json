@@ -1,0 +1,10 @@
+{
+  "id": "permissions_manager",
+  "name": "Permissions Manager",
+  "version": "0.1.0",
+  "description": "Role, plugin, and skill access policy management.",
+  "dependencies": [
+    "collab_chat",
+    "agent_flow"
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "id": "agent_workflow",
+  "name": "Agent Workflow",
+  "version": "0.1.0",
+  "description": "Workflow orchestration API skeleton with typed contracts and phase-1 trace/status plumbing.",
+  "dependencies": [
+    "collab_chat",
+    "repo_context"
+  ],
+  "routes": [
+    "/v1/agent_workflow/run",
+    "/v1/agent_workflow/stream",
+    "/v1/agent_workflow/approval",
+    "/v1/agent_workflow/status/{workflow_id}",
+    "/v1/agent_workflow/cancel/{workflow_id}",
+    "/v1/agent_workflow/feedback",
+    "/v1/agent_workflow/learning",
+    "/v1/agent_workflow/tools",
+    "/v1/agent_workflow/profiles",
+    "/v1/agent_workflow/profiles/reload"
+    ,"/v1/agent_workflow/profiles/files"
+    ,"/v1/agent_workflow/profiles/upsert"
+    ,"/v1/agent_workflow/agents/config"
+  ]
+}

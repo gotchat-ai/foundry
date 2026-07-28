@@ -1,0 +1,64 @@
+{
+  "name": "quarantine_review",
+  "description": "Synthetic workflow that validates quarantine report generation for imported workflow bundles.",
+  "start": "n1",
+  "test": {
+    "request_text": "Create a synthetic quarantine review report.",
+    "expect": [
+      {"path": "n1.summary.recommendation", "equals": "manual_review_required"},
+      {"path": "n1.report_path", "exists_file": true}
+    ]
+  },
+  "nodes": {
+    "n1": {
+      "label": "Quarantine Review",
+      "plugin_id": "agent_workflow_member",
+      "transitions": [],
+      "plugin_settings": {
+        "node_type": "tool_node",
+        "member_role": "workflow_exchange",
+        "action_skills": ["workflow_exchange.quarantine_review"],
+        "tool_config": {
+          "tool": "workflow_exchange.quarantine_review",
+          "params": {
+            "bundle_dir": "__QUARANTINE_OUTPUT_DIR__",
+            "flow_name": "synthetic_import_review",
+            "workflow_json": {
+              "name": "synthetic_import_review",
+              "description": "Synthetic imported workflow for quarantine review.",
+              "start": "n1",
+              "nodes": {
+                "n1": {
+                  "label": "Security Filter",
+                  "plugin_id": "agent_workflow_member",
+                  "transitions": [],
+                  "plugin_settings": {
+                    "node_type": "tool_node",
+                    "action_skills": ["security.prompt_injection_filter"],
+                    "tool_config": {
+                      "tool": "security.prompt_injection_filter"
+                    }
+                  }
+                }
+              }
+            },
+            "scan": {
+              "decision": "quarantine_review",
+              "findings": [
+                {
+                  "code": "prompt_injection_detected",
+                  "severity": "medium",
+                  "message": "Synthetic prompt injection finding for quarantine review."
+                }
+              ]
+            },
+            "sanitization": {
+              "review_findings": ["prompt_injection_detected"],
+              "blocked_findings": []
+            }
+          }
+        }
+      }
+    }
+  }
+}

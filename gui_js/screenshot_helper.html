@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>GotChat Screenshot Helper</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      background: #08111b;
+      overflow: hidden;
+      font-family: Arial, sans-serif;
+    }
+    .stage {
+      width: 100vw;
+      height: 100vh;
+      display: flex;
+      align-items: stretch;
+      justify-content: stretch;
+      background: linear-gradient(180deg, #08111b 0%, #0b1724 100%);
+    }
+    iframe {
+      width: 100%;
+      height: 100%;
+      border: 0;
+      background: #08111b;
+    }
+    .status {
+      position: fixed;
+      right: 16px;
+      bottom: 16px;
+      z-index: 10;
+      padding: 8px 12px;
+      border-radius: 999px;
+      background: rgba(8, 17, 27, 0.82);
+      color: #dbe7f5;
+      font-size: 12px;
+      letter-spacing: 0.04em;
+      border: 1px solid rgba(148, 163, 184, 0.22);
+    }
+  </style>
+</head>
+<body>
+  <div class="stage">
+    <iframe id="appframe" src="/chat_js.htm?server=http://localhost:8000"></iframe>
+  </div>
+  <div class="status" id="status">Loading...</div>
+  <script>
+    const params = new URLSearchParams(window.location.search);
+    const mode = params.get('mode') || 'plugins';
+    const frame = document.getElementById('appframe');
+    const statusEl = document.getElementById('status');
+
+    function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
+
+    async function waitFor(fn, timeout = 30000, step = 200) {
+      const started = Date.now();
+      while ((Date.now() - started) < timeout) {
+        const value = fn();
+        if (value) return value;
+        await sleep(step);
+      }
+      throw new Error('Timed out');
+    }
+
+    function getDoc() {
+      return frame.contentDocument || frame.contentWindow?.document || null;
+    }
+
+    async function clickWhen(selector, root = null) {
+      const node = await waitFor(() => {
+        const doc = root || getDoc();
+        return doc ? doc.querySelector(selector) : null;
+      });
+      node.click();
+      await sleep(500);
+      return node;
+    }
+
+    async function openMenu() {
+      await clickWhen('#menu-btn');
+      await sleep(400);
+    }
+
+    async function openGuiPlugin(pluginId) {
+      const doc = getDoc();
+      await openMenu();
+      const group = await waitFor(() => doc.querySelector('.menu-item.has-sub[data-menu="gui-plugins"]'));
+      group.click();
+      await sleep(500);
+      const pluginBtn = await waitFor(() => doc.querySelector(`#menu-gui-sub [data-plugin-id="${pluginId}"]`), 30000, 250);
+      pluginBtn.click();
+      await sleep(2000);
+    }
+
+    async function openToolsPanel(panelId) {
+      const doc = getDoc();
+      await openMenu();
+      const btn = await waitFor(() => doc.querySelector(`.menu-item[data-open="${panelId}"]`));
+      btn.click();
+      await sleep(1200);
+    }
+
+    async function run() {
+      try {
+        statusEl.textContent = `Preparing ${mode}`;
+        const doc = await waitFor(() => getDoc());
+        await waitFor(() => doc.querySelector('#menu-btn'));
+        await sleep(3500);
+        if (mode === 'plugins') {
+          await openToolsPanel('plugins');
+          const manageTab = doc.querySelector('[data-plugin-tab="manage"]');
+          if (manageTab) manageTab.click();
+          await sleep(1200);
+        } else if (mode === 'agent_flow') {
+          await openGuiPlugin('agent_flow');
+        } else if (mode === 'model_deck') {
+          await openGuiPlugin('model_deck');
+        }
+        statusEl.textContent = `Ready: ${mode}`;
+        document.body.dataset.ready = '1';
+      } catch (err) {
+        statusEl.textContent = `Error: ${err.message || err}`;
+        document.body.dataset.ready = 'error';
+      }
+    }
+
+    frame.addEventListener('load', () => {
+      run();
+    }, { once: true });
+  </script>
+</body>
+</html>

@@ -1,0 +1,7 @@
+{
+  "id": "chat_style_renderer",
+  "name": "Chat Style Renderer",
+  "kind": "render",
+  "description": "Style chat tags and render <think> blocks as collapsible sections.",
+  "entry": "plugin.js"
+}

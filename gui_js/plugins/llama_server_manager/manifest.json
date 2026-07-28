@@ -1,0 +1,7 @@
+{
+  "id": "llama_server_manager",
+  "name": "Llama Server Manager",
+  "version": "0.1.0",
+  "description": "Manage host-side llama.cpp server runtimes and local llama-server processes.",
+  "entry": "plugin.js"
+}

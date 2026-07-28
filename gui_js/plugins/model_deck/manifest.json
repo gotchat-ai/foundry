@@ -1,0 +1,7 @@
+{
+  "id": "model_deck",
+  "name": "Model Deck",
+  "kind": "panel",
+  "description": "Catalog model types + saved loader settings; exposes deck endpoints for routers/agents.",
+  "entry": "plugin.js"
+}

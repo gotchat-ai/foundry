@@ -1,0 +1,10 @@
+{
+  "id": "llama_server_manager",
+  "name": "Llama Server Manager",
+  "version": "0.1.0",
+  "description": "Server-side proxy routes for the llama host manager.",
+  "dependencies": [
+    "model_deck",
+    "collab_chat"
+  ]
+}

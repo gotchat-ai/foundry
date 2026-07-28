@@ -1,0 +1,208 @@
+{
+  "id": "collab_chat",
+  "name": "Collab Chat",
+  "type": "gui_helper",
+  "version": "0.2.0",
+  "description": "Remote auth + project/session chat collaboration helper with server-side persistence, visibility rules, join requests, and presence/typing events.",
+  "server": {
+    "mount": true,
+    "requires_auth": true,
+    "auth": {
+      "token_header": "Authorization",
+      "token_scheme": "Bearer",
+      "alt_token_header": "X-Auth-Token"
+    },
+    "gating": {
+      "enabled_plugins_header": "X-Gui-Enabled-Plugins",
+      "required_plugin_id": "collab_chat"
+    }
+  },
+  "defaults": {
+    "project": {
+      "is_public": false
+    },
+    "session": {
+      "is_public": false
+    }
+  },
+  "visibility_rules": {
+    "projects": {
+      "list_visibility": "all_users_can_list_all_projects",
+      "default": "private",
+      "private_means": "Anyone can see the project in lists, but content access is restricted to members/admin.",
+      "public_means": "Anyone can see project and public sessions; session access rules apply per-session."
+    },
+    "sessions": {
+      "list_visibility": "all_users_can_list_all_sessions",
+      "effective_visibility": "project_private_forces_session_private",
+      "public_session_access": "any_authenticated_user",
+      "private_session_access": "owner_or_admin_or_granted_membership",
+      "join_request_flow": true
+    }
+  },
+  "endpoints": [
+    {
+      "method": "POST",
+      "path": "/v1/auth/login",
+      "purpose": "Remote login (returns token)."
+    },
+    {
+      "method": "POST",
+      "path": "/v1/auth/logout",
+      "purpose": "Remote logout (revokes token)."
+    },
+    {
+      "method": "GET",
+      "path": "/v1/auth/me",
+      "purpose": "Get current authenticated user."
+    },
+    {
+      "method": "POST",
+      "path": "/v1/auth/change_password",
+      "purpose": "Self-service password change (verifies old password, updates new password, revokes other tokens)."
+    },
+    {
+      "method": "GET",
+      "path": "/v1/auth/users",
+      "purpose": "Admin-only list users."
+    },
+    {
+      "method": "POST",
+      "path": "/v1/auth/users",
+      "purpose": "Admin upsert user (create/update password/role)."
+    },
+    {
+      "method": "DELETE",
+      "path": "/v1/auth/users/{username}",
+      "purpose": "Admin delete user (revokes tokens and memberships)."
+    },
+
+    {
+      "method": "GET",
+      "path": "/v1/projects",
+      "purpose": "List projects (includes private/public; list is visible to all authenticated users)."
+    },
+    {
+      "method": "POST",
+      "path": "/v1/projects",
+      "purpose": "Create project (default private)."
+    },
+    {
+      "method": "PUT",
+      "path": "/v1/projects/{pid}/visibility",
+      "purpose": "Owner/admin set project visibility. If private -> forces all sessions private."
+    },
+    {
+      "method": "GET",
+      "path": "/v1/projects/{pid}/members",
+      "purpose": "Project admin/owner list project members."
+    },
+    {
+      "method": "POST",
+      "path": "/v1/projects/{pid}/members",
+      "purpose": "Project admin/owner upsert member role."
+    },
+    {
+      "method": "DELETE",
+      "path": "/v1/projects/{pid}/members/{username}",
+      "purpose": "Project admin/owner remove member."
+    },
+
+    {
+      "method": "GET",
+      "path": "/v1/projects/{pid}/sessions",
+      "purpose": "List sessions for a project (includes private/public; list is visible to all authenticated users)."
+    },
+    {
+      "method": "POST",
+      "path": "/v1/projects/{pid}/sessions",
+      "purpose": "Create session; default visibility depends on project visibility."
+    },
+    {
+      "method": "GET",
+      "path": "/v1/projects/{pid}/sessions/{sid}",
+      "purpose": "Get session metadata (requires session access)."
+    },
+    {
+      "method": "PUT",
+      "path": "/v1/projects/{pid}/sessions/{sid}/visibility",
+      "purpose": "Owner/admin set session visibility (only effective when project is public)."
+    },
+    {
+      "method": "GET",
+      "path": "/v1/projects/{pid}/sessions/{sid}/access",
+      "purpose": "Check whether the current user can access session content; returns can_request_join."
+    },
+
+    {
+      "method": "GET",
+      "path": "/v1/projects/{pid}/sessions/{sid}/messages",
+      "purpose": "Get chat history (requires session access)."
+    },
+    {
+      "method": "POST",
+      "path": "/v1/projects/{pid}/sessions/{sid}/messages",
+      "purpose": "Post message (requires session access)."
+    },
+
+    {
+      "method": "GET",
+      "path": "/v1/projects/{pid}/sessions/{sid}/events",
+      "purpose": "SSE event stream (requires session access). Also drives presence join/leave."
+    },
+
+    {
+      "method": "POST",
+      "path": "/v1/projects/{pid}/sessions/{sid}/model_turn_stream",
+      "purpose": "Server-side model streaming for a session (requires session access; persists reply even if client disconnects)."
+    },
+
+    {
+      "method": "GET",
+      "path": "/v1/projects/{pid}/sessions/{sid}/roster",
+      "purpose": "Roster/presence snapshot (requires session access)."
+    },
+    {
+      "method": "POST",
+      "path": "/v1/projects/{pid}/sessions/{sid}/typing",
+      "purpose": "Typing indicator (requires session access; broadcasts typing events)."
+    },
+
+    {
+      "method": "POST",
+      "path": "/v1/projects/{pid}/sessions/{sid}/join_requests",
+      "purpose": "Request to join a private session (creates pending request if needed)."
+    },
+    {
+      "method": "GET",
+      "path": "/v1/projects/{pid}/sessions/{sid}/join_requests",
+      "purpose": "Owner/admin list pending join requests."
+    },
+    {
+      "method": "POST",
+      "path": "/v1/projects/{pid}/sessions/{sid}/join_requests/{req_id}/approve",
+      "purpose": "Owner/admin approve join request (grants membership)."
+    },
+    {
+      "method": "POST",
+      "path": "/v1/projects/{pid}/sessions/{sid}/join_requests/{req_id}/deny",
+      "purpose": "Owner/admin deny join request."
+    }
+  ],
+  "client_headers": {
+    "required": ["X-Gui-Enabled-Plugins"],
+    "recommended": ["X-Project-Id", "X-Session-Id", "X-User-Alias"]
+  },
+  "events": {
+    "sse_event_names": ["message", "token", "done", "diag", "presence", "typing", "join_request", "session_meta"]
+  },
+  "ui": {
+    "suggested_panels": [
+      {
+        "id": "auth_projects",
+        "name": "Auth + Projects",
+        "overrides_chats_tab": true
+      }
+    ]
+  }
+}

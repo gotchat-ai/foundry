@@ -1,0 +1,17 @@
+{
+  "id": "agent_flow",
+  "name": "Agent Flow",
+  "version": "0.1.0",
+  "description": "Server-side agent flow execution, status, and project flow storage endpoints.",
+  "dependencies": [
+    "collab_chat",
+    "permissions_manager",
+    "browser_relay",
+    "agent_workflow"
+  ],
+  "routes": [
+    "/v1/projects/{pid}/sessions/{sid}/agent_flow/run",
+    "/v1/projects/{pid}/sessions/{sid}/agent_flow/status",
+    "/v1/projects/{pid}/sessions/{sid}/agent_flow/flows"
+  ]
+}

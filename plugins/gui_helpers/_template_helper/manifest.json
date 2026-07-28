@@ -1,0 +1,10 @@
+{
+  "id": "template_helper",
+  "name": "Template Helper",
+  "type": "control",
+  "gui_plugin_id": "your_gui_plugin_id",
+  "description": "Copy this folder and edit it to create a new GUI helper.",
+  "routes": [
+    "/v1/your/endpoint"
+  ]
+}

@@ -1,0 +1,149 @@
+{
+  "recommended_loader_id": "model_loader.model_deck.video",
+  "fields": [
+    {
+      "key": "backend",
+      "type": "enum",
+      "choices": ["diffusers", "comfyui"],
+      "default": "diffusers",
+      "label": "Backend"
+    },
+    {
+      "key": "model_id",
+      "type": "str",
+      "required": true,
+      "default": "genmo/mochi-1-preview",
+      "label": "Video model id/path (default: Mochi 1)"
+    },
+    {
+      "key": "device",
+      "type": "enum",
+      "choices": [
+        "auto",
+        "cuda",
+        "xpu",
+        "cpu",
+        "mps"
+      ],
+      "default": "auto",
+      "label": "Device (diffusers)"
+    },
+    {
+      "key": "dtype",
+      "type": "enum",
+      "choices": [
+        "auto",
+        "fp16",
+        "bf16",
+        "fp32"
+      ],
+      "default": "auto",
+      "label": "Dtype (diffusers)"
+    },
+    {
+      "key": "use_wan",
+      "type": "bool",
+      "required": false,
+      "label": "Force Wan pipeline (diffusers)"
+    },
+    {
+      "key": "use_wan_vae",
+      "type": "bool",
+      "required": false,
+      "label": "Wan: load VAE subfolder"
+    },
+    {
+      "key": "wan_vae_subfolder",
+      "type": "str",
+      "default": "vae",
+      "label": "Wan VAE subfolder"
+    },
+    {
+      "key": "wan_vae_dtype",
+      "type": "enum",
+      "choices": [
+        "fp32",
+        "fp16",
+        "bf16"
+      ],
+      "default": "fp32",
+      "label": "Wan VAE dtype"
+    },
+    {
+      "key": "enable_model_cpu_offload",
+      "type": "bool",
+      "required": false,
+      "label": "Enable model CPU offload (diffusers)"
+    },
+    {
+      "key": "enable_sequential_cpu_offload",
+      "type": "bool",
+      "required": false,
+      "label": "Enable sequential CPU offload (diffusers)"
+    },
+    {
+      "key": "gguf_path",
+      "type": "path",
+      "required": false,
+      "label": "GGUF path (if ComfyUI workflows)"
+    },
+    {
+      "key": "width",
+      "type": "int",
+      "default": 848,
+      "label": "Width"
+    },
+    {
+      "key": "height",
+      "type": "int",
+      "default": 480,
+      "label": "Height"
+    },
+    {
+      "key": "frames",
+      "type": "int",
+      "default": 31,
+      "label": "Frames"
+    },
+    {
+      "key": "fps",
+      "type": "int",
+      "default": 30,
+      "label": "FPS"
+    },
+    {
+      "key": "codec",
+      "type": "enum",
+      "choices": [
+        "libx264",
+        "mpeg4"
+      ],
+      "default": "libx264",
+      "label": "Video codec"
+    },
+    {
+      "key": "steps",
+      "type": "int",
+      "default": 64,
+      "label": "Steps"
+    },
+    {
+      "key": "guidance_scale",
+      "type": "float",
+      "default": 6.0,
+      "label": "Guidance scale (CFG)"
+    },
+    {
+      "key": "seed",
+      "type": "int",
+      "default": -1,
+      "label": "Seed (-1=random)"
+    },
+    {
+      "key": "negative_prompt",
+      "type": "str",
+      "default": "",
+      "label": "Negative prompt"
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "id": "agent_flow",
+  "name": "Agent Flow",
+  "kind": "ui",
+  "description": "Agent Flow designer for router plugin flows.",
+  "category": "Agent/Workflows",
+  "entry": "plugin.js"
+}

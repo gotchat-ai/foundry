@@ -1,0 +1,8 @@
+{
+  "id": "skills_settings",
+  "name": "Skills Settings",
+  "kind": "panel",
+  "description": "Store reusable settings and API keys for agent skills.",
+  "category": "Agent/Workflows",
+  "entry": "plugin.js"
+}

@@ -1,0 +1,37 @@
+{
+  "name": "web_research",
+  "description": "Synthetic workflow that validates local web research ingestion and prompt-injection sanitization.",
+  "start": "n1",
+  "test": {
+    "request_text": "Research the local synthetic source.",
+    "initial_state": {
+      "local_url": "__LOCAL_WEB_URL__"
+    },
+    "expect": [
+      {"path": "n1.findings", "min_length": 1},
+      {"path": "n1.findings.0.prompt_injection_scan.decision", "equals": "block"},
+      {"path": "n1.findings.0.summary_excerpt", "contains": "<prompt_injection_redacted>"}
+    ]
+  },
+  "nodes": {
+    "n1": {
+      "label": "Research Local Source",
+      "plugin_id": "agent_workflow_member",
+      "transitions": [],
+      "plugin_settings": {
+        "node_type": "tool_node",
+        "member_role": "research",
+        "action_skills": ["web.research"],
+        "tool_config": {
+          "tool": "web.research",
+          "params": {
+            "max_sources": 1
+          },
+          "input_bindings": {
+            "urls": "local_url_list"
+          }
+        }
+      }
+    }
+  }
+}

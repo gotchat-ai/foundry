@@ -1,0 +1,45 @@
+{
+  "recommended_loader_id": "model_loader.model_deck.speech",
+  "fields": [
+    {
+      "key": "model_path",
+      "type": "path",
+      "required": true,
+      "label": "Whisper/ASR GGUF model path"
+    },
+    {
+      "key": "task",
+      "type": "enum",
+      "choices": [
+        "transcribe",
+        "translate"
+      ],
+      "default": "transcribe",
+      "label": "Task"
+    },
+    {
+      "key": "language",
+      "type": "str",
+      "default": "",
+      "label": "Language (optional)"
+    },
+    {
+      "key": "beam_size",
+      "type": "int",
+      "default": 1,
+      "label": "Beam size"
+    },
+    {
+      "key": "vad",
+      "type": "bool",
+      "default": true,
+      "label": "VAD"
+    },
+    {
+      "key": "word_timestamps",
+      "type": "bool",
+      "default": false,
+      "label": "Word timestamps"
+    }
+  ]
+}

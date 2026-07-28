@@ -1,0 +1,7 @@
+{
+  "id": "theme_demo",
+  "name": "Theme Demo",
+  "kind": "ui",
+  "description": "Switch between system/light/dark themes with accent colors.",
+  "entry": "plugin.js"
+}

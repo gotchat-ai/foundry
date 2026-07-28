@@ -1,0 +1,261 @@
+{
+  "recommended_loader_id": "model_loader.model_deck.text_llm",
+  "fields": [
+    {
+      "key": "model_path",
+      "type": "path",
+      "required": true,
+      "label": "GGUF model path"
+    },
+    {
+      "key": "mmproj_path",
+      "type": "path",
+      "required": false,
+      "label": "MMProj / vision proj path (optional)"
+    },
+    {
+      "key": "lora_adapter_path",
+      "type": "path",
+      "required": false,
+      "label": "LoRA adapter path (optional)"
+    },
+    {
+      "key": "lora_base_model_path",
+      "type": "path",
+      "required": false,
+      "label": "LoRA base model path (optional)"
+    },
+    {
+      "key": "lora_scale",
+      "type": "float",
+      "default": null,
+      "label": "LoRA scale"
+    },
+    {
+      "key": "n_ctx",
+      "type": "int",
+      "default": 8192,
+      "label": "Context length"
+    },
+    {
+      "key": "n_batch",
+      "type": "int",
+      "default": 512,
+      "label": "Batch size (n_batch)"
+    },
+    {
+      "key": "ubatch_size",
+      "type": "int",
+      "default": 512,
+      "label": "Micro-batch size (n_ubatch)"
+    },
+    {
+      "key": "n_threads",
+      "type": "int",
+      "default": 0,
+      "label": "Generation threads"
+    },
+    {
+      "key": "threads_batch",
+      "type": "int",
+      "default": 0,
+      "label": "Prompt/batch threads"
+    },
+    {
+      "key": "n_gpu_layers",
+      "type": "int",
+      "default": -1,
+      "label": "GPU layers (-1=auto)"
+    },
+    {
+      "key": "n_gpu_layers_offset",
+      "type": "int",
+      "default": 0,
+      "label": "GPU layers offset (CPU layers)"
+    },
+    {
+      "key": "backend_mode",
+      "type": "enum",
+      "default": "embedded",
+      "choices": [
+        { "value": "embedded", "label": "Embedded GGUF" },
+        { "value": "llama_server", "label": "llama.cpp Server" }
+      ],
+      "label": "Backend mode"
+    },
+    {
+      "key": "llama_server_url",
+      "type": "text",
+      "default": "",
+      "label": "llama-server URL (optional)"
+    },
+    {
+      "key": "llama_server_image",
+      "type": "text",
+      "default": "",
+      "label": "llama-server image (optional)"
+    },
+    {
+      "key": "parallel_slots",
+      "type": "int",
+      "default": null,
+      "label": "Parallel slots (-np / --parallel)"
+    },
+    {
+      "key": "cont_batching",
+      "type": "bool",
+      "default": null,
+      "label": "Continuous batching"
+    },
+    {
+      "key": "main_gpu",
+      "type": "int",
+      "default": 0,
+      "label": "Main GPU device id (0=default)"
+    },
+    {
+      "key": "gpu_selection_mode",
+      "type": "enum",
+      "default": "auto",
+      "choices": [
+        { "value": "auto", "label": "Auto GPU placement" },
+        { "value": "single", "label": "Single GPU only" },
+        { "value": "split", "label": "Split across GPUs" }
+      ],
+      "label": "GPU selection mode"
+    },
+    {
+      "key": "gpu_split_mode",
+      "type": "enum",
+      "default": "layer",
+      "choices": [
+        { "value": "layer", "label": "Layer split (recommended)" },
+        { "value": "row", "label": "Row split" },
+        { "value": "none", "label": "Disable split mode" }
+      ],
+      "label": "GPU split mode"
+    },
+    {
+      "key": "gpu_split_devices",
+      "type": "text",
+      "default": "",
+      "label": "Split GPU device ids (e.g. 0,1)"
+    },
+    {
+      "key": "gpu_split_percent",
+      "type": "text",
+      "default": "",
+      "label": "Split percentages (e.g. 70,30)"
+    },
+    {
+      "key": "offload_kqv",
+      "type": "bool",
+      "default": false,
+      "label": "Offload K/Q/V + KV cache to GPU"
+    },
+    {
+      "key": "type_k",
+      "type": "text",
+      "default": "",
+      "label": "KV cache type K (e.g. Q8_0, F16)"
+    },
+    {
+      "key": "type_v",
+      "type": "text",
+      "default": "",
+      "label": "KV cache type V (e.g. Q8_0, F16)"
+    },
+    {
+      "key": "flash_attn",
+      "type": "bool",
+      "default": false,
+      "label": "Flash Attention (if supported)"
+    },
+    {
+      "key": "kv_unified",
+      "type": "bool",
+      "default": null,
+      "label": "Unified KV cache buffer"
+    },
+    {
+      "key": "no_host",
+      "type": "bool",
+      "default": null,
+      "label": "Disable host buffer (--no-host)"
+    },
+    {
+      "key": "cache_ram",
+      "type": "int",
+      "default": null,
+      "label": "Prompt cache RAM MiB (0=disable)"
+    },
+    {
+      "key": "mmap",
+      "type": "bool",
+      "default": null,
+      "label": "Memory-map model file"
+    },
+    {
+      "key": "ctx_checkpoints",
+      "type": "int",
+      "default": null,
+      "label": "Context checkpoints per slot"
+    },
+    {
+      "key": "emit_thinking",
+      "type": "bool",
+      "default": false,
+      "label": "Emit thinking / reasoning"
+    },
+    {
+      "key": "think_style",
+      "type": "text",
+      "default": "planner",
+      "label": "Thinking style"
+    },
+    {
+      "key": "rope_freq_base",
+      "type": "float",
+      "default": null,
+      "allow_auto": true,
+      "label": "RoPE frequency base"
+    },
+    {
+      "key": "rope_freq_scale",
+      "type": "float",
+      "default": null,
+      "allow_auto": true,
+      "label": "RoPE frequency scale"
+    },
+    {
+      "key": "temp",
+      "type": "float",
+      "default": 0.7,
+      "label": "Temperature"
+    },
+    {
+      "key": "top_p",
+      "type": "float",
+      "default": 0.95,
+      "label": "Top-p"
+    },
+    {
+      "key": "top_k",
+      "type": "int",
+      "default": 40,
+      "label": "Top-k"
+    },
+    {
+      "key": "repeat_penalty",
+      "type": "float",
+      "default": 1.05,
+      "label": "Repeat penalty"
+    },
+    {
+      "key": "seed",
+      "type": "int",
+      "default": -1,
+      "label": "Seed (-1=random)"
+    }
+  ]
+}

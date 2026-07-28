@@ -1,0 +1,7 @@
+{
+  "id": "repo_context",
+  "name": "Repo Context",
+  "version": "0.1.0",
+  "description": "Repository context injection and repo watch helpers for project-aware chat flows.",
+  "dependencies": []
+}

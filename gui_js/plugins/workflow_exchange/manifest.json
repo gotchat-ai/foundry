@@ -1,0 +1,8 @@
+{
+  "id": "workflow_exchange",
+  "name": "Agent Workflow Exchange",
+  "kind": "panel",
+  "description": "Imported agent workflow exchange library with evaluate, refresh, install, and designer handoff.",
+  "category": "Agent/Workflows",
+  "entry": "plugin.js"
+}

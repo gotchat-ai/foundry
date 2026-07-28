@@ -1,0 +1,26 @@
+{
+  "recommended_loader_id": "model_loader.model_deck.safety",
+  "fields": [
+    {
+      "key": "model_path",
+      "type": "path",
+      "required": true,
+      "label": "Classifier model path"
+    },
+    {
+      "key": "threshold",
+      "type": "float",
+      "default": 0.5,
+      "label": "Threshold"
+    },
+    {
+      "key": "labels",
+      "type": "list",
+      "default": [
+        "safe",
+        "unsafe"
+      ],
+      "label": "Labels"
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "id": "agent_workflow",
+  "name": "Agent Workflow",
+  "kind": "ui",
+  "description": "Workflow feedback and learning panel.",
+  "category": "Agent/Workflows",
+  "entry": "plugin.js"
+}

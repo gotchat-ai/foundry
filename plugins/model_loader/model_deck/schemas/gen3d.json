@@ -1,0 +1,33 @@
+{
+  "recommended_loader_id": "model_loader.model_deck.3d",
+  "fields": [
+    {
+      "key": "backend",
+      "type": "enum",
+      "choices": [
+        "tripo",
+        "shap_e",
+        "custom"
+      ],
+      "default": "custom",
+      "label": "Backend"
+    },
+    {
+      "key": "model_id",
+      "type": "str",
+      "required": true,
+      "label": "3D model id/path"
+    },
+    {
+      "key": "output_format",
+      "type": "enum",
+      "choices": [
+        "glb",
+        "obj",
+        "ply"
+      ],
+      "default": "glb",
+      "label": "Output format"
+    }
+  ]
+}

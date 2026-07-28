@@ -1,0 +1,7 @@
+{
+  "id": "permissions_manager",
+  "name": "Permissions",
+  "kind": "ui",
+  "description": "Manage roles, plugin access, and delegated enterprise permissions.",
+  "entry": "plugin.js"
+}

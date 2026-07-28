@@ -1,0 +1,9 @@
+From: noreply@example.invalid
+To: ops-test@example.invalid
+Subject: Synthetic workflow validation
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+MIME-Version: 1.0
+X-LLMLoader2-Mode: draft_only
+
+This is a synthetic validation draft created by the workflow harness.

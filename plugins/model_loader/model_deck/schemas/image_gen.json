@@ -1,0 +1,275 @@
+{
+  "recommended_loader_id": "model_loader.model_deck.diffusers",
+  "fields": [
+    {
+      "key": "backend",
+      "type": "enum",
+      "choices": [
+        "diffusers",
+        "comfyui",
+        "sd_cpp",
+        "gguf_cli"
+      ],
+      "default": "diffusers",
+      "label": "Backend"
+    },
+    {
+      "key": "model_id",
+      "type": "str",
+      "required": false,
+      "label": "Model id/path (base pipeline)"
+    },
+    {
+      "key": "gguf_path",
+      "type": "path",
+      "required": false,
+      "label": "GGUF path (diffusers gguf / sd_cpp / gguf_cli)"
+    },
+    {
+      "key": "text_encoder_path",
+      "type": "path",
+      "required": false,
+      "label": "Text encoder path (diffusers gguf)"
+    },
+    {
+      "key": "use_unet",
+      "type": "bool",
+      "required": false,
+      "label": "Use UNet override"
+    },
+    {
+      "key": "sdxl_unet_path",
+      "type": "path",
+      "required": false,
+      "label": "UNet path (safetensors)"
+    },
+    {
+      "key": "sdxl_unet_repo",
+      "type": "str",
+      "required": false,
+      "label": "UNet repo (HF)"
+    },
+    {
+      "key": "sdxl_unet_filename",
+      "type": "str",
+      "required": false,
+      "label": "UNet filename"
+    },
+    {
+      "key": "sdxl_base_model",
+      "type": "str",
+      "required": false,
+      "label": "Base model id"
+    },
+    {
+      "key": "sdxl_variant",
+      "type": "str",
+      "required": false,
+      "label": "Variant (e.g., fp16)"
+    },
+    {
+      "key": "sdxl_timestep_spacing",
+      "type": "enum",
+      "choices": [
+        "trailing",
+        "leading",
+        "linspace"
+      ],
+      "default": "trailing",
+      "label": "Timestep spacing"
+    },
+    {
+      "key": "vae_path",
+      "type": "path",
+      "required": false,
+      "label": "VAE path (diffusers gguf / sd_cpp)"
+    },
+    {
+      "key": "clip_path",
+      "type": "path",
+      "required": false,
+      "label": "CLIP path (optional, diffusers gguf)"
+    },
+    {
+      "key": "gguf_filename",
+      "type": "str",
+      "required": false,
+      "label": "GGUF filename (if gguf_path is HF repo)"
+    },
+    {
+      "key": "hf_token",
+      "type": "str",
+      "required": false,
+      "label": "Hugging Face token (gated repos)"
+    },
+    {
+      "key": "dtype",
+      "type": "enum",
+      "choices": [
+        "auto",
+        "fp16",
+        "bf16",
+        "fp32"
+      ],
+      "default": "auto",
+      "label": "Torch dtype (diffusers)"
+    },
+    {
+      "key": "device",
+      "type": "enum",
+      "choices": [
+        "auto",
+        "cuda",
+        "xpu",
+        "cpu",
+        "mps"
+      ],
+      "default": "auto",
+      "label": "Device (diffusers)"
+    },
+    {
+      "key": "enable_model_cpu_offload",
+      "type": "bool",
+      "required": false,
+      "label": "Enable model CPU offload (diffusers)"
+    },
+    {
+      "key": "enable_sequential_cpu_offload",
+      "type": "bool",
+      "required": false,
+      "label": "Enable sequential CPU offload (diffusers)"
+    },
+    {
+      "key": "max_sequence_length",
+      "type": "int",
+      "required": false,
+      "label": "Max sequence length (Flux)"
+    },
+    {
+      "key": "low_cpu_mem_usage",
+      "type": "bool",
+      "required": false,
+      "label": "Low CPU mem usage (diffusers)"
+    },
+    {
+      "key": "cli_path",
+      "type": "path",
+      "required": false,
+      "label": "GGUF CLI path (image generator binary)"
+    },
+    {
+      "key": "cli_args",
+      "type": "str",
+      "required": false,
+      "label": "CLI args template (uses {model_path}, {prompt}, {out_path}, {width}, {height}, {steps}, {guidance}, {negative_prompt}, {seed}, {seed_arg})"
+    },
+    {
+      "key": "output_ext",
+      "type": "enum",
+      "choices": [
+        "png",
+        "jpg",
+        "jpeg",
+        "webp"
+      ],
+      "default": "png",
+      "label": "Output format"
+    },
+    {
+      "key": "clip_l_path",
+      "type": "path",
+      "required": false,
+      "label": "CLIP-L path (sd_cpp)"
+    },
+    {
+      "key": "clip_g_path",
+      "type": "path",
+      "required": false,
+      "label": "CLIP-G path (sd_cpp)"
+    },
+    {
+      "key": "t5xxl_path",
+      "type": "path",
+      "required": false,
+      "label": "T5-XXL path (sd_cpp)"
+    },
+    {
+      "key": "t5_path",
+      "type": "path",
+      "required": false,
+      "label": "T5 path (sd_cpp)"
+    },
+    {
+      "key": "n_threads",
+      "type": "int",
+      "required": false,
+      "label": "Threads (sd_cpp)"
+    },
+    {
+      "key": "n_gpu_layers",
+      "type": "int",
+      "required": false,
+      "label": "GPU layers (sd_cpp)"
+    },
+    {
+      "key": "device",
+      "type": "str",
+      "required": false,
+      "label": "Device (sd_cpp)"
+    },
+    {
+      "key": "sdcpp_kwargs",
+      "type": "object",
+      "required": false,
+      "label": "Extra kwargs (sd_cpp)"
+    },
+    {
+      "key": "timeout_s",
+      "type": "int",
+      "default": 300,
+      "label": "CLI timeout (seconds)"
+    },
+    {
+      "key": "steps",
+      "type": "int",
+      "default": 28,
+      "label": "Steps"
+    },
+    {
+      "key": "cfg_scale",
+      "type": "float",
+      "default": 3.5,
+      "label": "CFG scale"
+    },
+    {
+      "key": "width",
+      "type": "int",
+      "default": 1024,
+      "label": "Width"
+    },
+    {
+      "key": "height",
+      "type": "int",
+      "default": 1024,
+      "label": "Height"
+    },
+    {
+      "key": "sampler",
+      "type": "enum",
+      "choices": [
+        "euler",
+        "euler_a",
+        "dpmpp_2m",
+        "ddim"
+      ],
+      "default": "euler",
+      "label": "Sampler"
+    },
+    {
+      "key": "seed",
+      "type": "int",
+      "default": -1,
+      "label": "Seed (-1=random)"
+    }
+  ]
+}

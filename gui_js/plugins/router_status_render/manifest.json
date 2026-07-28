@@ -1,0 +1,7 @@
+{
+  "id": "router_status_render",
+  "name": "Router Status Render",
+  "kind": "render",
+  "description": "Render aiRouter plugin results into friendly status output.",
+  "entry": "plugin.js"
+}

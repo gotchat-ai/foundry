@@ -1,0 +1,62 @@
+{
+  "recommended_loader_id": "model_loader.model_deck.os_agent",
+  "fields": [
+    {
+      "key": "model_path",
+      "type": "path",
+      "required": true,
+      "label": "Agent/VLM GGUF model path"
+    },
+    {
+      "key": "mmproj_path",
+      "type": "path",
+      "required": false,
+      "label": "MMProj path (if vision)"
+    },
+    {
+      "key": "chat_handler",
+      "type": "enum",
+      "choices": [
+        "auto",
+        "llava_15",
+        "qwen25vl",
+        "qwen3vl"
+      ],
+      "default": "auto",
+      "label": "Chat handler"
+    },
+    {
+      "key": "executor",
+      "type": "enum",
+      "choices": [
+        "pyautogui",
+        "native"
+      ],
+      "default": "pyautogui",
+      "label": "Executor"
+    },
+    {
+      "key": "action_space",
+      "type": "enum",
+      "choices": [
+        "coords",
+        "ui_tree",
+        "hybrid"
+      ],
+      "default": "coords",
+      "label": "Action space"
+    },
+    {
+      "key": "temp",
+      "type": "float",
+      "default": 0.2,
+      "label": "Temperature"
+    },
+    {
+      "key": "grounding_temp",
+      "type": "float",
+      "default": 0.0,
+      "label": "Grounding temperature"
+    }
+  ]
+}
