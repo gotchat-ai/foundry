@@ -39,6 +39,4 @@ This framework release should be deployed with compatible backend services, CMS 
 
 == Changelog ==
 = 1.0.0 =
-- Made some changes to readme
-- added vllm_backend_2.py file
-- added a newline after import torch line
+- initial release
