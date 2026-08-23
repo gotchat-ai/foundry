@@ -6,6 +6,7 @@ from pathlib import Path
 import inspect
 import builtins
 import contextlib
+import importlib
 import importlib.util
 import sys
 import sysconfig
@@ -14,7 +15,9 @@ from runtime_cuda import empty_accelerator_cache, preferred_torch_device
 from fastapi import APIRouter, Request, HTTPException
 from plugins.gui_helpers._framework.utils import require_gui_plugin_enabled
 from plugins.ai_routes.model_deck_utils import get_server_app
+from plugins.model_loader.model_deck import compat_registry
 from plugins.model_loader.gguf.plugin import _resolve_gguf_path
+from plugins.model_loader.model_deck.local_loaders.diffusers_manifest import build_pipeline_from_runtime_profile, build_transformer_and_pipeline, resolve_manifest, resolve_runtime_profile
 try:
     from plugins.gui_helpers._framework.event_bus import publish_gui_event
 except Exception:
@@ -35,6 +38,78 @@ _PIPELINE: Optional[Any] = None
 _LAST_KEY: Optional[str] = None
 
 
+def _teardown_pipeline(pipe: Any) -> None:
+    if pipe is None:
+        return
+    try:
+        maybe_free = getattr(pipe, "maybe_free_model_hooks", None)
+        if callable(maybe_free):
+            maybe_free()
+    except Exception:
+        pass
+    for attr in ("components", "hf_device_map", "device_map", "_all_hooks"):
+        try:
+            if hasattr(pipe, attr):
+                setattr(pipe, attr, None if attr != "components" else {})
+        except Exception:
+            pass
+
+
+def _release_runtime_memory(torch_module: Any, device: Optional[str]) -> None:
+    import gc
+    import time
+
+    dev = str(device or "").strip().lower()
+    dev_index = None
+    if ":" in dev:
+        base, raw_idx = dev.split(":", 1)
+        dev = base.strip()
+        try:
+            dev_index = int(str(raw_idx).strip())
+        except Exception:
+            dev_index = None
+
+    for _ in range(2):
+        gc.collect()
+        try:
+            if dev == "xpu":
+                xpu_mod = getattr(torch_module, "xpu", None)
+                if xpu_mod is not None:
+                    if dev_index is not None and hasattr(xpu_mod, "set_device"):
+                        xpu_mod.set_device(dev_index)
+                    if hasattr(xpu_mod, "synchronize"):
+                        xpu_mod.synchronize()
+                    if hasattr(xpu_mod, "empty_cache"):
+                        xpu_mod.empty_cache()
+                    if hasattr(xpu_mod, "synchronize"):
+                        xpu_mod.synchronize()
+            else:
+                empty_accelerator_cache(torch_module, device)
+        except Exception:
+            pass
+        time.sleep(0.15)
+    try:
+        empty_accelerator_cache(torch_module, device)
+    except Exception:
+        pass
+    for attr in ("unet", "vae", "text_encoder", "text_encoder_2", "transformer", "controlnet", "image_encoder"):
+        try:
+            module = getattr(pipe, attr, None)
+            if module is not None and hasattr(module, "to"):
+                try:
+                    module.to("cpu")
+                except Exception:
+                    pass
+            setattr(pipe, attr, None)
+        except Exception:
+            pass
+    try:
+        if hasattr(pipe, "to"):
+            pipe.to("cpu")
+    except Exception:
+        pass
+
+
 def _ensure_stdlib_profile_module() -> None:
     mod = sys.modules.get("profile")
     if getattr(mod, "runctx", None):
@@ -52,9 +127,30 @@ def _ensure_stdlib_profile_module() -> None:
         sys.modules["profile"] = profile_mod
 
 
+def _device_base(device: str) -> str:
+    text = str(device or "").strip().lower()
+    if ":" in text:
+        return text.split(":", 1)[0].strip()
+    return text
+
+
 def _resolve_device(settings: Dict[str, Any]) -> str:
     device = str(settings.get("device") or "").strip().lower()
-    if device and device != "auto":
+    if not device or device == "auto":
+        try:
+            import torch
+            device = preferred_torch_device(torch)
+        except Exception:
+            device = "cpu"
+    selection_mode = str(settings.get("gpu_selection_mode") or "").strip().lower()
+    if selection_mode == "single" and ":" not in device and _device_base(device) in ("cuda", "xpu"):
+        try:
+            main_gpu = int(settings.get("main_gpu"))
+        except Exception:
+            main_gpu = 0
+        if main_gpu >= 0:
+            return f"{_device_base(device)}:{main_gpu}"
+    if device:
         return device
     try:
         import torch
@@ -65,7 +161,7 @@ def _resolve_device(settings: Dict[str, Any]) -> str:
 
 
 def _should_block_cuda_flash_attn(settings: Dict[str, Any]) -> bool:
-    device = str(settings.get("device") or "").strip().lower()
+    device = _device_base(_resolve_device(settings))
     if device and device not in ("auto", "cuda"):
         return True
     try:
@@ -116,6 +212,7 @@ def _block_cuda_flash_attn_imports(settings: Dict[str, Any]):
 
 def _resolve_dtype(settings: Dict[str, Any], device: str):
     dtype = str(settings.get("dtype") or "").strip().lower()
+    base_device = _device_base(device)
     try:
         import torch
     except Exception:
@@ -128,9 +225,9 @@ def _resolve_dtype(settings: Dict[str, Any], device: str):
     elif dtype in ("fp32", "float32"):
         out = torch.float32
     else:
-        out = torch.float16 if device != "cpu" else torch.float32
+        out = torch.float16 if base_device != "cpu" else torch.float32
 
-    if device == "cpu" and out in (torch.float16, torch.bfloat16):
+    if base_device == "cpu" and out in (torch.float16, torch.bfloat16):
         out = torch.float32
     return out
 
@@ -147,6 +244,29 @@ def _resolve_bool(value: Any) -> Optional[bool]:
         if v in ("0", "false", "no", "off"):
             return False
     return bool(value)
+
+
+def _diffusers_offload_kwargs(method: Any, device: str) -> Dict[str, Any]:
+    try:
+        sig = inspect.signature(method)
+    except Exception:
+        return {}
+    params = sig.parameters
+    base_device = str(device or "").strip().lower()
+    gpu_id = None
+    if ":" in base_device:
+        maybe_base, maybe_idx = base_device.split(":", 1)
+        try:
+            gpu_id = int(maybe_idx)
+            base_device = maybe_base
+        except Exception:
+            pass
+    kwargs: Dict[str, Any] = {}
+    if "device" in params and base_device:
+        kwargs["device"] = base_device
+    if "gpu_id" in params and gpu_id is not None:
+        kwargs["gpu_id"] = gpu_id
+    return kwargs
 
 
 def _normalize_pipeline_component_dtypes(pipe: Any, torch_dtype: Any) -> None:
@@ -213,6 +333,42 @@ def _apply_token_kwargs(fn: Any, kwargs: Dict[str, Any], token: str) -> Dict[str
     return kwargs
 
 
+def _resolve_manifest_pipeline(request: Optional[Request], settings: Dict[str, Any], torch_dtype: Any, hf_token: str) -> Optional[Any]:
+    runtime_profile = resolve_runtime_profile(compat_registry, type_id="image_gen", settings=settings)
+    loader_spec = resolve_manifest(compat_registry, type_id="image_gen", settings=settings)
+    if not loader_spec:
+        loader_spec = {}
+    try:
+        import torch
+        compute_dtype = torch_dtype or torch.float32
+    except Exception:
+        compute_dtype = torch_dtype
+
+    def _resolve_source(source: str) -> str:
+        return _resolve_gguf_path_setting(request, settings, str(source or "").strip())
+
+    pipe = build_pipeline_from_runtime_profile(
+        runtime_profile=runtime_profile,
+        settings=settings,
+        torch_dtype=torch_dtype,
+        hf_token=hf_token,
+        compute_dtype=compute_dtype,
+        apply_token_kwargs=_apply_token_kwargs,
+        resolve_source=_resolve_source,
+    )
+    if pipe is not None:
+        return pipe
+    return build_transformer_and_pipeline(
+        loader_spec=loader_spec,
+        settings=settings,
+        torch_dtype=torch_dtype,
+        hf_token=hf_token,
+        compute_dtype=compute_dtype,
+        apply_token_kwargs=_apply_token_kwargs,
+        resolve_source=_resolve_source,
+    )
+
+
 def _resolve_gguf_path_setting(request: Optional[Request], settings: Dict[str, Any], gguf_path: str) -> str:
     if not gguf_path:
         return ""
@@ -266,6 +422,37 @@ def _resolve_unet_path_setting(
 
 
 def load(request: Request, settings: Dict[str, Any]) -> Dict[str, Any]:
+    workflow_mode = str(settings.get("workflow_loader_mode") or settings.get("model_workflow_mode") or "").strip().lower()
+    if (
+        str(settings.get("__model_deck_type_id") or "").strip() == "image_gen"
+        and str(settings.get("image_command_mode") or "standard").strip().lower() == "advanced"
+        and workflow_mode != "workflow_model_loader"
+    ):
+        model_ref = str(settings.get("model_id") or settings.get("gguf_path") or settings.get("model_path") or "").strip()
+        _STATE.update({
+            "loaded": True,
+            "model_id": model_ref or None,
+            "settings": settings,
+            "ts": int(time.time()),
+            "device": None,
+            "dtype": None,
+        })
+        if callable(publish_gui_event):
+            try:
+                publish_gui_event(
+                    "processes.changed",
+                    {"kind": "image_gen", "action": "load", "loader_id": LOADER_ID, "model_id": model_ref},
+                )
+            except Exception:
+                pass
+        return {
+            "ok": True,
+            "loader_id": LOADER_ID,
+            "loaded": True,
+            "model_id": model_ref,
+            "mode": "advanced",
+        }
+
     backend = str(settings.get("backend") or "diffusers").strip().lower()
     if backend != "diffusers":
         raise HTTPException(400, f"unsupported backend: {backend}")
@@ -318,7 +505,31 @@ def load(request: Request, settings: Dict[str, Any]) -> Dict[str, Any]:
     if use_unet and not sdxl_unet_path:
         raise HTTPException(400, "sdxl_unet_path required when use_unet is enabled")
 
-    if use_gguf_transformer:
+    manifest_pipe = None
+    manifest_id = ""
+    try:
+        try:
+            manifest_probe = resolve_manifest(compat_registry, type_id="image_gen", settings=settings)
+            manifest_id = str((manifest_probe or {}).get("id") or (manifest_probe or {}).get("loader_id") or "")
+        except Exception:
+            manifest_id = ""
+        manifest_pipe = _resolve_manifest_pipeline(request, settings, torch_dtype, hf_token)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        try:
+            runtime_profile_for_error = resolve_runtime_profile(compat_registry, type_id="image_gen", settings=settings)
+            loader_spec_for_error = resolve_manifest(compat_registry, type_id="image_gen", settings=settings)
+        except Exception:
+            runtime_profile_for_error = {}
+            loader_spec_for_error = {}
+        if runtime_profile_for_error or loader_spec_for_error:
+            raise HTTPException(500, f"tested diffusers manifest load failed: {exc}") from exc
+        manifest_pipe = None
+
+    if manifest_pipe is not None:
+        pipe = manifest_pipe
+    elif use_gguf_transformer:
         try:
             import torch
             _ensure_stdlib_profile_module()
@@ -469,9 +680,9 @@ def load(request: Request, settings: Dict[str, Any]) -> Dict[str, Any]:
 
     try:
         if enable_sequential_cpu_offload and hasattr(pipe, "enable_sequential_cpu_offload"):
-            pipe.enable_sequential_cpu_offload()
+            pipe.enable_sequential_cpu_offload(**_diffusers_offload_kwargs(pipe.enable_sequential_cpu_offload, device))
         elif enable_model_cpu_offload and hasattr(pipe, "enable_model_cpu_offload"):
-            pipe.enable_model_cpu_offload()
+            pipe.enable_model_cpu_offload(**_diffusers_offload_kwargs(pipe.enable_model_cpu_offload, device))
         elif hasattr(pipe, "to"):
             pipe = pipe.to(device)
     except Exception as exc:
@@ -488,6 +699,9 @@ def load(request: Request, settings: Dict[str, Any]) -> Dict[str, Any]:
         "device": device,
         "dtype": str(torch_dtype),
         "cpu_offload": bool(enable_model_cpu_offload or enable_sequential_cpu_offload),
+        "pipeline_class": type(pipe).__name__ if pipe is not None else "",
+        "pipeline_module": type(pipe).__module__ if pipe is not None else "",
+        "manifest_id": manifest_id,
     })
     if callable(publish_gui_event):
         try:
@@ -515,14 +729,10 @@ def unload(request: Request, settings: Dict[str, Any]) -> Dict[str, Any]:
     try:
         import gc
         import torch
-        if pipe is not None and hasattr(pipe, "to"):
-            try:
-                pipe.to("cpu")
-            except Exception:
-                pass
+        _teardown_pipeline(pipe)
         del pipe
         gc.collect()
-        empty_accelerator_cache(torch, _STATE.get("device"))
+        _release_runtime_memory(torch, _STATE.get("device"))
     except Exception:
         pass
     _STATE.update({
@@ -561,6 +771,9 @@ def _settings_key(settings: Dict[str, Any]) -> str:
         str(settings.get("vae_path") or ""),
         str(settings.get("clip_path") or ""),
         str(settings.get("use_flux") or ""),
+        str(settings.get("model_deck_compat_manifest_id") or ""),
+        str(settings.get("diffusers_pipeline_class") or ""),
+        str(settings.get("diffusers_transformer_class") or ""),
         str(settings.get("hf_token") or settings.get("hf_access_token") or ""),
         str(settings.get("base_model_id") or ""),
         str(settings.get("control_model_id") or ""),

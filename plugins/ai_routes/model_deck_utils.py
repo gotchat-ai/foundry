@@ -11,6 +11,156 @@ from runtime_cuda import empty_accelerator_cache
 from plugins.gui_helpers._framework.services import get_plugin_service
 
 
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi", ".wmv"}
+
+
+def _attachment_dict(item: Any) -> Dict[str, Any]:
+    if item is None:
+        return {}
+    if isinstance(item, dict):
+        return dict(item)
+    try:
+        if hasattr(item, "model_dump"):
+            return dict(item.model_dump(exclude_none=True))
+        if hasattr(item, "dict"):
+            return dict(item.dict(exclude_none=True))
+    except Exception:
+        pass
+    try:
+        return dict(item)
+    except Exception:
+        return {}
+
+
+def _extract_ordered_attachments(req: Any) -> List[Dict[str, Any]]:
+    sources: List[Any] = []
+
+    def _add(src: Any) -> None:
+        if not src:
+            return
+        if isinstance(src, dict):
+            nested = src.get("items") or src.get("attachments")
+            if nested is not None:
+                _add(nested)
+                return
+            sources.append(src)
+            return
+        if isinstance(src, (list, tuple)):
+            sources.extend(src)
+            return
+        sources.append(src)
+
+    if isinstance(req, dict):
+        _add(req.get("attachments"))
+        ext = req.get("ext") if isinstance(req.get("ext"), dict) else {}
+        _add((ext or {}).get("attachments"))
+        _add((ext or {}).get("media_attachments"))
+        msgs = req.get("messages")
+    else:
+        _add(getattr(req, "attachments", None))
+        ext = getattr(req, "ext", None)
+        if isinstance(ext, dict):
+            _add(ext.get("attachments"))
+            _add(ext.get("media_attachments"))
+        msgs = getattr(req, "messages", None)
+
+    if isinstance(msgs, list):
+        for msg in msgs:
+            if not isinstance(msg, dict) or (msg.get("role") or "").lower() != "user":
+                continue
+            meta = msg.get("meta")
+            if isinstance(meta, dict):
+                _add(meta.get("attachments"))
+            content = msg.get("content")
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict):
+                        _add(part.get("attachment") or part.get("file") or part.get("media"))
+
+    out: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in sources:
+        item = _attachment_dict(raw)
+        if not item:
+            continue
+        path = item.get("path") or item.get("local_path") or item.get("file_path") or item.get("abs_path")
+        url = item.get("url") or item.get("href") or item.get("download_url")
+        name = item.get("name") or item.get("filename") or item.get("file_name") or (os.path.basename(str(path)) if path else "")
+        mime = str(item.get("mime") or item.get("content_type") or item.get("type") or "").lower()
+        kind = str(item.get("kind") or item.get("media_type") or item.get("category") or "").lower()
+        key = str(path or url or name or repr(item))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({**item, "path": path or "", "url": url or "", "name": name or "", "mime": mime, "kind": kind})
+    return out
+
+
+def normalize_workflow_media_inputs(req: Any) -> Dict[str, Any]:
+    """Map chat-uploaded media into predictable first/last workflow inputs.
+
+    Convention:
+    - one image/video => source/first media
+    - two images/videos => first media is source, second media is last/target
+    - text prompt remains the route prompt; workflows may omit unused extras
+    """
+    images: List[str] = []
+    videos: List[str] = []
+
+    for item in _extract_ordered_attachments(req):
+        path = str(item.get("path") or item.get("url") or "").strip()
+        if not path:
+            continue
+        mime = str(item.get("mime") or "").lower()
+        kind = str(item.get("kind") or "").lower()
+        name = str(item.get("name") or path).lower()
+        ext = os.path.splitext(name.split("?", 1)[0])[1].lower()
+        is_image = kind == "image" or mime.startswith("image/") or ext in IMAGE_EXTENSIONS
+        is_video = kind == "video" or mime.startswith("video/") or ext in VIDEO_EXTENSIONS
+        if is_image:
+            images.append(path)
+        elif is_video:
+            videos.append(path)
+
+    out: Dict[str, Any] = {}
+    if images:
+        out.update({
+            "input_image_paths": images,
+            "image_paths": images,
+            "source_image_path": images[0],
+            "first_image_path": images[0],
+            "input_image_path": images[0],
+            "init_image_path": images[0],
+            "reference_image_path": images[0],
+        })
+        if len(images) > 1:
+            out.update({
+                "last_image_path": images[1],
+                "target_image_path": images[1],
+                "end_image_path": images[1],
+            })
+    if videos:
+        out.update({
+            "input_video_paths": videos,
+            "video_paths": videos,
+            "source_video_path": videos[0],
+            "first_video_path": videos[0],
+            "input_video_path": videos[0],
+            "init_video_path": videos[0],
+            "reference_video_path": videos[0],
+        })
+        if len(videos) > 1:
+            out.update({
+                "last_video_path": videos[1],
+                "target_video_path": videos[1],
+                "end_video_path": videos[1],
+            })
+    if images or videos:
+        out["workflow_media_inputs"] = {"images": images, "videos": videos}
+    return out
+
+
 def get_server_app(settings: Dict[str, Any], reg: Any) -> Any:
     app = settings.get("__server_app")
     if app is not None:
@@ -546,6 +696,7 @@ def _image_gen_worker(conn, loader_id: str, model_settings: Dict[str, Any], para
     try:
         from plugins.model_loader.model_deck.local_loaders.image_gen_gguf import routes as gguf_image_routes
         from plugins.model_loader.model_deck.local_loaders.diffusers import routes as diffusers_routes
+        from plugins.model_loader.model_deck.local_loaders import custom_command_runtime
 
         prompt = str(params.get("prompt") or "")
         negative_prompt = params.get("negative_prompt")
@@ -566,7 +717,33 @@ def _image_gen_worker(conn, loader_id: str, model_settings: Dict[str, Any], para
             except Exception:
                 pass
 
-        if loader_id == gguf_image_routes.LOADER_ID:
+        if str(model_settings.get("image_command_mode") or "standard").strip().lower() == "advanced":
+            if not output_dir:
+                output_dir = os.path.join(os.getcwd(), "data", "uploads")
+            os.makedirs(output_dir, exist_ok=True)
+            ext = "jpg" if fmt in ("jpg", "jpeg") else ("webp" if fmt == "webp" else "png")
+            out_path = os.path.join(output_dir, f"image_gen_{int(time.time())}_{os.getpid()}.{ext}")
+            custom_command_runtime.run_advanced_command(
+                settings=model_settings,
+                prefix="image",
+                runtime_inputs={
+                    "prompt": prompt,
+                    "negative_prompt": negative_prompt or "",
+                    "output_path": out_path,
+                    "width": width or "",
+                    "height": height or "",
+                    "steps": num_inference_steps or "",
+                    "num_inference_steps": num_inference_steps or "",
+                    "guidance": guidance_scale or "",
+                    "guidance_scale": guidance_scale or "",
+                    "seed": seed or "",
+                    "seed_arg": f"--seed {seed}" if seed not in (None, "") else "",
+                },
+            )
+            if not os.path.isfile(out_path):
+                raise RuntimeError(f"advanced image command did not create output: {out_path}")
+            url = f"/uploads/{os.path.basename(out_path)}"
+        elif loader_id == gguf_image_routes.LOADER_ID:
             out_path = gguf_image_routes.generate_text2image(
                 prompt=prompt,
                 settings=model_settings,
@@ -876,6 +1053,8 @@ class ImageGenRunner:
         try:
             last_step = -1
             last_total = None
+            last_heartbeat = time.monotonic()
+            heartbeat_total = int(num_inference_steps or 0)
             while True:
                 if callable(cancel_cb) and cancel_cb():
                     try:
@@ -897,11 +1076,18 @@ class ImageGenRunner:
                                     progress_callback(step, total)
                             except Exception:
                                 pass
+                        last_heartbeat = time.monotonic()
                         continue
                     if isinstance(msg, dict) and msg.get("type") == "result":
                         msg.pop("type", None)
                         return msg
                     return msg
+                if callable(progress_callback) and proc.is_alive() and (time.monotonic() - last_heartbeat) >= 4.0:
+                    try:
+                        progress_callback(max(last_step, 0), int(last_total or heartbeat_total or 0))
+                    except Exception:
+                        pass
+                    last_heartbeat = time.monotonic()
                 if self.worker_timeout > 0 and (time.monotonic() - start > self.worker_timeout):
                     return {"ok": False, "error": "worker_timeout"}
         finally:
@@ -935,6 +1121,7 @@ class ImageGenRunner:
 def _video_gen_worker(conn, model_settings: Dict[str, Any], params: Dict[str, Any]) -> None:
     try:
         from plugins.model_loader.model_deck.local_loaders.video import routes as video_routes
+        from plugins.model_loader.model_deck.local_loaders import custom_command_runtime
 
         prompt = str(params.get("prompt") or "")
         num_frames = params.get("num_frames")
@@ -944,6 +1131,7 @@ def _video_gen_worker(conn, model_settings: Dict[str, Any], params: Dict[str, An
         height = params.get("height")
         fps = params.get("fps")
         seed = params.get("seed")
+        negative_prompt = params.get("negative_prompt")
         output_dir = str(params.get("output_dir") or "").strip()
 
         def _progress(step: int, total: int) -> None:
@@ -952,19 +1140,47 @@ def _video_gen_worker(conn, model_settings: Dict[str, Any], params: Dict[str, An
             except Exception:
                 pass
 
-        out_path = video_routes.generate_text2video(
-            prompt=prompt,
-            settings=model_settings,
-            num_frames=num_frames,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
-            width=width,
-            height=height,
-            fps=fps,
-            seed=seed,
-            progress_callback=_progress,
-            output_dir=output_dir or None,
-        )
+        if str(model_settings.get("video_command_mode") or "standard").strip().lower() == "advanced":
+            if not output_dir:
+                output_dir = os.path.join(os.getcwd(), "data", "uploads")
+            os.makedirs(output_dir, exist_ok=True)
+            out_path = os.path.join(output_dir, f"video_gen_{int(time.time())}_{os.getpid()}.mp4")
+            custom_command_runtime.run_advanced_command(
+                settings=model_settings,
+                prefix="video",
+                runtime_inputs={
+                    "prompt": prompt,
+                    "negative_prompt": negative_prompt or "",
+                    "output_path": out_path,
+                    "width": width or "",
+                    "height": height or "",
+                    "frames": num_frames or "",
+                    "num_frames": num_frames or "",
+                    "fps": fps or "",
+                    "steps": num_inference_steps or "",
+                    "num_inference_steps": num_inference_steps or "",
+                    "guidance": guidance_scale or "",
+                    "guidance_scale": guidance_scale or "",
+                    "seed": seed or "",
+                    "seed_arg": f"--seed {seed}" if seed not in (None, "") else "",
+                },
+            )
+            if not os.path.isfile(out_path):
+                raise RuntimeError(f"advanced video command did not create output: {out_path}")
+        else:
+            out_path = video_routes.generate_text2video(
+                prompt=prompt,
+                settings=model_settings,
+                num_frames=num_frames,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
+                width=width,
+                height=height,
+                fps=fps,
+                seed=seed,
+                progress_callback=_progress,
+                output_dir=output_dir or None,
+            )
         url = f"/uploads/{os.path.basename(out_path)}"
         conn.send({"type": "result", "ok": True, "out_path": out_path, "url": url})
     except Exception as exc:

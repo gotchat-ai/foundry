@@ -5,19 +5,156 @@
       "key": "backend",
       "type": "enum",
       "choices": [
-        "diffusers",
-        "comfyui",
-        "sd_cpp",
-        "gguf_cli"
+        "diffusers"
       ],
       "default": "diffusers",
       "label": "Backend"
+    },
+    {
+      "key": "model_backend",
+      "type": "enum",
+      "choices": [
+        { "value": "default", "label": "Default" },
+        { "value": "workflow", "label": "Workflow" }
+      ],
+      "default": "default",
+      "label": "Model Backend",
+      "description": "Default uses the normal built-in edit fields. Workflow uses the Agent Flow native staged graph for this model."
+    },
+    {
+      "key": "image_command_mode",
+      "type": "enum",
+      "choices": [
+        { "value": "standard", "label": "Built-in backend routing" },
+        { "value": "advanced", "label": "Custom command template" }
+      ],
+      "default": "standard",
+      "label": "Execution mode",
+      "description": "Use built-in diffusers / sd_cpp routing by default, or switch to a fully custom command template."
+    },
+    {
+      "key": "workflow_loader_mode",
+      "type": "enum",
+      "choices": [
+        { "value": "checkpoint_runner", "label": "Built-in runner" },
+        { "value": "workflow_model_loader", "label": "Workflow model loader" }
+      ],
+      "default": "checkpoint_runner",
+      "label": "Model workflow mode",
+      "ui_hidden": true,
+      "description": "For tested workflow profiles, keep the built-in route or opt into the node-based workflow model loader."
+    },
+    {
+      "key": "workflow_node_lifecycle_policy",
+      "type": "enum",
+      "choices": [
+        { "value": "lazy_unload", "label": "Lazy load, unload after node" },
+        { "value": "lazy_persist", "label": "Lazy load, persist until cleanup" },
+        { "value": "preload_persist", "label": "Preload and persist" }
+      ],
+      "default": "lazy_unload",
+      "label": "Workflow node lifecycle",
+      "description": "Controls resource behavior for workflow-model-loader nodes."
+    },
+    {
+      "key": "workflow_execution_backend",
+      "type": "enum",
+      "choices": [
+        { "value": "built_in_runner", "label": "Built-in runner" },
+        { "value": "native_graph", "label": "Native staged graph execution" },
+        { "value": "native_comfyui_gguf", "label": "Native ComfyUI-GGUF graph backend (experimental)" }
+      ],
+      "default": "built_in_runner",
+      "label": "Workflow execution backend",
+      "ui_hidden": true,
+      "description": "Selects how terminal model workflow nodes execute for image models."
+    },
+    {
+      "key": "workflow_node_timeout_s",
+      "type": "number",
+      "default": 10800,
+      "label": "Workflow node timeout (seconds)",
+      "description": "Maximum time allowed for a terminal workflow execution node."
+    },
+    {
+      "key": "comfyui_runtime_root",
+      "type": "path",
+      "required": false,
+      "label": "ComfyUI runtime root",
+      "ui_hidden": true,
+      "description": "Optional path to a full ComfyUI checkout. Needed for the native ComfyUI-GGUF backend because the GGUF custom node imports comfy.*, nodes, and folder_paths."
+    },
+    {
+      "key": "comfyui_gguf_vendor_root",
+      "type": "path",
+      "required": false,
+      "default": "C:/Users/Tee/projects/llmloader2/vendor/ComfyUI-GGUF",
+      "label": "ComfyUI-GGUF vendor root",
+      "ui_hidden": true,
+      "description": "Path to the vendored ComfyUI-GGUF custom node code."
+    },
+    {
+      "key": "image_template_preset",
+      "type": "enum",
+      "choices": [
+        { "value": "generic_diffusers", "label": "Generic Diffusers" },
+        { "value": "flux_gguf_custom", "label": "Flux GGUF custom runner" },
+        { "value": "gguf_cli_custom", "label": "Generic GGUF CLI" }
+      ],
+      "default": "generic_diffusers",
+      "label": "Template preset",
+      "description": "Prefills example JSON for custom image generation commands."
+    },
+    {
+      "key": "image_runtime_template_json",
+      "type": "textarea",
+      "rows": 10,
+      "required": false,
+      "label": "Custom command template JSON",
+      "description": "Advanced mode only. Full argv template for your external image generator."
+    },
+    {
+      "key": "image_runtime_assets_json",
+      "type": "textarea",
+      "rows": 6,
+      "required": false,
+      "label": "Custom asset JSON",
+      "description": "Advanced mode only. Paths or static assets referenced by the template."
+    },
+    {
+      "key": "image_runtime_params_json",
+      "type": "textarea",
+      "rows": 6,
+      "required": false,
+      "label": "Custom parameter JSON",
+      "description": "Advanced mode only. Optional defaults merged into the runtime template placeholders."
+    },
+    {
+      "key": "image_runtime_extra_args",
+      "type": "str",
+      "required": false,
+      "label": "Custom extra args",
+      "description": "Advanced mode only. Extra args appended after the rendered command template."
     },
     {
       "key": "model_id",
       "type": "str",
       "required": false,
       "label": "Model id/path (base pipeline)"
+    },
+    {
+      "key": "diffusers_pipeline_class",
+      "type": "str",
+      "required": false,
+      "label": "Pipeline class name",
+      "description": "Auto-filled from the matched tested profile when known. Leave blank to use the profile default."
+    },
+    {
+      "key": "diffusers_transformer_class",
+      "type": "str",
+      "required": false,
+      "label": "Transformer class name",
+      "description": "Auto-filled from the matched tested profile when known. Leave blank to use the profile default."
     },
     {
       "key": "gguf_path",
@@ -126,6 +263,22 @@
       ],
       "default": "auto",
       "label": "Device (diffusers)"
+    },
+    {
+      "key": "gpu_selection_mode",
+      "type": "enum",
+      "choices": [
+        { "value": "auto", "label": "Automatic device selection" },
+        { "value": "single", "label": "Single GPU/device index" }
+      ],
+      "default": "auto",
+      "label": "GPU selection mode (diffusers)"
+    },
+    {
+      "key": "main_gpu",
+      "type": "int",
+      "default": 0,
+      "label": "GPU device id (diffusers)"
     },
     {
       "key": "enable_model_cpu_offload",

@@ -1,0 +1,12 @@
+{
+  "argv": [
+    "{python_bin}",
+    "{script_path}",
+    "--prompt",
+    "{prompt}",
+    "--output",
+    "{output_path}"
+  ],
+  "optional": [],
+  "append_extra_args_setting": "video_runtime_extra_args"
+}

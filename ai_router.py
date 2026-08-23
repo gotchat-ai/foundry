@@ -48,7 +48,7 @@ class AIRouter:
 
         # Figure out which plugins are enabled for *this* request
         enabled_ids = self._get_enabled_plugins_from_req(req)
-        # print(2342342)
+        print(2342342)
         print(enabled_ids)
         if enabled_ids is not None:
             enabled_set = {rid.lower() for rid in enabled_ids}
@@ -57,7 +57,7 @@ class AIRouter:
             ]
         else:
             candidate_routes = list(self.routes)
-        # print(234234)
+        print(234234)
         # Explicit route selection
         
         print("route_id", route_id)
@@ -68,7 +68,7 @@ class AIRouter:
             if not route.can_handle(req):
                 return False, None
             return _handle_route(route)
-        # print(2342234234234)
+        print(2342234234234)
         print("candidate_routes", candidate_routes)
         # Prefer attachment-capable routes when attachments are present,
         # but only auto-short-circuit on clear "read/describe" intent.

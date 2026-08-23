@@ -1,0 +1,47 @@
+{
+  "argv": [
+    "{python_bin}",
+    "{script_path}",
+    "--model",
+    "{model_id}",
+    "--prompt",
+    "{prompt}",
+    "--output",
+    "{output_path}"
+  ],
+  "optional": [
+    {
+      "setting": "negative_prompt",
+      "flag": "--negative-prompt"
+    },
+    {
+      "setting": "width",
+      "flag": "--width"
+    },
+    {
+      "setting": "height",
+      "flag": "--height"
+    },
+    {
+      "setting": "frames",
+      "flag": "--frames"
+    },
+    {
+      "setting": "fps",
+      "flag": "--fps"
+    },
+    {
+      "setting": "steps",
+      "flag": "--steps"
+    },
+    {
+      "setting": "guidance_scale",
+      "flag": "--guidance-scale"
+    },
+    {
+      "setting": "seed",
+      "flag": "--seed"
+    }
+  ],
+  "append_extra_args_setting": "video_runtime_extra_args"
+}

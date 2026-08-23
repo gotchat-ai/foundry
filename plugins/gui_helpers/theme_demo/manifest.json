@@ -6,5 +6,6 @@
   "description": "Shared admin theme defaults for the Theme Demo GUI plugin.",
   "routes": [
     "/v1/theme_demo/default_theme"
-  ]
+  ],
+  "category": "UI/Appearance"
 }

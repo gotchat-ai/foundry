@@ -1,0 +1,184 @@
+{
+  "id": "wan_diffusers",
+  "label": "Wan Diffusers",
+  "description": "Tested Wan text-to-video profile using the diffusers pipeline.",
+  "aliases": [
+    "wan",
+    "wan2.1",
+    "wan-ai/wan"
+  ],
+  "backends": [
+    "diffusers"
+  ],
+  "runtime_profile": {
+    "kind": "diffusers_components",
+    "family": "wan_video",
+    "asset_slots": [
+      {
+        "key": "model_id",
+        "role": "pipeline_repo",
+        "required": true,
+        "source": "huggingface_repo"
+      },
+      {
+        "key": "use_wan_vae",
+        "role": "enable_optional_vae",
+        "required": false,
+        "source": "setting"
+      },
+      {
+        "key": "wan_vae_subfolder",
+        "role": "vae_subfolder",
+        "required": false,
+        "source": "setting"
+      },
+      {
+        "key": "wan_vae_dtype",
+        "role": "vae_dtype",
+        "required": false,
+        "source": "setting"
+      }
+    ],
+    "components": [
+      {
+        "id": "transformer",
+        "role": "transformer_3d",
+        "class": "WanTransformer3DModel",
+        "module": "diffusers",
+        "load_method": "from_pretrained",
+        "source_setting": "model_id",
+        "source_default": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+        "subfolder_default": "transformer",
+        "torch_dtype_mode": "torch"
+      },
+      {
+        "id": "vae",
+        "role": "vae",
+        "class": "AutoencoderKLWan",
+        "module": "diffusers",
+        "load_method": "from_pretrained",
+        "source_setting": "model_id",
+        "source_default": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+        "subfolder_setting": "wan_vae_subfolder",
+        "subfolder_default": "vae",
+        "enabled_setting": "use_wan_vae",
+        "torch_dtype_mode": "none",
+        "kwargs_from_settings": [
+          {
+            "setting": "wan_vae_dtype",
+            "kw": "torch_dtype",
+            "transform": "torch_dtype"
+          }
+        ]
+      },
+      {
+        "id": "pipeline",
+        "role": "pipeline",
+        "class": "WanPipeline",
+        "module": "diffusers",
+        "load_method": "from_pretrained",
+        "source_setting": "model_id",
+        "source_default": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+        "inject": [
+          {
+            "component": "transformer",
+            "kw": "transformer"
+          },
+          {
+            "component": "vae",
+            "kw": "vae"
+          }
+        ],
+        "kwargs_from_settings": [
+          {
+            "setting": "low_cpu_mem_usage"
+          }
+        ]
+      }
+    ]
+  },
+  "diffusers_loader": {
+    "pipeline_class": "WanPipeline",
+    "pipeline_module": "diffusers",
+    "pipeline_load_method": "from_pretrained",
+    "pipeline_source_setting": "model_id",
+    "pipeline_source_default": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+    "pipeline_inject_key": "transformer",
+    "pipeline_kwargs_from_settings": [
+      {
+        "setting": "low_cpu_mem_usage"
+      }
+    ],
+    "transformer_class": "WanTransformer3DModel",
+    "transformer_module": "diffusers",
+    "transformer_load_method": "from_pretrained",
+    "transformer_source_setting": "model_id",
+    "transformer_source_default": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+    "transformer_subfolder": "transformer"
+  },
+  "requirements": [
+    {
+      "id": "torch",
+      "label": "PyTorch",
+      "kind": "python_package",
+      "package": "torch",
+      "import_name": "torch",
+      "install": [
+        "torch"
+      ],
+      "uninstall": [
+        "torch"
+      ]
+    },
+    {
+      "id": "diffusers",
+      "label": "diffusers",
+      "kind": "python_package",
+      "package": "diffusers",
+      "import_name": "diffusers",
+      "install": [
+        "diffusers"
+      ],
+      "uninstall": [
+        "diffusers"
+      ]
+    },
+    {
+      "id": "wan_pipeline",
+      "label": "WanPipeline",
+      "kind": "python_symbol",
+      "module": "diffusers",
+      "symbol": "WanPipeline",
+      "install": [
+        "diffusers"
+      ],
+      "uninstall": []
+    },
+    {
+      "id": "transformers",
+      "label": "transformers",
+      "kind": "python_package",
+      "package": "transformers",
+      "import_name": "transformers",
+      "install": [
+        "transformers"
+      ],
+      "uninstall": [
+        "transformers"
+      ]
+    },
+    {
+      "id": "imageio_ffmpeg",
+      "label": "imageio-ffmpeg",
+      "kind": "python_package",
+      "package": "imageio-ffmpeg",
+      "import_name": "imageio_ffmpeg",
+      "install": [
+        "imageio-ffmpeg"
+      ],
+      "uninstall": [
+        "imageio-ffmpeg"
+      ]
+    }
+  ]
+}

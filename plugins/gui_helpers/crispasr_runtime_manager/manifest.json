@@ -1,0 +1,10 @@
+{
+  "id": "crispasr_runtime_manager",
+  "name": "CrispASR Runtime Manager",
+  "version": "0.1.0",
+  "description": "Manage CrispASR runtime builds and executable paths for speech backends.",
+  "dependencies": [
+    "collab_chat"
+  ],
+  "category": "Models/Inference"
+}

@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "id": "ltx23",
+  "name": "LTX 2.3",
+  "description": "Capabilities for LTX 2.3 GGUF / native staged graph workflows. This adapter declares model node skills and settings only; it does not auto-load or select workflows.",
+  "model_types": ["video_gen"],
+  "aliases": ["unsloth_ltx_workflow", "unsloth_ltx23_gguf", "ltx_2_3", "unsloth_ltx23_gguf"],
+  "families": ["unsloth_ltx23_gguf", "ltx23_gguf", "ltxv", "ltxv_avtransformer"],
+  "skills": {
+    "asset_resolver": "models.asset_resolver",
+    "prompt_encoder": "models.ltx_prompt_encoder",
+    "text_encoder_loader": "models.ltx_prompt_encoder",
+    "transformer_loader": "models.gguf_transformer_loader",
+    "gguf_transformer_loader": "models.gguf_transformer_loader",
+    "connector_loader": "models.ltx_asset_attach",
+    "lora_loader": "models.ltx_asset_attach",
+    "asset_attach": "models.ltx_asset_attach",
+    "graph_settings": "models.ltx_graph_settings",
+    "sampler": "models.ltx_sampler",
+    "vae_loader": "models.video_vae_decode",
+    "vae_decode": "models.video_vae_decode",
+    "video_encode": "models.video_encode",
+    "media_encode": "models.video_encode",
+    "cleanup": "models.cleanup"
+  },
+  "asset_keys": {
+    "gguf_path": {"label": "LTX transformer GGUF", "kind": "local_or_hf_file", "required": true, "source": "https://huggingface.co/unsloth/LTX-2.3-GGUF"},
+    "embeddings_connectors_path": {"label": "LTX embeddings/connectors", "kind": "local_or_hf_file", "required": true, "source": "https://huggingface.co/unsloth/LTX-2.3-GGUF"},
+    "video_vae_path": {"label": "LTX video VAE", "kind": "local_or_hf_file", "required": true, "source": "https://huggingface.co/Kijai/LTX2.3_comfy"},
+    "audio_vae_path": {"label": "LTX audio VAE", "kind": "local_or_hf_file", "required": false, "source": "https://huggingface.co/Kijai/LTX2.3_comfy"},
+    "text_encoder_gguf_path": {"label": "Gemma text encoder GGUF or safetensors", "kind": "local_or_hf_file", "required": true, "source": "https://huggingface.co/unsloth/gemma-3-12b-it-qat-GGUF"},
+    "text_encoder_mmproj_path": {"label": "Text projection / MMProj", "kind": "local_or_hf_file", "required": true, "source": "https://huggingface.co/Kijai/LTX2.3_comfy"},
+    "distilled_lora_path": {"label": "Distilled LoRA", "kind": "local_or_hf_file", "required": false, "source": "https://huggingface.co/Lightricks/LTX-2.3"},
+    "spatial_upscaler_path": {"label": "Spatial/temporal upscaler", "kind": "local_or_hf_file", "required": false, "source": "https://huggingface.co/Lightricks/LTX-2.3"}
+  },
+  "setting_schema_refs": {
+    "prompt_encoder": "schemas/ltx23_prompt_encoder.json",
+    "sampler": "schemas/ltx23_sampler.json",
+    "vae_decode": "schemas/ltx23_vae_decode.json"
+  },
+  "examples": [
+    {
+      "name": "LTX 2.3 GGUF staged graph",
+      "note": "Example workflows are optional/importable. They are not activated by this manifest."
+    }
+  ]
+}

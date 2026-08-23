@@ -60,8 +60,18 @@ def preferred_torch_device(torch_module, explicit: str | None = None) -> str:
 
 def empty_accelerator_cache(torch_module, device: str | None = None) -> None:
     dev = str(device or preferred_torch_device(torch_module)).strip().lower()
+    dev_index = None
+    if ":" in dev:
+        base, raw_idx = dev.split(":", 1)
+        dev = base.strip()
+        try:
+            dev_index = int(str(raw_idx).strip())
+        except Exception:
+            dev_index = None
     try:
         if dev == "cuda" and cuda_available_safe(torch_module):
+            if dev_index is not None and hasattr(torch_module.cuda, "set_device"):
+                torch_module.cuda.set_device(dev_index)
             torch_module.cuda.empty_cache()
             if hasattr(torch_module.cuda, "ipc_collect"):
                 torch_module.cuda.ipc_collect()
@@ -70,6 +80,10 @@ def empty_accelerator_cache(torch_module, device: str | None = None) -> None:
             return
         if dev == "xpu" and xpu_available_safe(torch_module):
             xpu_mod = getattr(torch_module, "xpu", None)
+            if xpu_mod is not None and dev_index is not None and hasattr(xpu_mod, "set_device"):
+                xpu_mod.set_device(dev_index)
+            if xpu_mod is not None and hasattr(xpu_mod, "synchronize"):
+                xpu_mod.synchronize()
             if xpu_mod is not None and hasattr(xpu_mod, "empty_cache"):
                 xpu_mod.empty_cache()
             if xpu_mod is not None and hasattr(xpu_mod, "synchronize"):

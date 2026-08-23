@@ -1,0 +1,7 @@
+{
+  "model_id": "Tongyi-MAI/Z-Image-Turbo",
+  "width": 1024,
+  "height": 1024,
+  "steps": 50,
+  "guidance_scale": 5.0
+}

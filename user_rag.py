@@ -221,7 +221,7 @@ class UserRagManager:
                                symbol: Optional[str] = None, kind: Optional[str] = None,
                                version: Optional[str] = None, topics: Optional[List[str]] = None, ts: Optional[int] = None) -> str:
         st = self._get_cold_store(sid)
-        print("st: ", st)
+        # print("st: ", st)
         did = self._mk_id(repo_id, path, symbol or "", str(abs(hash(text))))
         meta = {"repo_id": repo_id, "path": path, "lang": lang, "symbol": symbol, "kind": kind, "version": version, "topic": (topics or []), "ts": ts}
         st.add(did, text, meta)
@@ -356,7 +356,7 @@ class UserRagManager:
             with open(p, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception as e:
-            # print(4329923)
+            print(4329923)
             print(e)
             return {"repo_id": repo_id, "versions": [], "latest_seq": 0}
 
@@ -643,7 +643,7 @@ class UserRagManager:
                     st = cls(**ctor) if ctor else cls(base_dir=base)
                     break
                 except Exception as e:
-                    # print(2323244)
+                    print(2323244)
                     print(e)
                     continue
 

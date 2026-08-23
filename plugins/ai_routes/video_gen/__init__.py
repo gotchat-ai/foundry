@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 from plugins.ai_routes.base import BaseRoute, RouterCore
-from plugins.ai_routes.model_deck_utils import VideoGenRunner
+from plugins.ai_routes.model_deck_utils import VideoGenRunner, normalize_workflow_media_inputs
 
 
 PLUGIN_ID = "video_gen"
@@ -39,6 +39,14 @@ class VideoGenRoute(BaseRoute):
             return {"route_id": self.route_id, "ok": False, "error": "empty_prompt"}
 
         settings = self._merge_settings(req)
+        media_inputs = normalize_workflow_media_inputs(req)
+        if media_inputs:
+            settings.update(media_inputs)
+            model_overrides = settings.get("video_gen_model_settings")
+            if not isinstance(model_overrides, dict):
+                model_overrides = {}
+            model_overrides.update(media_inputs)
+            settings["video_gen_model_settings"] = model_overrides
         if self._is_canceled(settings):
             return {"route_id": self.route_id, "ok": False, "error": "canceled"}
         cancel_cb = self._cancel_cb(settings)
@@ -80,6 +88,7 @@ class VideoGenRoute(BaseRoute):
 
         self.emit_status(f"Rendering video ({steps} steps)...", step=0, total=steps)
         last_step = {"value": -1}
+        last_emit = {"ts": 0.0}
 
         def _progress(step: int, total: int) -> None:
             if callable(cancel_cb) and cancel_cb():
@@ -89,9 +98,14 @@ class VideoGenRoute(BaseRoute):
                 total_i = int(total)
             except Exception:
                 return
-            if step_i <= last_step["value"]:
+            import time
+            now = time.monotonic()
+            if step_i < last_step["value"]:
+                return
+            if step_i == last_step["value"] and total_i == steps and (now - last_emit["ts"]) < 8.0:
                 return
             last_step["value"] = step_i
+            last_emit["ts"] = now
             self.emit_status(f"Rendering video ({step_i}/{total_i})...", step=step_i, total=total_i)
 
         try:
@@ -171,7 +185,7 @@ class VideoGenRoute(BaseRoute):
 
     def _merge_settings(self, req: Any) -> Dict[str, Any]:
         settings: Dict[str, Any] = dict(self.core.settings or {})
-        ext = getattr(req, "ext", None)
+        ext = req.get("ext") if isinstance(req, dict) else getattr(req, "ext", None)
         if isinstance(ext, dict):
             over = ext.get("video_gen_settings")
             if isinstance(over, dict):

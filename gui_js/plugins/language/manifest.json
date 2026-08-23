@@ -3,5 +3,6 @@
   "name": "Language",
   "kind": "ui",
   "description": "Framework-wide language selector and plugin translation bundle loader for chat_js.",
-  "entry": "plugin.js"
+  "entry": "plugin.js",
+  "category": "UI/Appearance"
 }

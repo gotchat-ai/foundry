@@ -1,0 +1,10 @@
+{
+  "model_id": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+  "width": 832,
+  "height": 480,
+  "frames": 49,
+  "fps": 16,
+  "steps": 40,
+  "guidance_scale": 5.0,
+  "wan_vae_subfolder": "vae"
+}

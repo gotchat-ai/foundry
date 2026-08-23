@@ -1,0 +1,7 @@
+{
+  "argv": [
+    "{python_bin}"
+  ],
+  "workflow": "native_graph",
+  "note": "MiniMax H3 REF2VA is represented as a native Agent Flow graph. Execution should remain in-process through llmloader2's native MiniMax adapter; do not require a separate Comfy server."
+}

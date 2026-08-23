@@ -45,9 +45,8 @@ class Embedder:
         model_src = local_snapshot or model_name
         try:
             from sentence_transformers import SentenceTransformer
-            self.backend = "st"
             try:
-                self.model = SentenceTransformer(
+                model = SentenceTransformer(
                     model_src,
                     cache_folder=cache_dir,
                     local_files_only=local_only,
@@ -56,7 +55,7 @@ class Embedder:
                 if not local_only and cache_dir:
                     local_snapshot = _try_local_snapshot(model_name, cache_dir)
                     if local_snapshot:
-                        self.model = SentenceTransformer(
+                        model = SentenceTransformer(
                             local_snapshot,
                             cache_folder=cache_dir,
                             local_files_only=True,
@@ -65,24 +64,45 @@ class Embedder:
                         raise
                 else:
                     raise
+            self._validate_sentence_transformer(model)
+            self.backend = "st"
+            self.model = model
         except Exception:
-            # Fallback to HF encoder with mean-pooling over last hidden state
-            from transformers import AutoModel, AutoTokenizer
-            import torch
-            self.backend = "hf"
-            self.tok = AutoTokenizer.from_pretrained(
-                model_src,
-                cache_dir=cache_dir,
-                local_files_only=local_only,
-            )
-            self.model = AutoModel.from_pretrained(
-                model_src,
-                cache_dir=cache_dir,
-                local_files_only=local_only,
-            )
-            self.device = "cuda" if _cuda_runtime_enabled() else "cpu"
-            self.model.to(self.device)
-            self.model.eval()
+            self._init_hf_backend(model_src, cache_dir=cache_dir, local_only=local_only)
+
+    def _validate_sentence_transformer(self, model: Any) -> None:
+        first = None
+        try:
+            first = model._first_module()
+        except Exception:
+            first = None
+        tokenizer = getattr(first, "tokenizer", None) if first is not None else None
+        if tokenizer is None:
+            raise RuntimeError("sentence_transformer_tokenizer_missing")
+        try:
+            model.encode(["health check"], normalize_embeddings=True, show_progress_bar=False)
+        except Exception as exc:
+            if "tokenize" in str(exc):
+                raise RuntimeError("sentence_transformer_tokenizer_broken") from exc
+            raise
+
+    def _init_hf_backend(self, model_src: str, *, cache_dir: str, local_only: bool) -> None:
+        # Fallback to HF encoder with mean-pooling over last hidden state
+        from transformers import AutoModel, AutoTokenizer
+        self.backend = "hf"
+        self.tok = AutoTokenizer.from_pretrained(
+            model_src,
+            cache_dir=cache_dir,
+            local_files_only=local_only,
+        )
+        self.model = AutoModel.from_pretrained(
+            model_src,
+            cache_dir=cache_dir,
+            local_files_only=local_only,
+        )
+        self.device = "cuda" if cuda_runtime_enabled() else "cpu"
+        self.model.to(self.device)
+        self.model.eval()
 
             
 
@@ -111,7 +131,22 @@ class Embedder:
         Batches in fallback to avoid OOM and long blocking.
         """
         if getattr(self, "backend", None) == "st":
-            return self.model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+            try:
+                return self.model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+            except AttributeError as exc:
+                if "tokenize" not in str(exc):
+                    raise
+                cache_dir = _hf_cache_root()
+                local_snapshot = _try_local_snapshot(self.model_name, cache_dir) if cache_dir else None
+                model_src = local_snapshot or self.model_name
+                self._init_hf_backend(model_src, cache_dir=cache_dir, local_only=bool(local_snapshot))
+            except Exception as exc:
+                if "tokenize" not in str(exc):
+                    raise
+                cache_dir = _hf_cache_root()
+                local_snapshot = _try_local_snapshot(self.model_name, cache_dir) if cache_dir else None
+                model_src = local_snapshot or self.model_name
+                self._init_hf_backend(model_src, cache_dir=cache_dir, local_only=bool(local_snapshot))
         # HF fallback
         import numpy as np
         import torch

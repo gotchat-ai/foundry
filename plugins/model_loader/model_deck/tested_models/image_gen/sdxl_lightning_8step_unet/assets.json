@@ -1,0 +1,16 @@
+{
+  "_asset_sources": {
+    "model_path": {
+      "type": "huggingface",
+      "repo_id": "ByteDance/SDXL-Lightning",
+      "filename": "sdxl_lightning_8step_unet.safetensors",
+      "url": "https://huggingface.co/ByteDance/SDXL-Lightning/blob/main/sdxl_lightning_8step_unet.safetensors"
+    },
+    "unet_path": {
+      "type": "huggingface",
+      "repo_id": "ByteDance/SDXL-Lightning",
+      "filename": "sdxl_lightning_8step_unet.safetensors",
+      "url": "https://huggingface.co/ByteDance/SDXL-Lightning/blob/main/sdxl_lightning_8step_unet.safetensors"
+    }
+  }
+}

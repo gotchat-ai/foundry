@@ -264,6 +264,69 @@ def register_default_tools(app, registry: WorkflowToolRegistry) -> None:
                     return os.path.abspath(candidate)
         return os.path.abspath(raw if os.path.isabs(raw) else os.path.join(root, raw.strip("/").replace("/", os.sep)))
 
+    def _well_known_agent_workflow_repo_dir() -> str:
+        candidates = [
+            os.path.join(_framework_data_dir(app), "agent_workflow", "repo"),
+            os.path.join(root, "llmloader2", "data", "agent_workflow", "repo"),
+            os.path.join(root, "data", "agent_workflow", "repo"),
+        ]
+        for candidate in candidates:
+            if os.path.isdir(candidate):
+                return os.path.abspath(candidate)
+        return ""
+
+    def _resolve_scan_base_with_fallback(
+        *,
+        ctx: Dict[str, Any],
+        params: Dict[str, Any],
+        raw_target_repo_root: str = "",
+        raw_path: str = "",
+        raw_base_prefix: str = "",
+    ) -> str:
+        settings = ctx.get("settings") if isinstance(ctx, dict) and isinstance(ctx.get("settings"), dict) else {}
+        router_plugin_settings = (
+            settings.get("router_plugin_settings")
+            if isinstance(settings, dict) and isinstance(settings.get("router_plugin_settings"), dict)
+            else {}
+        )
+        agent_workflow_settings = (
+            router_plugin_settings.get("agent_workflow")
+            if isinstance(router_plugin_settings.get("agent_workflow"), dict)
+            else {}
+        )
+        candidates: List[str] = []
+        for raw in (
+            raw_target_repo_root,
+            params.get("agent_workflow_target_repo_root"),
+            params.get("target_repo_root"),
+            ctx.get("agent_workflow_target_repo_root") if isinstance(ctx, dict) else None,
+            ctx.get("target_repo_root") if isinstance(ctx, dict) else None,
+            settings.get("agent_workflow_target_repo_root") if isinstance(settings, dict) else None,
+            settings.get("target_repo_root") if isinstance(settings, dict) else None,
+            settings.get("selected_repo_root") if isinstance(settings, dict) else None,
+            agent_workflow_settings.get("target_repo_root") if isinstance(agent_workflow_settings, dict) else None,
+            raw_base_prefix,
+            raw_path,
+        ):
+            sval = str(raw or "").strip().replace("\\", "/")
+            if sval and sval not in candidates:
+                candidates.append(sval)
+        for candidate in candidates:
+            resolved = _resolve_target_repo_scan_base(candidate)
+            if os.path.isdir(resolved):
+                return resolved
+        known_repo = _well_known_agent_workflow_repo_dir()
+        if known_repo:
+            rel_path = _normalize_repo_user_path(raw_path or raw_base_prefix or "")
+            if rel_path and not os.path.isabs(rel_path):
+                abs_candidate = os.path.abspath(os.path.join(known_repo, rel_path.replace("/", os.sep)))
+                if os.path.exists(abs_candidate):
+                    return known_repo
+            if candidates:
+                return known_repo
+        scan_base_hint = str(raw_target_repo_root or raw_base_prefix or raw_path or "").strip()
+        return _resolve_target_repo_scan_base(scan_base_hint)
+
     def _tool_error_payload(code: str, message: str, data: Dict[str, Any] | None = None) -> Dict[str, Any]:
         payload = dict(data or {})
         payload["error_code"] = str(code or "").strip() or "UNKNOWN_ERROR"
@@ -283,8 +346,12 @@ def register_default_tools(app, registry: WorkflowToolRegistry) -> None:
             or ""
         ).strip().replace("\\", "/")
         raw_target_repo_root = str(params.get("target_repo_root") or "").strip().replace("\\", "/")
-        scan_base_hint = raw_target_repo_root or raw_base_prefix
-        scan_base = _resolve_target_repo_scan_base(scan_base_hint)
+        scan_base = _resolve_scan_base_with_fallback(
+            ctx=ctx,
+            params=params,
+            raw_target_repo_root=raw_target_repo_root,
+            raw_base_prefix=raw_base_prefix,
+        )
         if not os.path.isdir(scan_base):
             return {"ok": False, "data": {"root": root, "scan_root": scan_base, "files": [], "truncated": False}, "warnings": ["target_repo_root_not_found"]}
 
@@ -322,8 +389,12 @@ def register_default_tools(app, registry: WorkflowToolRegistry) -> None:
             or ""
         ).strip().replace("\\", "/")
         raw_target_repo_root = str(params.get("target_repo_root") or "").strip().replace("\\", "/")
-        scan_base_hint = raw_target_repo_root or raw_base_prefix
-        scan_base = _resolve_target_repo_scan_base(scan_base_hint)
+        scan_base = _resolve_scan_base_with_fallback(
+            ctx=ctx,
+            params=params,
+            raw_target_repo_root=raw_target_repo_root,
+            raw_base_prefix=raw_base_prefix,
+        )
         if not os.path.isdir(scan_base):
             return {
                 "ok": False,
@@ -441,8 +512,12 @@ def register_default_tools(app, registry: WorkflowToolRegistry) -> None:
         start_char = int(params.get("start_char") or 0)
         start_char = max(0, start_char)
         raw_target_repo_root = str(params.get("target_repo_root") or "").strip().replace("\\", "/")
-        scan_base_hint = raw_target_repo_root or raw_path
-        scan_base = _resolve_target_repo_scan_base(scan_base_hint)
+        scan_base = _resolve_scan_base_with_fallback(
+            ctx=ctx,
+            params=params,
+            raw_target_repo_root=raw_target_repo_root,
+            raw_path=raw_path,
+        )
         if not os.path.isdir(scan_base):
             return _tool_error_payload("TARGET_REPO_ROOT_NOT_FOUND", "target_repo_root_not_found", {"scan_root": scan_base})
         allowed_root = scan_base
@@ -478,6 +553,52 @@ def register_default_tools(app, registry: WorkflowToolRegistry) -> None:
             },
             "warnings": [],
         }
+
+    def repo_read_range(ctx: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            from ..agent_flow.skills.repo.read_range import run as repo_read_range_run
+        except Exception as exc:
+            return _tool_error_payload("TOOL_IMPORT_FAILED", f"repo_read_range_import_failed:{exc}")
+        res = repo_read_range_run({"app": app, **(ctx or {})}, dict(params or {}))
+        if not isinstance(res, dict):
+            return _tool_error_payload("TOOL_RUNTIME_ERROR", "repo_read_range_invalid_response")
+        warnings = list(res.get("warnings") or []) if isinstance(res.get("warnings"), list) else []
+        if not bool(res.get("ok")):
+            data = dict(res.get("data") or {}) if isinstance(res.get("data"), dict) else {}
+            if any(str(w).startswith("missing_path") for w in warnings):
+                data["error_code"] = "PATH_REQUIRED"
+            elif any(str(w).startswith("path_outside_repo") for w in warnings):
+                data["error_code"] = "PATH_OUTSIDE_SCOPE"
+            elif any(str(w).startswith("file_not_found") for w in warnings):
+                data["error_code"] = "FILE_NOT_FOUND"
+            else:
+                data["error_code"] = "TOOL_RUNTIME_ERROR"
+            res["data"] = data
+            res["error_code"] = data["error_code"]
+        return res
+
+    def repo_search(ctx: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            from ..agent_flow.skills.repo.search import run as repo_search_run
+        except Exception as exc:
+            return _tool_error_payload("TOOL_IMPORT_FAILED", f"repo_search_import_failed:{exc}")
+        res = repo_search_run({"app": app, **(ctx or {})}, dict(params or {}))
+        if not isinstance(res, dict):
+            return _tool_error_payload("TOOL_RUNTIME_ERROR", "repo_search_invalid_response")
+        warnings = list(res.get("warnings") or []) if isinstance(res.get("warnings"), list) else []
+        if not bool(res.get("ok")):
+            data = dict(res.get("data") or {}) if isinstance(res.get("data"), dict) else {}
+            if any(str(w).startswith("query_required") for w in warnings):
+                data["error_code"] = "QUERY_REQUIRED"
+            elif any(str(w).startswith("path_outside_repo") for w in warnings):
+                data["error_code"] = "PATH_OUTSIDE_SCOPE"
+            elif any(str(w).startswith("path_not_found") for w in warnings):
+                data["error_code"] = "SEARCH_ROOT_NOT_FOUND"
+            else:
+                data["error_code"] = "TOOL_RUNTIME_ERROR"
+            res["data"] = data
+            res["error_code"] = data["error_code"]
+        return res
 
     def repo_ingest(ctx: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
         target_repo_root = str(params.get("target_repo_root") or "").strip().replace("\\", "/").strip("/")
@@ -739,9 +860,22 @@ def register_default_tools(app, registry: WorkflowToolRegistry) -> None:
         base = os.path.basename(rel_norm)
         stem, ext = os.path.splitext(base)
         ext = ext.lower()
-        if ext not in {".html", ".js", ".css", ".ts", ".tsx", ".jsx", ".json", ".md"}:
+        if ext not in {".html", ".js", ".css", ".ts", ".tsx", ".jsx", ".json", ".md", ".py"}:
             return rel_norm
-        generic_names = {"index.html", "index.js", "game.html", "game.js", "app.html", "app.js", "main.js", "main.html"}
+        generic_names = {
+            "index.html",
+            "index.js",
+            "game.html",
+            "game.js",
+            "app.html",
+            "app.js",
+            "main.js",
+            "main.html",
+            "app.py",
+            "main.py",
+            "server.py",
+            "backend.py",
+        }
         top_level = "/" not in rel_norm
         slug = _slugify_request_title(request_title)
         rel_scoped = _target_repo_scoped_rel_path(rel_norm, target_repo_root, ctx)
@@ -768,6 +902,16 @@ def register_default_tools(app, registry: WorkflowToolRegistry) -> None:
         if not path.startswith(root):
             raise ValueError(f"path_outside_workspace:{rel}")
         return path
+
+    def _default_workflow_repo_cwd() -> str:
+        candidates = [
+            os.path.join(root, "data", "agent_workflow", "repo"),
+            os.path.join(root, "llmloader2", "data", "agent_workflow", "repo"),
+        ]
+        for candidate in candidates:
+            if os.path.isdir(candidate):
+                return os.path.abspath(candidate)
+        return root
 
     def code_apply_patch(ctx: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
         ops = params.get("ops")
@@ -890,6 +1034,19 @@ def register_default_tools(app, registry: WorkflowToolRegistry) -> None:
                 failed_lines.append(ln.strip())
         return {"framework": "npm", "failures": failed_lines[:50], "summary": failed_lines[0] if failed_lines else ""}
 
+    def _parse_unittest_output(out: str) -> Dict[str, Any]:
+        text = str(out or "")
+        failures: List[Dict[str, str]] = []
+        for m in re.finditer(r"^(FAIL|ERROR):\s+([^\s(]+)", text, flags=re.MULTILINE):
+            failures.append({"test": str(m.group(2) or "").strip(), "error": str(m.group(1) or "").strip()})
+        summary = ""
+        for ln in reversed(text.splitlines()):
+            s = str(ln or "").strip()
+            if s:
+                summary = s
+                break
+        return {"framework": "unittest", "failures": failures, "summary": summary}
+
     def _fallback_file_checks(cwd: str, changed_files: List[str]) -> Dict[str, Any]:
         runs: List[Dict[str, Any]] = []
         warnings: List[str] = []
@@ -990,25 +1147,46 @@ def register_default_tools(app, registry: WorkflowToolRegistry) -> None:
 
     def tests_run_project(ctx: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
         project_dir = str(params.get("project_dir") or ".")
+        target_repo_root = str(params.get("target_repo_root") or "").strip()
         try:
-            cwd = _safe_path(project_dir)
+            if project_dir in ("", ".", "./") and not target_repo_root:
+                cwd = _default_workflow_repo_cwd()
+            elif target_repo_root:
+                cwd = _safe_path(_target_repo_scoped_rel_path(project_dir or ".", target_repo_root, ctx), ctx, already_scoped=True)
+            else:
+                cwd = _safe_path(project_dir, ctx)
         except Exception:
-            cwd = root
+            cwd = _default_workflow_repo_cwd() if project_dir in ("", ".", "./") else root
         timeout = int(params.get("timeout_sec") or 300)
         framework = str(params.get("framework") or "auto").lower()
         commands: List[List[str]] = []
         warnings: List[str] = []
 
         has_pytest = os.path.isfile(os.path.join(cwd, "pytest.ini")) or os.path.isfile(os.path.join(cwd, "pyproject.toml"))
+        tests_dir = os.path.join(cwd, "tests")
+        has_unittest = os.path.isdir(tests_dir) and any(
+            str(name or "").startswith("test") and str(name or "").endswith(".py")
+            for name in os.listdir(tests_dir)
+        )
         has_package = os.path.isfile(os.path.join(cwd, "package.json"))
+        explicit_framework = framework not in ("", "auto")
         if framework in ("auto", "pytest") and has_pytest:
             commands.append(["python", "-m", "pytest", "-q"])
+        if framework == "unittest" and has_unittest:
+            commands.append(["python", "-m", "unittest", "discover", "-s", "tests", "-p", "test*.py"])
+        elif framework in ("auto", "unittest") and has_unittest and not has_pytest:
+            commands.append(["python", "-m", "unittest", "discover", "-s", "tests", "-p", "test*.py"])
         if framework in ("auto", "npm") and has_package:
             commands.append(["npm", "test", "--", "--silent"])
         if not commands:
             changed_files = params.get("changed_files")
             files = [str(x) for x in changed_files] if isinstance(changed_files, list) else []
-            return _fallback_file_checks(cwd, files)
+            result = _fallback_file_checks(cwd, files)
+            if explicit_framework:
+                warnings = list(result.get("warnings") or [])
+                warnings.append(f"requested_framework_not_detected:{framework}")
+                result["warnings"] = warnings
+            return result
 
         runs = []
         for cmd in commands:
@@ -1022,7 +1200,12 @@ def register_default_tools(app, registry: WorkflowToolRegistry) -> None:
                     shell=False,
                 )
                 out = f"{cp.stdout or ''}\n{cp.stderr or ''}".strip()
-                parsed = _parse_pytest_output(out) if "pytest" in cmd else _parse_npm_output(out)
+                if "pytest" in cmd:
+                    parsed = _parse_pytest_output(out)
+                elif "unittest" in cmd:
+                    parsed = _parse_unittest_output(out)
+                else:
+                    parsed = _parse_npm_output(out)
                 runs.append(
                     {
                         "command": cmd,
@@ -1956,6 +2139,8 @@ def register_default_tools(app, registry: WorkflowToolRegistry) -> None:
     registry.register_tool("repo.context", repo_context)
     registry.register_tool("repo.find_file", repo_find_file)
     registry.register_tool("repo.read", repo_read)
+    registry.register_tool("repo.read_range", repo_read_range)
+    registry.register_tool("repo.search", repo_search)
     registry.register_tool("repo.write", repo_write)
     registry.register_tool("repo.ingest", repo_ingest)
     registry.register_tool("rag.search", rag_search)

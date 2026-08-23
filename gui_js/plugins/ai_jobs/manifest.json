@@ -3,5 +3,6 @@
   "name": "AI Jobs",
   "kind": "gui",
   "description": "Shows queued background AI jobs in the top-right status row.",
-  "entry": "plugin.js"
+  "entry": "plugin.js",
+  "category": "AI Jobs"
 }

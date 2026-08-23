@@ -1,0 +1,16 @@
+{
+  "python_bin": "python",
+  "script_path": "${LLMLOADER2_ROOT}/tools/run_zimage.py",
+  "_asset_sources": {
+    "model_path": {
+      "type": "huggingface",
+      "repo_id": "Tongyi-MAI/Z-Image-Turbo",
+      "url": "https://huggingface.co/Tongyi-MAI/Z-Image-Turbo"
+    },
+    "gguf_path": {
+      "type": "huggingface",
+      "repo_id": "unsloth/Z-Image-Turbo-GGUF",
+      "url": "https://huggingface.co/unsloth/Z-Image-Turbo-GGUF"
+    }
+  }
+}

@@ -4,6 +4,8 @@ import fnmatch
 import os
 from typing import Any, Dict, List
 
+from . import _common
+
 NAME = "repo.find_file"
 PERMISSIONS = ["repo.find_file", "repo.*"]
 
@@ -11,30 +13,7 @@ SKIP_DIRS = {".git", "__pycache__", ".venv", "node_modules", ".rag", "tmp_repo_d
 
 
 def _resolve_root(ctx: Dict[str, Any], params: Dict[str, Any]) -> str:
-    root = str((params or {}).get("target_repo_root") or (ctx or {}).get("target_repo_root") or "").strip()
-    if root:
-        abs_root = os.path.abspath(root)
-        if os.path.isdir(abs_root):
-            return abs_root
-    app = (ctx or {}).get("app") if isinstance(ctx, dict) else None
-    raw = str(root or "").replace("\\", "/").lower().strip("/")
-    data_dir = getattr(getattr(app, "state", None), "data_dir", None) if app is not None else None
-    workdir = getattr(getattr(app, "state", None), "workdir", None) if app is not None else None
-    for base_raw in (workdir, data_dir, os.getcwd()):
-        if not base_raw:
-            continue
-        base = os.path.abspath(str(base_raw))
-        if "data/agent_workflow/repo" in raw:
-            for candidate in (
-                os.path.join(base, "data", "agent_workflow", "repo"),
-                os.path.join(base, "agent_workflow", "repo"),
-            ):
-                if os.path.isdir(candidate):
-                    return os.path.abspath(candidate)
-    for raw_base in (data_dir, workdir, os.getcwd()):
-        if raw_base:
-            return os.path.abspath(str(raw_base))
-    return os.getcwd()
+    return _common.resolve_root(ctx or {}, params or {})
 
 
 def _strip_repo_virtual_prefixes(rel: str) -> str:

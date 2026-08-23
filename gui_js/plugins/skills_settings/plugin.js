@@ -44,6 +44,17 @@ function stateFor(ctx) {
 }
 
 async function apiJson(ctx, url, options = {}) {
+  if (ctx?.apiJson) {
+    const payload = { ...options };
+    if (payload.body && typeof payload.body === "string") {
+      try {
+        payload.body = JSON.parse(payload.body);
+      } catch (_err) {
+        // Keep string payloads untouched if they are not JSON.
+      }
+    }
+    return ctx.apiJson(url, payload);
+  }
   const res = await fetch(url, {
     ...options,
     headers: { "Content-Type": "application/json", ...(options.headers || {}) },

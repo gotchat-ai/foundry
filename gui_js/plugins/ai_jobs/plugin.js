@@ -16,6 +16,7 @@ let popoverOpen = false;
 let lastJobs = [];
 let lastScheduler = null;
 let outsideHandler = null;
+let refreshDebounceTimer = null;
 
 function ensureStyles() {
   if (document.getElementById(STYLE_ID)) return;
@@ -348,8 +349,25 @@ async function refreshJobs(ctx) {
       renderPopover(ctx, filtered);
     }
   } catch (err) {
+    lastJobs = [];
+    lastScheduler = null;
     updateBadge(0);
+    if (popoverOpen) {
+      renderPopover(ctx, []);
+    }
   }
+}
+
+function scheduleRefresh(ctx, delayMs = 0) {
+  if (!ctx) return;
+  if (refreshDebounceTimer) {
+    clearTimeout(refreshDebounceTimer);
+    refreshDebounceTimer = null;
+  }
+  refreshDebounceTimer = setTimeout(() => {
+    refreshDebounceTimer = null;
+    void refreshJobs(ctx);
+  }, Math.max(0, Number(delayMs || 0)));
 }
 
 function startPolling(ctx) {
@@ -477,6 +495,19 @@ function openSettings(ctx) {
 
 function register(host) {
   host.addTopRightIconRow((ctx) => buildButton(ctx));
+  host.addEventHandler?.((event, data, ctx) => {
+    if (!ctx?.apiJson) return;
+    if (event === "assistant_done" || event === "done") {
+      scheduleRefresh(ctx, 75);
+      return;
+    }
+    if (event === "message") {
+      const msg = data?.msg;
+      if (String(msg?.role || "").toLowerCase() === "assistant" && msg?.streaming === false) {
+        scheduleRefresh(ctx, 75);
+      }
+    }
+  });
   outsideHandler = (event) => {
     if (!popoverOpen) return;
     if (!popoverEl || !buttonEl) return;
@@ -490,6 +521,10 @@ function register(host) {
 
 function dispose() {
   stopPolling();
+  if (refreshDebounceTimer) {
+    clearTimeout(refreshDebounceTimer);
+    refreshDebounceTimer = null;
+  }
   closePopover();
   if (outsideHandler) {
     document.removeEventListener("click", outsideHandler);

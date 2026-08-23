@@ -7,27 +7,112 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 
+def _infer_requested_repo_target(text: str) -> str:
+    raw_text = str(text or "").strip()
+    if not raw_text:
+        return ""
+    normalized = raw_text.replace("\\", "/")
+    explicit = re.search(
+        r"(?:^|\s)(data/agent_workflow/repo/[A-Za-z0-9_.\\/-]+)",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if explicit:
+        return str(explicit.group(1) or "").strip().rstrip(".,;:)")
+    folder_match = re.search(
+        r"\brepo\s+folder\s+([A-Za-z0-9_.-]+)",
+        raw_text,
+        flags=re.IGNORECASE,
+    )
+    if folder_match:
+        return str(folder_match.group(1) or "").strip().rstrip(".,;:)")
+    called_match = re.search(
+        r"\bfolder\s+called\s+([A-Za-z0-9_.-]+)",
+        raw_text,
+        flags=re.IGNORECASE,
+    )
+    if called_match:
+        return str(called_match.group(1) or "").strip().rstrip(".,;:)")
+    return ""
+
+
+def _collect_text_hints(ctx: Dict[str, Any], params: Dict[str, Any]) -> str:
+    ctx = ctx or {}
+    params = params or {}
+    parts: List[str] = []
+    for key in (
+        "user_request",
+        "request",
+        "text",
+        "instruction",
+        "prompt",
+        "request_text",
+        "input_text",
+        "message",
+        "content",
+        "path",
+        "file_path",
+    ):
+        val = params.get(key)
+        if str(val or "").strip():
+            parts.append(str(val))
+    for key in (
+        "original_request",
+        "user_text",
+        "request",
+        "request_text",
+        "prompt",
+        "input_text",
+        "message",
+        "content",
+        "target_path",
+        "path",
+    ):
+        val = ctx.get(key) if isinstance(ctx, dict) else None
+        if str(val or "").strip():
+            parts.append(str(val))
+    settings = (ctx or {}).get("settings") if isinstance(ctx, dict) else None
+    if isinstance(settings, dict):
+        for key in ("target_repo_root", "selected_repo_root", "repo_root"):
+            val = settings.get(key)
+            if str(val or "").strip():
+                parts.append(str(val))
+    return " ".join(part for part in parts if str(part or "").strip())
+
+
 def resolve_root(ctx: Dict[str, Any], params: Dict[str, Any]) -> Path:
     settings = (ctx or {}).get("settings") if isinstance(ctx, dict) else None
     settings = settings if isinstance(settings, dict) else {}
+    text_hint = _collect_text_hints(ctx or {}, params or {})
     raw = str(
         (params or {}).get("target_repo_root")
         or (params or {}).get("root")
+        or (params or {}).get("repo_path")
+        or (params or {}).get("project_dir")
+        or (params or {}).get("path")
         or (ctx or {}).get("target_repo_root")
         or settings.get("target_repo_root")
         or settings.get("selected_repo_root")
         or ""
     ).strip()
+    inferred_target = _infer_requested_repo_target(text_hint)
+    if raw:
+        raw_norm = raw.replace("\\", "/").strip().lower().rstrip("/")
+        if inferred_target:
+            target_norm = inferred_target.replace("\\", "/").strip().rstrip("/")
+            raw_trimmed = raw.rstrip("/\\")
+            if raw_norm.endswith("/data/agent_workflow/repo") or raw_norm == "data/agent_workflow/repo":
+                raw = f"{raw_trimmed}/{target_norm}"
+            elif raw_norm.endswith("/agent_workflow/repo") or raw_norm == "agent_workflow/repo":
+                raw = f"{raw_trimmed}/{target_norm}"
     if not raw:
-        text_hint = " ".join(
-            str((params or {}).get(k) or "")
-            for k in ("user_request", "request", "text", "instruction")
-        )
         m = re.search(r"target\s+repo\s+root\s+([A-Za-z0-9_./\\:-]+)", text_hint, flags=re.IGNORECASE)
         if not m:
             m = re.search(r"(?:^|\s)(data/agent_workflow/repo/[A-Za-z0-9_.\\/-]+)", text_hint.replace("\\", "/"), flags=re.IGNORECASE)
         if m:
             raw = str(m.group(1) or "").strip().rstrip(".,;)")
+        elif inferred_target:
+            raw = inferred_target
     app = (ctx or {}).get("app") if isinstance(ctx, dict) else None
     base = (
         getattr(getattr(app, "state", None), "workdir", None)
@@ -35,6 +120,10 @@ def resolve_root(ctx: Dict[str, Any], params: Dict[str, Any]) -> Path:
         or os.getcwd()
     )
     base_path = Path(str(base)).resolve()
+    scoped_repo_fallback: Path | None = None
+    if inferred_target:
+        target_rel = inferred_target.replace("\\", os.sep).strip("/\\")
+        scoped_repo_fallback = (base_path / "data" / "agent_workflow" / "repo" / target_rel).resolve()
     if raw:
         direct = Path(raw)
         try:
@@ -45,6 +134,8 @@ def resolve_root(ctx: Dict[str, Any], params: Dict[str, Any]) -> Path:
         raw_rel = raw.replace("\\", os.sep).strip("/\\")
         for candidate in (
             base_path / raw_rel,
+            base_path / "data" / "agent_workflow" / "repo" / raw_rel,
+            base_path / "agent_workflow" / "repo" / raw_rel,
         ):
             try:
                 if candidate.exists():
@@ -59,8 +150,12 @@ def resolve_root(ctx: Dict[str, Any], params: Dict[str, Any]) -> Path:
             ):
                 if candidate.exists():
                     return candidate.resolve()
+        if inferred_target and scoped_repo_fallback is not None:
+            return scoped_repo_fallback
         candidate = (base_path / raw.replace("\\", os.sep).strip("/")).resolve()
         return candidate
+    if scoped_repo_fallback is not None:
+        return scoped_repo_fallback
     return base_path
 
 

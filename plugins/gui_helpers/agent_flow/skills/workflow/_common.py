@@ -530,7 +530,23 @@ def infer_request_capabilities(text: Any) -> List[Dict[str, Any]]:
         "portal_reconciliation" in {str(row.get("id") or "").strip() for row in caps}
         and not explicit_web_research
     )
-    if any(_contains_keyword(low, tok) for tok in ("weather", "forecast", "temperature", "humidity", "wind", "rain chance", "precipitation")):
+    if any(
+        _contains_keyword(low, tok)
+        for tok in (
+            "weather",
+            "forecast",
+            "temperature",
+            "humidity",
+            "wind",
+            "rain",
+            "drizzle",
+            "showers",
+            "storm",
+            "umbrella",
+            "rain chance",
+            "precipitation",
+        )
+    ):
         _add(
             "weather_lookup",
             "The request requires current weather conditions or same-day forecast lookup.",

@@ -1387,6 +1387,125 @@ def _educational_deliverable_answer(user_request: str, current_text: str = "") -
 
     return ""
 
+
+def _structured_review_markdown(current_text: str) -> str:
+    raw = str(current_text or "").strip()
+    if not raw:
+        return ""
+    lines = [str(line or "").rstrip() for line in raw.splitlines()]
+    if len(lines) < 2:
+        return ""
+    known_headers = {
+        "repo root",
+        "target folder",
+        "verified files",
+        "changed files",
+        "git status",
+        "rag sync",
+        "findings",
+        "proposed improvements",
+        "what it supports",
+        "missing files",
+        "files",
+    }
+    if not any(
+        ":" in line and line.split(":", 1)[0].strip().lower() in known_headers
+        for line in lines[1:] if line.strip()
+    ):
+        return ""
+    first = lines[0].strip()
+    first_key = first.split(":", 1)[0].strip().lower() if ":" in first else ""
+    summary_line = "" if first_key in known_headers else first
+
+    scalar_keys = ["repo root", "target folder", "git status", "rag sync", "changed files"]
+    list_keys = ["verified files", "what it supports", "findings", "proposed improvements", "missing files", "files"]
+    scalar_values: dict[str, str] = {}
+    list_values: dict[str, list[str]] = {}
+    current_list: str | None = None
+
+    def _add_list_item(section: str, value: str) -> None:
+        item = str(value or "").strip()
+        if not item:
+            return
+        bucket = list_values.setdefault(section, [])
+        if item not in bucket:
+            bucket.append(item)
+
+    for line in lines if summary_line == "" else lines[1:]:
+        s = line.strip()
+        if not s:
+            continue
+        if ":" in s:
+            key, value = s.split(":", 1)
+            key_norm = key.strip().lower()
+            value_norm = value.strip()
+            if key_norm in scalar_keys:
+                scalar_values[key_norm] = value_norm or "none"
+                current_list = None
+                continue
+            if key_norm in list_keys:
+                current_list = key_norm
+                if value_norm and value_norm.lower() != "none":
+                    if key_norm in {"verified files", "missing files", "files"}:
+                        for part in re.split(r",(?=\s*\S)", value_norm):
+                            _add_list_item(key_norm, str(part or "").strip())
+                    else:
+                        _add_list_item(key_norm, value_norm)
+                elif value_norm.lower() == "none":
+                    list_values.setdefault(key_norm, [])
+                continue
+        if current_list:
+            item = s[2:].strip() if s.startswith("- ") else s
+            _add_list_item(current_list, item)
+
+    if not scalar_values and not list_values:
+        return ""
+
+    label_map = {
+        "repo root": "Repo Root",
+        "target folder": "Target Folder",
+        "git status": "Git Status",
+        "rag sync": "RAG Sync",
+        "changed files": "Changed Files",
+    }
+    title_map = {
+        "verified files": "Verified Files",
+        "what it supports": "What It Supports",
+        "findings": "Findings",
+        "proposed improvements": "Proposed Improvements",
+        "missing files": "Missing Files",
+        "files": "Files",
+    }
+
+    out: list[str] = []
+    if summary_line:
+        out.append(f"## Summary\n{summary_line}")
+
+    detail_rows: list[str] = []
+    for key in scalar_keys:
+        value = scalar_values.get(key, "").strip()
+        if not value:
+            continue
+        formatted = f"`{value}`" if key in {"repo root", "target folder"} else value
+        detail_rows.append(f"| {label_map[key]} | {formatted} |")
+    if detail_rows:
+        out.append("## Details\n| Field | Value |\n|---|---|\n" + "\n".join(detail_rows))
+
+    for key in list_keys:
+        if key not in list_values:
+            continue
+        items = list_values.get(key) or []
+        out.append(f"## {title_map[key]}")
+        if items:
+            if key in {"verified files", "missing files", "files"}:
+                out.extend(f"- `{item}`" for item in items)
+            else:
+                out.extend(f"- {item}" for item in items)
+        else:
+            out.append("- None")
+    return "\n\n".join(part.strip() for part in out if str(part or "").strip()).strip()
+
+
 def _artifact_result_text(params: Dict[str, Any], user_request: str, current_text: str) -> str:
     request_low = str(user_request or "").lower()
     wants_file_result = bool(re.search(r"\b(download|export|save|write|create file|output file|workbook|spreadsheet|html file|pdf file|json file)\b", request_low))
@@ -1607,6 +1726,9 @@ def run(ctx, params):
     artifact_text = _artifact_result_text(params, user_request, text)
     if artifact_text:
         text = artifact_text
+    structured_text = _structured_review_markdown(text)
+    if structured_text:
+        text = structured_text
     return {
         "ok": True,
         "mode": "text",

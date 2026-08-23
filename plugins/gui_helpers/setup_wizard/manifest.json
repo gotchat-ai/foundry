@@ -6,5 +6,6 @@
   "dependencies": [
     "model_deck",
     "permissions_manager"
-  ]
+  ],
+  "category": "Setup Wizard"
 }

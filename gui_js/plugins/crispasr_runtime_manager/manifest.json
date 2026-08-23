@@ -1,0 +1,8 @@
+{
+  "id": "crispasr_runtime_manager",
+  "name": "CrispASR Runtime Manager",
+  "kind": "panel",
+  "description": "Detect host compatibility, generate CrispASR build scripts, and manage runtime executable paths.",
+  "category": "Models/Inference",
+  "entry": "plugin.js"
+}

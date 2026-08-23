@@ -1,0 +1,225 @@
+{
+  "id": "hunyuan15_t2v_gguf",
+  "label": "HunyuanVideo 1.5 T2V GGUF Workflow",
+  "description": "HunyuanVideo 1.5 text-to-video GGUF native graph workflow.",
+  "workflow_file": "workflow.json",
+  "aliases": [
+    "hunyuan 1.5",
+    "hunyuanvideo 1.5",
+    "hunyuan15_t2v_gguf",
+    "jayn7/HunyuanVideo-1.5_T2V_720p-GGUF",
+    "jayn7/HunyuanVideo-1.5_I2V_720p-GGUF"
+  ],
+  "backends": [
+    "native_graph",
+    "comfy_gguf_lazy"
+  ],
+  "runtime_profile": {
+    "kind": "internal_workflow",
+    "workflow_id": "hunyuan15_t2v_gguf",
+    "workflow_model_loader_id": "models.hunyuan15_t2v_gguf",
+    "workflow_model_loader_file": "workflow.json",
+    "supports_workflow_model_loader": true,
+    "family": "hunyuan15_t2v_gguf",
+    "scenario": "hunyuan15_t2v_gguf",
+    "asset_slots": [
+      {
+        "key": "hunyuan_gguf_path",
+        "role": "video_transformer_gguf",
+        "required": true,
+        "source": "local_or_hf_file",
+        "patterns": [
+          "*HunyuanVideo*1.5*720p*.gguf",
+          "*hunyuan*video*Q5*.gguf",
+          "*.gguf"
+        ]
+      },
+      {
+        "key": "video_vae_path",
+        "role": "video_vae",
+        "required": true,
+        "source": "local_or_hf_file",
+        "patterns": [
+          "hunyuanvideo15*vae*.safetensors",
+          "hunyuan_video_vae*.safetensors",
+          "*vae*.safetensors"
+        ]
+      },
+      {
+        "key": "text_encoder_1_path",
+        "role": "text_encoder_1",
+        "required": true,
+        "source": "local_or_hf_file",
+        "patterns": [
+          "qwen_2.5_vl*.safetensors",
+          "Long-ViT*.safetensors"
+        ]
+      },
+      {
+        "key": "text_encoder_2_path",
+        "role": "text_encoder_2",
+        "required": true,
+        "source": "local_or_hf_file",
+        "patterns": [
+          "byt5_small*.safetensors",
+          "llava_llama3*.safetensors"
+        ]
+      },
+      {
+        "key": "source_image_path",
+        "role": "source_image",
+        "required": false,
+        "source": "local_file",
+        "patterns": [
+          "*.png",
+          "*.jpg",
+          "*.jpeg",
+          "*.webp"
+        ]
+      },
+      {
+        "key": "hunyuan_fast_lora_path",
+        "role": "fast_lora",
+        "required": false,
+        "source": "local_or_hf_file",
+        "patterns": [
+          "*FastVideo*LoRA*.safetensors",
+          "*.safetensors"
+        ]
+      },
+      {
+        "key": "hunyuan_leapfusion_lora_path",
+        "role": "i2v_leapfusion_lora",
+        "required": false,
+        "source": "local_or_hf_file",
+        "patterns": [
+          "*img2vid*.safetensors",
+          "*LeapFusion*.safetensors"
+        ]
+      },
+      {
+        "key": "upscale_model_path",
+        "role": "latent_upscaler",
+        "required": false,
+        "source": "local_or_hf_file",
+        "patterns": [
+          "*upscale*.safetensors",
+          "*upscaler*.safetensors"
+        ]
+      }
+    ]
+  },
+  "requirements": [
+    {
+      "id": "torch",
+      "label": "PyTorch",
+      "kind": "python_package",
+      "package": "torch",
+      "import_name": "torch",
+      "install": [
+        "torch"
+      ],
+      "uninstall": [
+        "torch"
+      ]
+    },
+    {
+      "id": "gguf",
+      "label": "gguf",
+      "kind": "python_package",
+      "package": "gguf",
+      "import_name": "gguf",
+      "install": [
+        "gguf"
+      ],
+      "uninstall": [
+        "gguf"
+      ]
+    },
+    {
+      "id": "imageio_ffmpeg",
+      "label": "imageio-ffmpeg",
+      "kind": "python_package",
+      "package": "imageio-ffmpeg",
+      "import_name": "imageio_ffmpeg",
+      "install": [
+        "imageio-ffmpeg"
+      ],
+      "uninstall": [
+        "imageio-ffmpeg"
+      ]
+    }
+  ],
+  "workflow_defaults": {
+    "model_id": "jayn7/HunyuanVideo-1.5_T2V_720p-GGUF",
+    "model_family": "hunyuan15_t2v_gguf",
+    "workflow_variant": "t2v",
+    "runtime_adapter": "hunyuan15",
+    "workflow_adapter": "hunyuan15",
+    "model_deck_compat_manifest_id": "hunyuan15_t2v_gguf",
+    "workflow_loader_mode": "workflow_model_loader",
+    "workflow_execution_backend": "native_graph",
+    "workflow_node_lifecycle_policy": "lazy_unload",
+    "model_workflow_flow_name": "Models / HunyuanVideo 1.5 T2V GGUF",
+    "model_workflow_template_flow_name": "Models / HunyuanVideo 1.5 T2V GGUF",
+    "model_workflow_owned": false,
+    "device": "xpu",
+    "dtype": "bfloat16",
+    "native_gguf_execution_mode": "comfy_gguf_lazy",
+    "native_lazy_quantized_packed_device": "cpu",
+    "native_transformer_offload": "cpu_slots",
+    "hunyuan_gguf_path": "${MODEL_DECK_MODELS_DIR}/hunyuan_video_1_5/diffusion_models/t2v/hunyuanvideo1.5_720p_t2v-Q5_K_M.gguf",
+    "gguf_path": "${MODEL_DECK_MODELS_DIR}/hunyuan_video_1_5/diffusion_models/t2v/hunyuanvideo1.5_720p_t2v-Q5_K_M.gguf",
+    "clip_type": "hunyuan_video_15",
+    "hunyuan_clip_type": "hunyuan_video_15",
+    "hunyuan_latent_version": "15",
+    "hunyuan_conditioning_mode": "t2v",
+    "hunyuan_unet_loader": "basic",
+    "hunyuan_gguf_dequant_dtype": "default",
+    "hunyuan_gguf_patch_dtype": "default",
+    "hunyuan_gguf_patch_on_device": false,
+    "hunyuan_text_encoder_device": "cpu",
+    "hunyuan_text_encoder_cache_mode": "cpu",
+    "hunyuan_video_vae_device": "gpu",
+    "hunyuan_vae_decode_mode": "gpu_temporal_halo",
+    "hunyuan_vae_tile_size": 128,
+    "hunyuan_vae_tile_overlap": 64,
+    "hunyuan_vae_temporal_size": 4096,
+    "hunyuan_vae_temporal_overlap": 8,
+    "hunyuan_upscale_enabled": false,
+    "hunyuan_upscale_width": 0,
+    "hunyuan_upscale_height": 0,
+    "hunyuan_upscale_method": "bilinear",
+    "hunyuan_upscale_crop": "center",
+    "width": 480,
+    "height": 320,
+    "duration_seconds": 2,
+    "fps": 16,
+    "target_fps": 16,
+    "frames": 45,
+    "steps": 12,
+    "guidance_scale": 7.5,
+    "sampler_name": "gradient_estimation",
+    "scheduler": "linear_quadratic",
+    "shift": 9.0,
+    "denoise": 1.0,
+    "seed": -1,
+    "batch_size": 1,
+    "video_codec": "libx264",
+    "output_ext": "mp4",
+    "negative_prompt": "cartoon, anime, low quality, blurry, gray overlay, horizontal lines, flicker, watermark, subtitles",
+    "source_image_path": "",
+    "python_bin": "python",
+    "video_vae_path": "${MODEL_DECK_MODELS_DIR}/hunyuan_video_1_5/vae/hunyuanvideo15_vae_fp16.safetensors",
+    "legacy_video_vae_path": "${MODEL_DECK_MODELS_DIR}/hunyuan_video_1_5/vae/hunyuan_video_vae_bf16.safetensors",
+    "text_encoder_1_path": "${MODEL_DECK_MODELS_DIR}/hunyuan_video_1_5/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors",
+    "text_encoder_2_path": "${MODEL_DECK_MODELS_DIR}/hunyuan_video_1_5/text_encoders/byt5_small_glyphxl_fp16.safetensors",
+    "legacy_text_encoder_1_path": "${MODEL_DECK_MODELS_DIR}/hunyuan_video_1_5/text_encoders/Long-ViT-L-14-GmP-SAE-TE-only.safetensors",
+    "legacy_text_encoder_2_path": "${MODEL_DECK_MODELS_DIR}/hunyuan_video_1_5/text_encoders/llava_llama3_fp8_scaled.safetensors",
+    "qwen_text_encoder_path": "${MODEL_DECK_MODELS_DIR}/hunyuan_video_1_5/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors",
+    "byt5_text_encoder_path": "${MODEL_DECK_MODELS_DIR}/hunyuan_video_1_5/text_encoders/byt5_small_glyphxl_fp16.safetensors",
+    "upscale_model_path": "${MODEL_DECK_MODELS_DIR}/hunyuan_video_1_5/upscaler/hunyuan_video_1.5_720p_upscaler.safetensors",
+    "hunyuan_fast_lora_path": "${MODEL_DECK_MODELS_DIR}/hunyuan_video_1_5/loras/hyvideo_FastVideo_LoRA-fp8.safetensors",
+    "hunyuan_leapfusion_lora_path": "${MODEL_DECK_MODELS_DIR}/hunyuan_video_1_5/loras/img2vid544p.safetensors"
+  }
+}

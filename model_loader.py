@@ -81,12 +81,12 @@ def _dtype_kwarg_for(cls, desired: torch.dtype | None):
     else {}.
     """
     if desired is None:
-        # print(3)
+        print(3)
         return {}
     try:
         sig = inspect.signature(cls.from_pretrained)
     except (ValueError, TypeError):
-        # print(1)
+        print(1)
         return {}
     params = sig.parameters
     print(params)
@@ -109,6 +109,10 @@ class HFChatModel:
         self.load_in_4bit = load_in_4bit if load_in_4bit is not None else False
         self.load_in_8bit = load_in_8bit if load_in_8bit is not None else False
         _ensure_transformers()
+
+        model_id = str(model_id or "").strip()
+        if not model_id or model_id.lower() in {"none", "null", "undefined"}:
+            raise ValueError(f"invalid Hugging Face model_id: {model_id!r}")
 
         self.model_id = model_id
         self.model_id_alias = model_id.split("/")[-1]

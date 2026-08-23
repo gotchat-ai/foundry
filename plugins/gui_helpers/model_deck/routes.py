@@ -6,9 +6,13 @@ import ntpath
 import time
 import asyncio
 import inspect
+import re
 import subprocess
 import shutil
+import threading
+import uuid
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 import urllib.request
@@ -33,6 +37,7 @@ from pydantic import BaseModel, Field
 
 from plugins.gui_helpers._framework.utils import require_gui_plugin_enabled
 from plugins.gui_helpers._framework.services import register_plugin_service
+from plugins.model_loader.model_deck import compat_registry
 
 
 GUI_PLUGIN_ID = "model_deck"
@@ -176,49 +181,110 @@ def _settings_expected_gguf_filename(settings: Dict[str, Any]) -> str:
     return ""
 
 
-def _post_llama_manager_json(path: str, payload: Dict[str, Any], *, timeout_seconds: float = 20.0) -> Dict[str, Any]:
+def _post_llama_manager_json(
+    path: str,
+    payload: Dict[str, Any],
+    *,
+    timeout_seconds: float = 20.0,
+    auth_headers: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     headers = {"Content-Type": "application/json"}
     url = f"{_llama_manager_base()}{path}"
     data = json.dumps(payload).encode("utf-8")
     shared_token = _read_llama_shared_token()
     if shared_token:
         headers["X-Client-Service-Token"] = shared_token
+    if isinstance(auth_headers, dict):
+        auth_value = str(auth_headers.get("Authorization") or "").strip()
+        x_auth_token = str(auth_headers.get("X-Auth-Token") or "").strip()
+        if auth_value:
+            headers["Authorization"] = auth_value
+        if x_auth_token:
+            headers["X-Auth-Token"] = x_auth_token
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
     with urlopen(req, timeout=_llama_manager_timeout(timeout_seconds)) as resp:
         body = resp.read() or b"{}"
     return json.loads(body.decode("utf-8", errors="ignore"))
 
 
-def _get_llama_manager_json(path: str, *, timeout_seconds: float = 3.0) -> Dict[str, Any]:
+def _get_llama_manager_json(
+    path: str,
+    *,
+    timeout_seconds: float = 3.0,
+    auth_headers: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     headers = {}
     shared_token = _read_llama_shared_token()
     if shared_token:
         headers["X-Client-Service-Token"] = shared_token
+    if isinstance(auth_headers, dict):
+        auth_value = str(auth_headers.get("Authorization") or "").strip()
+        x_auth_token = str(auth_headers.get("X-Auth-Token") or "").strip()
+        if auth_value:
+            headers["Authorization"] = auth_value
+        if x_auth_token:
+            headers["X-Auth-Token"] = x_auth_token
     req = urllib.request.Request(f"{_llama_manager_base()}{path}", headers=headers, method="GET")
     with urlopen(req, timeout=_llama_manager_timeout(timeout_seconds)) as resp:
         body = resp.read() or b"{}"
     return json.loads(body.decode("utf-8", errors="ignore"))
 
 
-def _llama_manager_status_cached(app: Any) -> Dict[str, Any]:
+def _llama_manager_status_cached(app: Any, *, lightweight: bool = True, max_age: float = 4.0) -> Dict[str, Any]:
     now = time.time()
     cache = getattr(app.state, "llama_manager_status_cache", None)
     if isinstance(cache, dict):
         ts = float(cache.get("ts") or 0.0)
         payload = cache.get("payload")
-        if (now - ts) < 2.0 and isinstance(payload, dict):
-            return payload
+        cached_lightweight = bool(cache.get("lightweight", True))
+        # A cached full payload can satisfy a lightweight request too.
+        if (now - ts) < max_age and isinstance(payload, dict):
+            if cached_lightweight == lightweight or (lightweight and not cached_lightweight):
+                return payload
+    pending = getattr(app.state, "llama_manager_status_inflight", None)
+    if not isinstance(pending, dict):
+        pending = {}
+        setattr(app.state, "llama_manager_status_inflight", pending)
+    pending_key = "light" if lightweight else "full"
+    inflight = pending.get(pending_key)
+    if isinstance(inflight, dict):
+        event = inflight.get("event")
+        started_ts = float(inflight.get("ts") or 0.0)
+        if isinstance(event, threading.Event) and event.is_set() is False and (now - started_ts) < 10.0:
+            # Coalesce short bursts so multiple panels do not fan out into
+            # parallel status calls against the host manager.
+            event.wait(timeout=min(max_age, 1.5))
+            cache = getattr(app.state, "llama_manager_status_cache", None)
+            if isinstance(cache, dict):
+                ts = float(cache.get("ts") or 0.0)
+                payload = cache.get("payload")
+                cached_lightweight = bool(cache.get("lightweight", True))
+                if (time.time() - ts) < max_age and isinstance(payload, dict):
+                    if cached_lightweight == lightweight or (lightweight and not cached_lightweight):
+                        return payload
+    event = threading.Event()
+    pending[pending_key] = {"event": event, "ts": now}
     try:
-        payload = _get_llama_manager_json("/v1/llama_server/status?lightweight=0", timeout_seconds=3.0)
+        path = f"/v1/llama_server/status?lightweight={1 if lightweight else 0}"
+        payload = _get_llama_manager_json(path, timeout_seconds=3.0)
     except Exception:
         payload = {}
-    setattr(app.state, "llama_manager_status_cache", {"ts": now, "payload": payload})
+    finally:
+        event.set()
+        current_pending = getattr(app.state, "llama_manager_status_inflight", None)
+        if isinstance(current_pending, dict) and current_pending.get(pending_key, {}).get("event") is event:
+            current_pending.pop(pending_key, None)
+    setattr(
+        app.state,
+        "llama_manager_status_cache",
+        {"ts": now, "payload": payload, "lightweight": bool(lightweight)},
+    )
     return payload
 
 
 def _clear_llama_manager_status_cache(app: Any) -> None:
     try:
-        setattr(app.state, "llama_manager_status_cache", {"ts": 0.0, "payload": {}})
+        setattr(app.state, "llama_manager_status_cache", {"ts": 0.0, "payload": {}, "lightweight": True})
     except Exception:
         pass
 
@@ -301,6 +367,41 @@ def _reconcile_managed_llama_server_settings(app: Any, settings: Dict[str, Any])
     if current_id and current_urls and target_url not in current_urls:
         out.pop("llama_server_managed_id", None)
     return out
+
+
+def _normalize_runtime_managed_llama_server_settings(app: Any, settings: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(settings or {})
+    backend_mode = str(out.get("backend_mode") or "").strip().lower()
+    if backend_mode != "llama_server" and not str(out.get("llama_server_url") or "").strip() and not str(out.get("llama_server_managed_id") or "").strip():
+        return out
+    try:
+        return _reconcile_managed_llama_server_settings(app, out)
+    except Exception:
+        return out
+
+
+def _reconcile_deck_managed_llama_server_settings(app: Any, deck: Dict[str, Any]) -> tuple[Dict[str, Any], bool]:
+    out = _normalize_deck(json.loads(json.dumps(deck or {})))
+    changed = False
+    for _type_id, t in list((out.get("types") or {}).items()):
+        if not isinstance(t, dict):
+            continue
+        models = t.get("models")
+        if not isinstance(models, list):
+            continue
+        for model in models:
+            if not isinstance(model, dict):
+                continue
+            settings = model.get("settings")
+            if not isinstance(settings, dict):
+                continue
+            before = json.dumps(settings, sort_keys=True, default=str)
+            after_settings = _normalize_runtime_managed_llama_server_settings(app, settings)
+            after = json.dumps(after_settings, sort_keys=True, default=str)
+            if after != before:
+                model["settings"] = after_settings
+                changed = True
+    return out, changed
 
 
 def _llama_manager_state_fallback() -> Dict[str, Any]:
@@ -442,6 +543,7 @@ def _start_managed_llama_server_if_needed(
     model_relpath: str,
     *,
     mmproj_relpath: Optional[str] = None,
+    auth_headers: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     managed_id = str((settings or {}).get("llama_server_managed_id") or "").strip()
     if not managed_id:
@@ -480,6 +582,7 @@ def _start_managed_llama_server_if_needed(
     result = _post_llama_manager_json(
         "/v1/llama_server/server/start",
         payload,
+        auth_headers=auth_headers,
     )
     status = result.get("status") if isinstance(result, dict) else None
 
@@ -488,12 +591,22 @@ def _start_managed_llama_server_if_needed(
     return None
 
 
-def _stop_managed_llama_server_if_needed(app: Any, settings: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _stop_managed_llama_server_if_needed(
+    app: Any,
+    settings: Dict[str, Any],
+    *,
+    auth_headers: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
     managed_id = str((settings or {}).get("llama_server_managed_id") or "").strip()
     if not managed_id:
         return None
     try:
-        result = _post_llama_manager_json("/v1/llama_server/server/stop", {"server_id": managed_id}, timeout_seconds=20.0)
+        result = _post_llama_manager_json(
+            "/v1/llama_server/server/stop",
+            {"server_id": managed_id},
+            timeout_seconds=20.0,
+            auth_headers=auth_headers,
+        )
     except Exception as exc:
         message = str(exc or "").strip()
         if "timed out" not in message.lower() and "timeout" not in message.lower():
@@ -543,22 +656,29 @@ def _current_loaded_gguf_settings(app: Any, sid: str, slot: str) -> Dict[str, An
         state = getattr(gguf_loader, "_state", {}) or {}
         current = state.get((sid or "_default", slot or "_default"))
         settings = dict((current or {}).get("settings") or {})
-        return settings if isinstance(settings, dict) else {}
+        if not isinstance(settings, dict):
+            return {}
+        return _normalize_runtime_managed_llama_server_settings(app, settings)
     except Exception:
         return {}
 
 
-def _stop_managed_llama_servers_for_settings(app: Any, *settings_list: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _stop_managed_llama_servers_for_settings(
+    app: Any,
+    *settings_list: Dict[str, Any],
+    auth_headers: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
     seen: set[str] = set()
     for settings in settings_list:
         if not isinstance(settings, dict):
             continue
+        settings = _normalize_runtime_managed_llama_server_settings(app, settings)
         managed_id = str((settings or {}).get("llama_server_managed_id") or "").strip()
         if not managed_id or managed_id in seen:
             continue
         seen.add(managed_id)
-        result = _stop_managed_llama_server_if_needed(app, settings)
+        result = _stop_managed_llama_server_if_needed(app, settings, auth_headers=auth_headers)
         if isinstance(result, dict):
             results.append(result)
     return results
@@ -624,7 +744,11 @@ def _load_deck(app: Any) -> Dict[str, Any]:
     if not os.path.exists(path):
         return {"version": 1, "updated_ts": int(time.time()), "types": {}}
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        # Be tolerant of UTF-8 BOMs. Some Windows tools can write JSON as
+        # UTF-8-with-BOM; plain utf-8 makes json.load raise before the first
+        # character, and this function intentionally falls back to an empty
+        # deck on read errors. That makes the Model Deck list appear blank.
+        with open(path, "r", encoding="utf-8-sig") as f:
             data = json.load(f)
         if not isinstance(data, dict):
             raise ValueError("deck not dict")
@@ -639,6 +763,7 @@ def _load_deck(app: Any) -> Dict[str, Any]:
         data["updated_ts"] = int(time.time())
     before = json.dumps(data, sort_keys=True)
     _cleanup_legacy_workflow_training_entries(data)
+    _migrate_legacy_speech_type(data)
     after = json.dumps(data, sort_keys=True)
     if before != after:
         try:
@@ -687,13 +812,53 @@ def _cleanup_legacy_workflow_training_entries(deck: Dict[str, Any]) -> Dict[str,
     return deck
 
 
+def _migrate_legacy_speech_type(deck: Dict[str, Any]) -> Dict[str, Any]:
+    types = deck.get("types") if isinstance(deck.get("types"), dict) else {}
+    legacy = types.get("speech") if isinstance(types.get("speech"), dict) else None
+    if not isinstance(legacy, dict):
+        return deck
+    target = types.get("speech_asr") if isinstance(types.get("speech_asr"), dict) else None
+    if not isinstance(target, dict):
+        target = {
+            "type_id": "speech_asr",
+            "label": "Speech ASR models",
+            "notes": "Audio -> text.",
+            "default_model_id": legacy.get("default_model_id"),
+            "main_model_id": legacy.get("main_model_id"),
+            "models": [],
+        }
+        types["speech_asr"] = target
+    existing_ids = {
+        str((row or {}).get("model_id") or "").strip()
+        for row in (target.get("models") or [])
+        if isinstance(row, dict)
+    }
+    for row in legacy.get("models") or []:
+        if not isinstance(row, dict):
+            continue
+        migrated = json.loads(json.dumps(row))
+        if str(migrated.get("loader_id") or "").strip() == "model_loader.model_deck.speech":
+            migrated["loader_id"] = "model_loader.model_deck.speech_asr"
+        model_id = str(migrated.get("model_id") or "").strip()
+        if model_id and model_id not in existing_ids:
+            target.setdefault("models", []).append(migrated)
+            existing_ids.add(model_id)
+    if not target.get("default_model_id"):
+        target["default_model_id"] = legacy.get("default_model_id")
+    if not target.get("main_model_id"):
+        target["main_model_id"] = legacy.get("main_model_id")
+    types.pop("speech", None)
+    return deck
+
+
 def _default_types() -> Dict[str, Any]:
     return {
         "text_llm": {"label": "Text LLM (chat / reasoning / code / tool-use)", "notes": "Text -> text / JSON tool calls."},
         "vlm": {"label": "Multimodal LLM / VLM (vision + language)", "notes": "Text+Image -> text / structured outputs."},
         "os_agent": {"label": "GUI / OS Agent model (policy + grounding)", "notes": "Screenshot+state -> actions."},
         "retrieval": {"label": "Retrieval models (embeddings + rerankers)", "notes": "Text -> vectors; (query, doc) -> score."},
-        "speech": {"label": "Speech models (ASR / TTS)", "notes": "Audio -> text; text -> audio."},
+        "speech_asr": {"label": "Speech ASR models", "notes": "Audio -> text."},
+        "speech_tts": {"label": "Speech TTS models", "notes": "Text -> audio."},
         "safety": {"label": "Safety / moderation models", "notes": "Text/image -> labels/scores."},
         "image_gen": {"label": "Image generation models (create + edit)", "notes": "Text -> image; image+mask -> image."},
         "video_gen": {"label": "Video generation models (create + edit)", "notes": "Text -> video; image -> video."},
@@ -770,9 +935,77 @@ class PreDownloadRequest(BaseModel):
     model_id: Optional[str] = None
 
 
+class HfRepoSearchRequest(BaseModel):
+    query: str = ""
+    limit: int = 12
+    task: str = ""
+
+
+class HfRepoDownloadRequest(BaseModel):
+    repo_id: str
+
+
+class HfGgufSearchRequest(BaseModel):
+    query: str = ""
+    limit: int = 10
+
+
+class HfAssetSearchRequest(BaseModel):
+    query: str = ""
+    limit: int = 10
+    extensions: List[str] = Field(default_factory=lambda: [".gguf", ".safetensors"])
+
+
+class HfGgufDownloadRequest(BaseModel):
+    repo_id: str
+    filename: str
+    backend_mode: str = "embedded"
+    destination_mode: str = "auto"
+    expected_bytes: int = 0
+
+
+class CompatStatusRequest(BaseModel):
+    type_id: str
+    manifest_id: Optional[str] = None
+    settings: Dict[str, Any] = Field(default_factory=dict)
+
+
+class CompatMutationRequest(BaseModel):
+    type_id: str
+    manifest_id: str
+    settings: Dict[str, Any] = Field(default_factory=dict)
+    requirement_ids: List[str] = Field(default_factory=list)
+
+
+class EnsureModelWorkflowRequest(BaseModel):
+    type_id: str
+    model_id: str
+    pid: Optional[str] = "default"
+    template_flow_name: Optional[str] = None
+    settings: Dict[str, Any] = Field(default_factory=dict)
+
+
+_LTX_MODEL_WORKFLOW_TEMPLATE_FLOW = "Models / Unsloth LTX 2.3 GGUF"
+
+
+def _looks_like_deck_type_entry(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    # Runtime/model setting dicts should never become deck type entries.  A
+    # real type entry has model-deck metadata and, at minimum, a models list
+    # once defaults are ensured.
+    return any(key in value for key in ("type_id", "label", "notes", "default_model_id", "main_model_id", "models"))
+
+
 def _normalize_deck(deck: Dict[str, Any]) -> Dict[str, Any]:
     if "types" not in deck or not isinstance(deck["types"], dict):
         deck["types"] = {}
+    else:
+        deck["types"] = {
+            str(tid): t
+            for tid, t in deck["types"].items()
+            if _looks_like_deck_type_entry(t)
+        }
     return deck
 
 
@@ -819,6 +1052,40 @@ def _find_model(t: Dict[str, Any], model_id: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _find_model_by_deck_or_runtime_id(t: Dict[str, Any], model_id: str) -> Optional[Dict[str, Any]]:
+    needle = str(model_id or "").strip()
+    if not needle:
+        return None
+    model = _find_model(t, needle)
+    if model is not None:
+        return model
+    needle_norm = needle.replace("\\", "/").rstrip("/").lower()
+    for m in (t.get("models") or []):
+        if not isinstance(m, dict):
+            continue
+        settings = m.get("settings") if isinstance(m.get("settings"), dict) else {}
+        candidates = [
+            settings.get("model_id"),
+            settings.get("model"),
+            settings.get("video_model_id"),
+            settings.get("image_model_id"),
+            settings.get("repo_id"),
+            settings.get("hf_repo_id"),
+            settings.get("model_path"),
+            settings.get("gguf_path"),
+            settings.get("video_gguf_path"),
+            settings.get("image_gguf_path"),
+        ]
+        for candidate in candidates:
+            cand = str(candidate or "").strip()
+            if not cand:
+                continue
+            cand_norm = cand.replace("\\", "/").rstrip("/").lower()
+            if cand_norm == needle_norm:
+                return m
+    return None
+
+
 def _next_cloned_model_id(t: Dict[str, Any], source_model_id: str) -> str:
     base = str(source_model_id or "").strip() or "model"
     existing = {str((m or {}).get("model_id") or "").strip() for m in (t.get("models") or []) if isinstance(m, dict)}
@@ -831,6 +1098,285 @@ def _next_cloned_model_id(t: Dict[str, Any], source_model_id: str) -> str:
         if candidate not in existing:
             return candidate
         idx += 1
+
+
+def _model_workflow_safe_name(model_id: str) -> str:
+    text = str(model_id or "").strip() or "model"
+    text = re.sub(r"[^A-Za-z0-9._-]+", "_", text)
+    text = re.sub(r"_+", "_", text).strip("._-")
+    return (text or "model")[:96]
+
+
+def _model_workflow_name_for_model(type_id: str, model_id: str, template_flow_name: str = "") -> str:
+    safe = _model_workflow_safe_name(model_id)
+    template = str(template_flow_name or _LTX_MODEL_WORKFLOW_TEMPLATE_FLOW).strip()
+    suffix = "LTX 2.3 GGUF" if "ltx" in template.lower() else "Workflow"
+    return f"Models / {safe} / {suffix}"
+
+
+def _parse_json_dict(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    text = str(value or "").strip()
+    if not text:
+        return {}
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        return {}
+    return dict(parsed) if isinstance(parsed, dict) else {}
+
+
+def _hf_asset_source(repo_id: str, filename: str = "") -> Dict[str, Any]:
+    repo_id = str(repo_id or "").strip()
+    filename = str(filename or "").strip().replace("\\", "/")
+    if not repo_id:
+        return {}
+    url = f"https://huggingface.co/{repo_id}"
+    if filename:
+        url = f"{url}/blob/main/{filename}"
+    return {
+        "type": "huggingface",
+        "repo_id": repo_id,
+        **({"filename": filename} if filename else {}),
+        "url": url,
+    }
+
+
+def _collect_asset_sources(*sources: Dict[str, Any]) -> Dict[str, Any]:
+    asset_sources: Dict[str, Any] = {}
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for source_key in ("_asset_sources", "asset_sources", "asset_source_urls"):
+            raw = source.get(source_key)
+            parsed = _parse_json_dict(raw) if isinstance(raw, str) else raw
+            if isinstance(parsed, dict):
+                for key, value in parsed.items():
+                    if value not in (None, "", [], {}):
+                        asset_sources[str(key)] = value
+        for key, value in source.items():
+            key_text = str(key or "")
+            if not key_text.endswith("_source_url"):
+                continue
+            asset_key = key_text[: -len("_source_url")]
+            url = str(value or "").strip()
+            if url:
+                asset_sources.setdefault(asset_key, {"type": "huggingface" if "huggingface.co/" in url else "url", "url": url})
+
+    # Preserve the source of a one-file GGUF download in workflows cloned from
+    # Hugging Face search.  This makes exported/reimported workflow JSONs
+    # self-describing even if the local cache path changes later.
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        repo_id = str(source.get("hf_source_repo_id") or source.get("repo_id") or "").strip()
+        filename = str(source.get("hf_source_filename") or source.get("gguf_filename") or "").strip()
+        if repo_id:
+            for asset_key in ("gguf_path", "model_path"):
+                if source.get(asset_key) not in (None, "", [], {}):
+                    asset_sources.setdefault(asset_key, _hf_asset_source(repo_id, filename))
+    return asset_sources
+
+
+def _model_workflow_asset_and_setting_values(model: Dict[str, Any], type_id: str = "") -> tuple[Dict[str, Any], Dict[str, Any]]:
+    settings = dict((model or {}).get("settings") or {})
+    model_id = str((model or {}).get("model_id") or "").strip()
+    runtime_assets = _parse_json_dict(settings.get("video_runtime_assets_json") or settings.get("image_runtime_assets_json"))
+    runtime_params = _parse_json_dict(settings.get("video_runtime_params_json") or settings.get("image_runtime_params_json"))
+    asset_key_names = {
+        "python_bin",
+        "script_path",
+        "workflow_runner_path",
+        "gguf_path",
+        "model_path",
+        "embeddings_connectors_path",
+        "video_vae_path",
+        "audio_vae_path",
+        "text_encoder_gguf_path",
+        "text_encoder_mmproj_path",
+        "text_encoder_projection_path",
+        "distilled_lora_path",
+        "spatial_upscaler_path",
+    }
+    asset_values: Dict[str, Any] = {}
+    for source in (runtime_assets, settings):
+        for key, value in source.items():
+            if value in (None, "", [], {}):
+                continue
+            key_text = str(key)
+            if key_text in asset_key_names or key_text.endswith("_path"):
+                asset_values[key_text] = value
+    asset_sources = _collect_asset_sources(runtime_assets, settings)
+    if asset_sources:
+        asset_values["_asset_sources"] = asset_sources
+
+    settings_values: Dict[str, Any] = {}
+    for source in (runtime_params, settings):
+        for key, value in source.items():
+            if value in (None, "", [], {}):
+                continue
+            key_text = str(key)
+            if key_text in {"video_runtime_template_json", "video_runtime_assets_json", "video_runtime_params_json", "image_runtime_template_json", "image_runtime_assets_json", "image_runtime_params_json"}:
+                continue
+            settings_values[key_text] = value
+    if model_id:
+        settings_values["__model_deck_default_model_id"] = model_id
+        settings_values["__model_deck_model_id"] = model_id
+    if type_id:
+        settings_values["__model_deck_type_id"] = str(type_id)
+    if asset_values.get("distilled_lora_path") and "skip_lora" not in settings:
+        settings_values["skip_lora"] = False
+    if asset_values.get("distilled_lora_path") and "native_skip_lora" not in settings:
+        settings_values["native_skip_lora"] = False
+    if asset_values.get("spatial_upscaler_path") and "native_debug_skip_stage2" not in settings:
+        settings_values["native_debug_skip_stage2"] = False
+    return asset_values, settings_values
+
+
+def _hydrate_model_workflow_flow(flow: Dict[str, Any], model: Dict[str, Any], type_id: str, flow_name: str, template_flow_name: str) -> Dict[str, Any]:
+    hydrated = json.loads(json.dumps(flow if isinstance(flow, dict) else {}))
+    asset_values, settings_values = _model_workflow_asset_and_setting_values(model, type_id)
+    settings = dict((model or {}).get("settings") or {})
+
+    def _merged_json(raw_value: Any, updates: Dict[str, Any]) -> str:
+        blob = _parse_json_dict(raw_value)
+        for key, value in updates.items():
+            if value not in (None, "", [], {}):
+                blob[str(key)] = value
+        return json.dumps(blob, indent=2)
+
+    def _hydrate_params(params: Dict[str, Any]) -> None:
+        if not isinstance(params, dict):
+            return
+        node_settings = dict(params.get("settings") if isinstance(params.get("settings"), dict) else {})
+        node_assets = dict(params.get("assets") if isinstance(params.get("assets"), dict) else {})
+        node_settings.update(settings_values)
+        for key, value in asset_values.items():
+            node_assets[key] = value
+            node_settings[key] = value
+        runtime_asset_key = "image_runtime_assets_json" if str(type_id) == "image_gen" else "video_runtime_assets_json"
+        runtime_param_key = "image_runtime_params_json" if str(type_id) == "image_gen" else "video_runtime_params_json"
+        runtime_template_key = "image_runtime_template_json" if str(type_id) == "image_gen" else "video_runtime_template_json"
+        node_settings[runtime_asset_key] = _merged_json(
+            settings.get(runtime_asset_key) or node_settings.get(runtime_asset_key),
+            asset_values,
+        )
+        node_settings[runtime_param_key] = _merged_json(
+            settings.get(runtime_param_key) or node_settings.get(runtime_param_key),
+            settings_values,
+        )
+        if settings.get(runtime_template_key) not in (None, ""):
+            node_settings[runtime_template_key] = settings.get(runtime_template_key)
+        params["settings"] = node_settings
+        params["assets"] = node_assets
+        existing_keys = params.get("asset_keys") if isinstance(params.get("asset_keys"), list) else []
+        merged_keys: List[str] = []
+        seen: set[str] = set()
+        for key in [*existing_keys, *asset_values.keys()]:
+            text = str(key or "").strip()
+            if text and text not in seen:
+                seen.add(text)
+                merged_keys.append(text)
+        if merged_keys:
+            params["asset_keys"] = merged_keys
+
+    def _walk(value: Any) -> None:
+        if isinstance(value, dict):
+            tool_cfg = value.get("tool_config") if isinstance(value.get("tool_config"), dict) else None
+            if tool_cfg is not None and isinstance(tool_cfg.get("params"), dict):
+                _hydrate_params(tool_cfg["params"])
+            for child in value.values():
+                _walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                _walk(child)
+
+    _walk(hydrated)
+    meta = hydrated.get("metadata") if isinstance(hydrated.get("metadata"), dict) else {}
+    meta = dict(meta or {})
+    meta["source"] = meta.get("source") or "model_deck"
+    meta["model_deck"] = {
+        "type_id": str(type_id or ""),
+        "model_id": str((model or {}).get("model_id") or ""),
+        "flow_name": str(flow_name or ""),
+        "template_flow_name": str(template_flow_name or ""),
+        "owned_by_model": True,
+    }
+    hydrated["metadata"] = meta
+    return hydrated
+
+
+def _ensure_model_workflow_for_deck_model(app: Any, type_id: str, model_id: str, pid: str = "default", template_flow_name: str = "", incoming_settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    try:
+        from plugins.gui_helpers.agent_flow.skills.workflow import _workflow_store
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Agent Flow workflow store unavailable: {exc}") from exc
+    deck = _ensure_defaults(_load_deck(app))
+    t = _get_type(deck, str(type_id or "").strip())
+    model = _find_model_by_deck_or_runtime_id(t, str(model_id or "").strip())
+    if model is None:
+        raise HTTPException(status_code=404, detail=f"unknown model_id: {model_id}")
+    settings = dict(model.get("settings") or {})
+    if isinstance(incoming_settings, dict) and incoming_settings:
+        settings.update({str(k): v for k, v in incoming_settings.items()})
+        model["settings"] = settings
+    ctx = {"app": app, "pid": str(pid or "default").strip() or "default"}
+    project_flows = _workflow_store.load_project_flows(ctx, str(pid or "default").strip() or "default")
+    default_flows = _workflow_store.load_default_flows(ctx)
+    flows = dict(project_flows or {})
+    saved_flow_name = str(settings.get("model_workflow_flow_name") or "").strip()
+    if saved_flow_name and isinstance(flows.get(saved_flow_name), dict):
+        if isinstance(incoming_settings, dict) and incoming_settings:
+            _save_deck(app, deck)
+        records = _workflow_store.project_flow_records(ctx, str(pid or "default").strip() or "default")
+        ids = _workflow_store.flow_ids_by_name(records)
+        return {
+            "ok": True,
+            "created": False,
+            "flow_name": saved_flow_name,
+            "workflow_id": str(ids.get(saved_flow_name) or ""),
+            "template_flow_name": str(settings.get("model_workflow_template_flow_name") or template_flow_name or _LTX_MODEL_WORKFLOW_TEMPLATE_FLOW),
+            "deck": deck,
+        }
+
+    chosen_template = str(template_flow_name or settings.get("model_workflow_template_flow_name") or _LTX_MODEL_WORKFLOW_TEMPLATE_FLOW).strip()
+    template_flow = flows.get(chosen_template) if isinstance(flows.get(chosen_template), dict) else None
+    if template_flow is None:
+        template_flow = default_flows.get(chosen_template) if isinstance(default_flows.get(chosen_template), dict) else None
+    if template_flow is None:
+        for candidate_name, candidate_flow in {**default_flows, **flows}.items():
+            if isinstance(candidate_flow, dict) and str(candidate_name or "").lower().startswith("models /") and "ltx" in str(candidate_name or "").lower():
+                chosen_template = str(candidate_name)
+                template_flow = candidate_flow
+                break
+    if template_flow is None:
+        raise HTTPException(status_code=404, detail=f"workflow template not found: {chosen_template}")
+
+    base_name = saved_flow_name or _model_workflow_name_for_model(str(type_id), str(model_id), chosen_template)
+    flow_name = base_name
+    suffix = 2
+    while flow_name in flows:
+        flow_name = f"{base_name} ({suffix})"
+        suffix += 1
+    flows[flow_name] = _hydrate_model_workflow_flow(template_flow, model, str(type_id), flow_name, chosen_template)
+    records = _workflow_store.replace_project_flows(ctx, str(pid or "default").strip() or "default", flows)
+    ids = _workflow_store.flow_ids_by_name(records)
+
+    settings["model_workflow_flow_name"] = flow_name
+    settings["model_workflow_template_flow_name"] = chosen_template
+    settings["model_workflow_owned"] = True
+    settings["model_workflow_created_ts"] = int(time.time())
+    model["settings"] = settings
+    _save_deck(app, deck)
+    return {
+        "ok": True,
+        "created": True,
+        "flow_name": flow_name,
+        "workflow_id": str(ids.get(flow_name) or ""),
+        "template_flow_name": chosen_template,
+        "deck": deck,
+    }
 
 
 def _list_loader_ids(app: Any) -> List[str]:
@@ -855,6 +1401,8 @@ def _list_loader_ids(app: Any) -> List[str]:
         "model_loader.model_deck.retrieval",
         "model_loader.model_deck.safety",
         "model_loader.model_deck.speech",
+        "model_loader.model_deck.speech_asr",
+        "model_loader.model_deck.speech_tts",
         "model_loader.model_deck.image_gen_gguf",
     ])
     return sorted({lid for lid in loader_ids if lid})
@@ -1010,6 +1558,677 @@ def _hf_hub_download(repo_id: str, filename: str, *, token: str = "", cache_dir:
                 return hf_hub_download(**kwargs)
 
 
+def _hf_list_models(api: Any, *, search: str, limit: int, token: Optional[str] = None):
+    attempts = [
+        {"search": search, "sort": "downloads", "direction": -1, "limit": limit, "token": token},
+        {"search": search, "sort": "downloads", "limit": limit, "token": token},
+        {"search": search, "limit": limit, "token": token},
+        {"search": search, "sort": "downloads", "direction": -1, "limit": limit},
+        {"search": search, "sort": "downloads", "limit": limit},
+        {"search": search, "limit": limit},
+    ]
+    last_exc: Optional[Exception] = None
+    for kwargs in attempts:
+        try:
+            return api.list_models(**kwargs)
+        except TypeError as exc:
+            last_exc = exc
+            continue
+        except Exception as exc:
+            last_exc = exc
+            break
+    if last_exc is not None:
+        raise last_exc
+    return []
+
+
+def _sanitize_model_search_query(query: str) -> str:
+    raw = str(query or "").strip()
+    if not raw:
+        return ""
+    raw = re.sub(r"\.gguf$", "", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"[._-]+", " ", raw)
+    return " ".join(raw.split())
+
+
+def _hf_query_candidates(query: str) -> List[str]:
+    q = _sanitize_model_search_query(query)
+    if not q:
+        return []
+    candidates: List[str] = []
+    seen: set[str] = set()
+
+    def add(value: str) -> None:
+        s = " ".join(str(value or "").split()).strip()
+        if not s:
+            return
+        low = s.lower()
+        if low in seen:
+            return
+        seen.add(low)
+        candidates.append(s)
+
+    add(q)
+    add(f"{q} GGUF")
+    simplified = q.replace("-", " ")
+    add(simplified)
+    add(f"{simplified} GGUF")
+    no_sizes = " ".join(part for part in simplified.split() if not any(ch.isdigit() for ch in part))
+    add(no_sizes)
+    add(f"{no_sizes} GGUF")
+    parts = [
+        part
+        for part in no_sizes.split()
+        if part.lower() not in {
+            "gguf",
+            "instruct",
+            "instruction",
+            "chat",
+            "model",
+            "models",
+            "reader",
+            "private",
+            "starter",
+            "balanced",
+            "gpu",
+            "cpu",
+            "workflow",
+            "workflows",
+        }
+    ]
+    if parts:
+        add(" ".join(parts[:2]))
+        add(f"{' '.join(parts[:2])} GGUF")
+        add(parts[0])
+        add(f"{parts[0]} GGUF")
+    return [item for item in candidates if item]
+
+
+def _is_safe_gguf_name(name: str) -> bool:
+    low = str(name or "").strip().lower()
+    if not low.endswith(".gguf"):
+        return False
+    bad_tokens = ("tokenizer", "vocab", "spm", "merges", "readme")
+    return not any(token in low for token in bad_tokens)
+
+
+def _is_single_file_gguf_name(name: str) -> bool:
+    low = str(name or "").strip().lower()
+    if not low.endswith(".gguf"):
+        return False
+    split_tokens = ("-00001-of-", ".part", "-split-", "-shard-")
+    return not any(token in low for token in split_tokens)
+
+
+def _resolve_repo_file_sizes(api: Any, app: Any, repo_id: str, filenames: List[str]) -> Dict[str, Optional[int]]:
+    repo_value = str(repo_id or "").strip()
+    wanted = [str(name or "").strip() for name in filenames if str(name or "").strip()]
+    sizes: Dict[str, Optional[int]] = {name: None for name in wanted}
+    if not repo_value or not wanted:
+        return sizes
+    token = _resolve_hf_token(app) or None
+    try:
+        detail = api.model_info(repo_id=repo_value, files_metadata=True, token=token)
+    except TypeError:
+        try:
+            detail = api.model_info(repo_id=repo_value, files_metadata=True)
+        except Exception:
+            return sizes
+    except Exception:
+        return sizes
+    siblings = getattr(detail, "siblings", None) or []
+    for sib in siblings:
+        name = str(getattr(sib, "rfilename", "") or "").strip()
+        if name not in sizes:
+            continue
+        size = getattr(sib, "size", None)
+        try:
+            sizes[name] = int(size) if size is not None else None
+        except Exception:
+            sizes[name] = None
+    return sizes
+
+
+def _search_hf_gguf_models(app: Any, query: str, *, limit: int = 10) -> List[Dict[str, Any]]:
+    try:
+        from huggingface_hub import HfApi
+    except Exception as exc:
+        raise HTTPException(500, f"huggingface_hub not available: {exc}") from exc
+    api = HfApi()
+    q = _sanitize_model_search_query(query)
+    if not q:
+        raise HTTPException(status_code=400, detail="search query required")
+    rows: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    search_limit = max(limit * 4, 24)
+    token = _resolve_hf_token(app) or None
+    for candidate in _hf_query_candidates(q):
+        try:
+            models_iter = _hf_list_models(api, search=candidate, limit=search_limit, token=token)
+        except Exception:
+            continue
+        for info in models_iter:
+            repo_id = str(getattr(info, "id", "") or "").strip()
+            if not repo_id or repo_id in seen:
+                continue
+            seen.add(repo_id)
+            try:
+                detail = api.model_info(repo_id=repo_id, files_metadata=True, token=token)
+            except TypeError:
+                try:
+                    detail = api.model_info(repo_id=repo_id, files_metadata=True)
+                except Exception:
+                    continue
+            except Exception:
+                continue
+            siblings = getattr(detail, "siblings", None) or []
+            gguf_names: List[str] = []
+            size_map: Dict[str, Optional[int]] = {}
+            for sib in siblings:
+                name = str(getattr(sib, "rfilename", "") or "").strip()
+                if not name.lower().endswith(".gguf"):
+                    continue
+                gguf_names.append(name)
+                size = getattr(sib, "size", None)
+                try:
+                    size_map[name] = int(size) if size is not None else None
+                except Exception:
+                    size_map[name] = None
+            if gguf_names and any(size_map.get(name) is None for name in gguf_names):
+                fallback_sizes = _resolve_repo_file_sizes(api, app, repo_id, gguf_names)
+                for name, size in fallback_sizes.items():
+                    if size is not None:
+                        size_map[name] = size
+            gguf_files: List[Dict[str, Any]] = []
+            for name in gguf_names:
+                gguf_files.append({
+                    "filename": name,
+                    "size": size_map.get(name),
+                    "direct_url": f"https://huggingface.co/{repo_id}/resolve/main/{name}",
+                    "is_safe": _is_safe_gguf_name(name),
+                    "is_single_file": _is_single_file_gguf_name(name),
+                })
+            if not gguf_files:
+                continue
+            gguf_files.sort(key=lambda item: item.get("filename") or "")
+            rows.append({
+                "repo_id": repo_id,
+                "downloads": getattr(detail, "downloads", None),
+                "likes": getattr(detail, "likes", None),
+                "last_modified": str(getattr(detail, "last_modified", "") or ""),
+                "pipeline_tag": getattr(detail, "pipeline_tag", None),
+                "gguf_files": gguf_files,
+                "repo_url": f"https://huggingface.co/{repo_id}",
+            })
+            if len(rows) >= limit:
+                return rows
+    return rows
+
+
+def _normalize_hf_extensions(values: Any) -> List[str]:
+    out: List[str] = []
+    for raw in (values or []):
+        text = str(raw or "").strip().lower()
+        if not text:
+            continue
+        if not text.startswith("."):
+            text = f".{text}"
+        if text not in out:
+            out.append(text)
+    return out or [".gguf", ".safetensors"]
+
+
+def _search_hf_asset_files(app: Any, query: str, *, limit: int = 10, extensions: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    try:
+        from huggingface_hub import HfApi
+    except Exception as exc:
+        raise HTTPException(500, f"huggingface_hub not available: {exc}") from exc
+    api = HfApi()
+    q = _sanitize_model_search_query(query)
+    if not q:
+        raise HTTPException(status_code=400, detail="search query required")
+    ext_list = _normalize_hf_extensions(extensions)
+    rows: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    search_limit = max(limit * 4, 24)
+    token = _resolve_hf_token(app) or None
+    for candidate in _hf_query_candidates(q):
+        try:
+            models_iter = _hf_list_models(api, search=candidate, limit=search_limit, token=token)
+        except Exception:
+            continue
+        for info in models_iter:
+            repo_id = str(getattr(info, "id", "") or "").strip()
+            if not repo_id or repo_id in seen:
+                continue
+            seen.add(repo_id)
+            try:
+                detail = api.model_info(repo_id=repo_id, files_metadata=True, token=token)
+            except TypeError:
+                try:
+                    detail = api.model_info(repo_id=repo_id, files_metadata=True)
+                except Exception:
+                    continue
+            except Exception:
+                continue
+            siblings = getattr(detail, "siblings", None) or []
+            file_names: List[str] = []
+            size_map: Dict[str, Optional[int]] = {}
+            for sib in siblings:
+                name = str(getattr(sib, "rfilename", "") or "").strip()
+                lower_name = name.lower()
+                if not any(lower_name.endswith(ext) for ext in ext_list):
+                    continue
+                file_names.append(name)
+                size = getattr(sib, "size", None)
+                try:
+                    size_map[name] = int(size) if size is not None else None
+                except Exception:
+                    size_map[name] = None
+            if file_names and any(size_map.get(name) is None for name in file_names):
+                fallback_sizes = _resolve_repo_file_sizes(api, app, repo_id, file_names)
+                for name, size in fallback_sizes.items():
+                    if size is not None:
+                        size_map[name] = size
+            files: List[Dict[str, Any]] = []
+            for name in file_names:
+                files.append({
+                    "filename": name,
+                    "size": size_map.get(name),
+                    "extension": os.path.splitext(name)[1].lower(),
+                    "direct_url": f"https://huggingface.co/{repo_id}/resolve/main/{name}",
+                })
+            if not files:
+                continue
+            files.sort(key=lambda item: item.get("filename") or "")
+            rows.append({
+                "repo_id": repo_id,
+                "downloads": getattr(detail, "downloads", None),
+                "likes": getattr(detail, "likes", None),
+                "last_modified": str(getattr(detail, "last_modified", "") or ""),
+                "pipeline_tag": getattr(detail, "pipeline_tag", None),
+                "files": files,
+                "repo_url": f"https://huggingface.co/{repo_id}",
+            })
+            if len(rows) >= limit:
+                return rows
+    return rows
+
+
+def _materialize_hf_model(app: Any, repo_id: str, filename: str, backend_mode: str, destination_mode: str = "auto") -> Dict[str, Any]:
+    repo_id = str(repo_id or "").strip()
+    filename = str(filename or "").strip()
+    mode = str(backend_mode or "embedded").strip().lower() or "embedded"
+    dest_mode = str(destination_mode or "auto").strip().lower() or "auto"
+    if not repo_id or not filename:
+        raise HTTPException(status_code=400, detail="repo_id and filename required")
+    token = _resolve_hf_token(app)
+    cache_dir = _resolve_hf_cache_dir(app)
+    cache_path = _hf_hub_download(repo_id, filename, token=token, cache_dir=cache_dir)
+    use_models_dir = dest_mode in {"both", "models_dir"} or (dest_mode == "auto" and mode != "embedded")
+    copied_path: Optional[str] = None
+    rel_source = ""
+    if use_models_dir:
+        copied_path, rel_source = _ensure_llama_server_model_copy(cache_path)
+    storage = "hf_cache"
+    saved_path = cache_path
+    model_source = cache_path
+    if copied_path is not None:
+        if dest_mode == "both":
+            storage = "hf_cache+llmloader_models"
+            saved_path = copied_path
+            model_source = cache_path if mode == "embedded" else rel_source
+        else:
+            storage = "llmloader_models"
+            saved_path = copied_path
+            model_source = rel_source
+    return {
+        "repo_id": repo_id,
+        "filename": filename,
+        "backend_mode": mode,
+        "destination_mode": dest_mode,
+        "cache_path": cache_path,
+        "saved_path": saved_path,
+        "copied_path": copied_path,
+        "model_source": model_source,
+        "storage": storage,
+    }
+
+
+def _model_deck_download_jobs(app: Any) -> Dict[str, Dict[str, Any]]:
+    jobs = getattr(app.state, "model_deck_download_jobs", None)
+    if isinstance(jobs, dict):
+        return jobs
+    jobs = {}
+    app.state.model_deck_download_jobs = jobs
+    return jobs
+
+
+def _download_progress_bytes(repo_id: str, *, cache_dir: Optional[str] = None) -> int:
+    repo_key = str(repo_id or "").strip().replace("/", "--")
+    if not repo_key:
+        return 0
+    hub_root_raw = _hf_cache_hub_root(cache_dir)
+    if not hub_root_raw:
+        return 0
+    hub_root = Path(hub_root_raw)
+    blobs_dir = hub_root / f"models--{repo_key}" / "blobs"
+    if not blobs_dir.is_dir():
+        return 0
+    total = 0
+    try:
+        for node in blobs_dir.iterdir():
+            if not node.is_file():
+                continue
+            name = str(node.name or "")
+            if not name.endswith(".incomplete"):
+                continue
+            try:
+                total += int(node.stat().st_size or 0)
+            except Exception:
+                continue
+    except Exception:
+        return 0
+    return max(0, total)
+
+
+def _set_model_deck_download_job(app: Any, job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    jobs = _model_deck_download_jobs(app)
+    row = dict(jobs.get(job_id) or {})
+    row.update(payload or {})
+    row["job_id"] = job_id
+    row["updated_ts"] = time.time()
+    jobs[job_id] = row
+    return row
+
+
+def _start_model_deck_download_job(app: Any, repo_id: str, filename: str, backend_mode: str, destination_mode: str, expected_bytes: int = 0) -> str:
+    job_id = uuid.uuid4().hex
+    expected_total = max(0, int(expected_bytes or 0))
+    _set_model_deck_download_job(app, job_id, {
+        "ok": True,
+        "done": False,
+        "phase": "queued",
+        "status": f"Queued {filename} for download.",
+        "repo_id": repo_id,
+        "filename": filename,
+        "backend_mode": backend_mode,
+        "downloaded_bytes": 0,
+        "expected_bytes": expected_total,
+    })
+
+    def _run() -> None:
+        stop_progress = threading.Event()
+
+        def _watch_progress() -> None:
+            while not stop_progress.wait(1.0):
+                raw_downloaded = _download_progress_bytes(repo_id, cache_dir=_resolve_hf_cache_dir(app))
+                if raw_downloaded <= 0:
+                    continue
+                row = _model_deck_download_jobs(app).get(job_id) or {}
+                if bool(row.get("done")):
+                    break
+                current_expected = max(0, int(row.get("expected_bytes") or expected_total or 0))
+                downloaded = min(raw_downloaded, current_expected) if current_expected > 0 else raw_downloaded
+                detail = f"Downloading {filename}... {downloaded:,} bytes"
+                if current_expected > 0:
+                    detail += f" of {current_expected:,}"
+                _set_model_deck_download_job(app, job_id, {
+                    "phase": "download",
+                    "status": detail,
+                    "downloaded_bytes": downloaded,
+                    "expected_bytes": current_expected,
+                })
+
+        threading.Thread(target=_watch_progress, name=f"model-deck-progress-{job_id[:8]}", daemon=True).start()
+        try:
+            def _progress(phase: str, status: str) -> None:
+                _set_model_deck_download_job(app, job_id, {
+                    "phase": str(phase or "working"),
+                    "status": str(status or "Working..."),
+                    "expected_bytes": expected_total,
+                })
+
+            result = _materialize_hf_model(app, repo_id, filename, backend_mode, destination_mode)
+            final_status = (
+                "Saved to Hugging Face cache and copied into data/models."
+                if result.get("storage") == "hf_cache+llmloader_models"
+                else "Saved to Hugging Face cache and selected for embedded GGUF."
+                if result.get("storage") == "hf_cache"
+                else "Copied into data/models and selected for llama.cpp server."
+            )
+            _set_model_deck_download_job(app, job_id, {
+                "done": True,
+                "phase": "complete",
+                "status": final_status,
+                "downloaded_bytes": expected_total if expected_total > 0 else max(0, _download_progress_bytes(repo_id, cache_dir=_resolve_hf_cache_dir(app))),
+                "expected_bytes": expected_total,
+                "result": result,
+            })
+        except Exception as exc:
+            detail = getattr(exc, "detail", None)
+            _set_model_deck_download_job(app, job_id, {
+                "ok": False,
+                "done": True,
+                "phase": "error",
+                "status": str(detail or exc or "Download failed"),
+                "expected_bytes": expected_total,
+                "error": str(detail or exc or "Download failed"),
+            })
+        finally:
+            stop_progress.set()
+
+    threading.Thread(target=_run, name=f"model-deck-download-{job_id[:8]}", daemon=True).start()
+    return job_id
+
+
+def _start_model_deck_repo_download_job(app: Any, repo_id: str) -> str:
+    job_id = uuid.uuid4().hex
+    repo_value = str(repo_id or "").strip()
+    _set_model_deck_download_job(app, job_id, {
+        "ok": True,
+        "done": False,
+        "phase": "queued",
+        "status": f"Queued {repo_value} for download.",
+        "repo_id": repo_value,
+        "downloaded_bytes": 0,
+        "expected_bytes": 0,
+    })
+
+    def _run() -> None:
+        stop_progress = threading.Event()
+
+        def _watch_progress() -> None:
+            while not stop_progress.wait(1.0):
+                downloaded = _download_progress_bytes(repo_value, cache_dir=_resolve_hf_cache_dir(app))
+                if downloaded <= 0:
+                    continue
+                row = _model_deck_download_jobs(app).get(job_id) or {}
+                if bool(row.get("done")):
+                    break
+                current_expected = max(0, int(row.get("expected_bytes") or 0))
+                detail = f"Downloading {repo_value}... {downloaded:,} bytes"
+                if current_expected > 0:
+                    detail += f" of {current_expected:,}"
+                _set_model_deck_download_job(app, job_id, {
+                    "phase": "download",
+                    "status": detail,
+                    "downloaded_bytes": downloaded,
+                    "expected_bytes": current_expected,
+                })
+
+        threading.Thread(target=_watch_progress, name=f"model-deck-repo-progress-{job_id[:8]}", daemon=True).start()
+        try:
+            token = _resolve_hf_token(app)
+            cache_dir = _resolve_hf_cache_dir(app)
+            cache_path = _snapshot_download(repo_value, token=token, cache_dir=cache_dir)
+            _set_model_deck_download_job(app, job_id, {
+                "done": True,
+                "phase": "complete",
+                "status": "Saved repository to Hugging Face cache.",
+                "downloaded_bytes": max(0, _download_progress_bytes(repo_value, cache_dir=_resolve_hf_cache_dir(app))),
+                "expected_bytes": 0,
+                "result": {
+                    "repo_id": repo_value,
+                    "cache_path": cache_path,
+                    "model_source": repo_value,
+                    "storage": "hf_cache_repo",
+                },
+            })
+        except Exception as exc:
+            detail = getattr(exc, "detail", None)
+            _set_model_deck_download_job(app, job_id, {
+                "ok": False,
+                "done": True,
+                "phase": "error",
+                "status": str(detail or exc or "Download failed"),
+                "expected_bytes": 0,
+                "error": str(detail or exc or "Download failed"),
+            })
+        finally:
+            stop_progress.set()
+
+    threading.Thread(target=_run, name=f"model-deck-repo-download-{job_id[:8]}", daemon=True).start()
+    return job_id
+
+
+def _sanitize_hf_repo_query(query: str) -> str:
+    raw = str(query or "").strip()
+    if not raw:
+        return ""
+    raw = re.sub(r"\.gguf$", "", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"[._-]+", " ", raw)
+    return " ".join(raw.split())
+
+
+def _hf_repo_query_candidates(query: str) -> List[str]:
+    q = _sanitize_hf_repo_query(query)
+    if not q:
+        return []
+    candidates: List[str] = []
+    seen: set[str] = set()
+
+    def add(value: str) -> None:
+        s = " ".join(str(value or "").split()).strip()
+        if not s:
+            return
+        low = s.lower()
+        if low in seen:
+            return
+        seen.add(low)
+        candidates.append(s)
+
+    add(q)
+    simplified = q.replace("-", " ")
+    add(simplified)
+    no_sizes = " ".join(part for part in simplified.split() if not any(ch.isdigit() for ch in part))
+    add(no_sizes)
+    parts = [part for part in no_sizes.split() if part.lower() not in {"model", "models", "image", "video", "generator", "diffusers"}]
+    if parts:
+        add(" ".join(parts[:2]))
+        add(parts[0])
+    return [item for item in candidates if item]
+
+
+def _matches_hf_repo_task(detail: Any, task: str) -> bool:
+    task_value = str(task or "").strip().lower()
+    if not task_value:
+        return True
+    pipeline_tag = str(getattr(detail, "pipeline_tag", "") or "").strip().lower()
+    tags = [str(item or "").strip().lower() for item in (getattr(detail, "tags", None) or [])]
+    haystack = " ".join([pipeline_tag] + tags)
+    if task_value == "image":
+        return any(token in haystack for token in ("text-to-image", "image-to-image", "diffusers", "flux", "stable-diffusion", "sdxl", "image-generation"))
+    if task_value == "video":
+        return any(token in haystack for token in ("text-to-video", "image-to-video", "video-to-video", "video-generation", "wan", "stable-video-diffusion", "svd", "diffusers"))
+    return True
+
+
+def _query_terms_match_repo(detail: Any, query: str) -> bool:
+    q = str(query or "").strip().lower()
+    if not q:
+        return False
+    repo_id = str(getattr(detail, "id", "") or "").strip().lower()
+    pipeline_tag = str(getattr(detail, "pipeline_tag", "") or "").strip().lower()
+    tags = [str(item or "").strip().lower() for item in (getattr(detail, "tags", None) or [])]
+    haystack = " ".join([repo_id, pipeline_tag] + tags)
+    parts = [part for part in re.split(r"[^a-z0-9]+", q) if part and len(part) >= 2]
+    if not parts:
+        return False
+    matches = 0
+    for part in parts:
+        if part in haystack:
+            matches += 1
+    return matches >= max(1, min(2, len(parts)))
+
+
+def _hf_repo_score(detail: Any, query: str, task: str) -> float:
+    repo_id = str(getattr(detail, "id", "") or "").strip().lower()
+    pipeline_tag = str(getattr(detail, "pipeline_tag", "") or "").strip().lower()
+    tags = [str(item or "").strip().lower() for item in (getattr(detail, "tags", None) or [])]
+    downloads = float(getattr(detail, "downloads", 0) or 0)
+    likes = float(getattr(detail, "likes", 0) or 0)
+    score = downloads + (likes * 25.0)
+    q = str(query or "").strip().lower()
+    if q and q in repo_id:
+        score += 50000.0
+    for part in [part for part in re.split(r"[^a-z0-9]+", q) if part]:
+        if part in repo_id:
+            score += 4000.0
+        if any(part in tag for tag in tags):
+            score += 1500.0
+        if part in pipeline_tag:
+            score += 1500.0
+    if task and _matches_hf_repo_task(detail, task):
+        score += 20000.0
+    elif task and _query_terms_match_repo(detail, query):
+        score += 8000.0
+    return score
+
+
+def _search_hf_repos(query: str, *, token: str = "", limit: int = 12, task: str = "") -> List[Dict[str, Any]]:
+    try:
+        from huggingface_hub import HfApi
+    except Exception as exc:
+        raise HTTPException(500, f"huggingface_hub not available: {exc}") from exc
+    q = _sanitize_hf_repo_query(query)
+    if not q:
+        raise HTTPException(400, "search query required")
+    api = HfApi()
+    rows: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    search_limit = max(limit * 5, 30)
+    for candidate in _hf_repo_query_candidates(q):
+        try:
+            models_iter = list(_hf_list_models(api, search=candidate, limit=search_limit, token=token or None))
+        except Exception:
+            continue
+        for info in models_iter:
+            repo_id = str(getattr(info, "id", "") or "").strip()
+            if not repo_id or repo_id in seen:
+                continue
+            seen.add(repo_id)
+            detail = info
+            tags = [str(item or "").strip() for item in (getattr(detail, "tags", None) or []) if str(item or "").strip()]
+            rows.append({
+                "repo_id": repo_id,
+                "downloads": getattr(detail, "downloads", None),
+                "likes": getattr(detail, "likes", None),
+                "last_modified": str(getattr(detail, "last_modified", "") or ""),
+                "pipeline_tag": getattr(detail, "pipeline_tag", None),
+                "tags": tags[:12],
+                "repo_url": f"https://huggingface.co/{repo_id}",
+                "_score": _hf_repo_score(detail, q, task),
+            })
+    rows.sort(key=lambda item: float(item.get("_score") or 0), reverse=True)
+    out: List[Dict[str, Any]] = []
+    for item in rows[:limit]:
+        row = dict(item)
+        row.pop("_score", None)
+        out.append(row)
+    return out
+
+
 def _build_load_intent(model: Dict[str, Any], pid: Optional[str], sid: Optional[str]) -> Dict[str, Any]:
     loader_id = str(model.get("loader_id") or "")
     settings = dict(model.get("settings") or {})
@@ -1053,7 +2272,14 @@ def _gguf_loader_ids() -> set[str]:
         "model_loader.model_deck.os_agent",
         "model_loader.model_deck.retrieval",
         "model_loader.model_deck.safety",
+    }
+
+
+def _speech_loader_ids() -> set[str]:
+    return {
         "model_loader.model_deck.speech",
+        "model_loader.model_deck.speech_asr",
+        "model_loader.model_deck.speech_tts",
     }
 
 
@@ -1064,6 +2290,31 @@ def _image_gen_loader_ids() -> set[str]:
     }
 
 
+def _media_loader_ids() -> set[str]:
+    return _image_gen_loader_ids() | {"model_loader.model_deck.video"}
+
+
+def _speech_state(loader_id: str) -> Dict[str, Any]:
+    if loader_id in _speech_loader_ids():
+        from plugins.model_loader.model_deck.local_loaders.speech import routes as speech_routes
+        return speech_routes.state_for_loader(loader_id)
+    return {}
+
+
+def _speech_load(loader_id: str, request: Any, settings: Dict[str, Any]) -> Dict[str, Any]:
+    if loader_id in _speech_loader_ids():
+        from plugins.model_loader.model_deck.local_loaders.speech import routes as speech_routes
+        return speech_routes.load_for_loader(loader_id, request, settings)
+    raise HTTPException(400, f"unsupported speech loader: {loader_id}")
+
+
+def _speech_unload(loader_id: str, request: Any, settings: Dict[str, Any]) -> Dict[str, Any]:
+    if loader_id in _speech_loader_ids():
+        from plugins.model_loader.model_deck.local_loaders.speech import routes as speech_routes
+        return speech_routes.unload_for_loader(loader_id, request, settings)
+    raise HTTPException(400, f"unsupported speech loader: {loader_id}")
+
+
 def _image_gen_state(loader_id: str) -> Dict[str, Any]:
     if loader_id == "model_loader.model_deck.diffusers":
         from plugins.model_loader.model_deck.local_loaders.diffusers import routes as diff_routes
@@ -1071,6 +2322,9 @@ def _image_gen_state(loader_id: str) -> Dict[str, Any]:
     if loader_id == "model_loader.model_deck.image_gen_gguf":
         from plugins.model_loader.model_deck.local_loaders.image_gen_gguf import routes as gguf_routes
         return dict(gguf_routes._STATE or {})
+    if loader_id == "model_loader.model_deck.video":
+        from plugins.model_loader.model_deck.local_loaders.video import routes as video_routes
+        return dict(video_routes._STATE or {})
     return {}
 
 
@@ -1081,6 +2335,9 @@ def _image_gen_load(loader_id: str, settings: Dict[str, Any]) -> Dict[str, Any]:
     if loader_id == "model_loader.model_deck.image_gen_gguf":
         from plugins.model_loader.model_deck.local_loaders.image_gen_gguf import routes as gguf_routes
         return gguf_routes.load(None, settings)
+    if loader_id == "model_loader.model_deck.video":
+        from plugins.model_loader.model_deck.local_loaders.video import routes as video_routes
+        return video_routes.load(None, settings)
     raise HTTPException(400, f"unsupported image_gen loader: {loader_id}")
 
 
@@ -1091,7 +2348,407 @@ def _image_gen_unload(loader_id: str, settings: Dict[str, Any]) -> Dict[str, Any
     if loader_id == "model_loader.model_deck.image_gen_gguf":
         from plugins.model_loader.model_deck.local_loaders.image_gen_gguf import routes as gguf_routes
         return gguf_routes.unload(None, settings)
+    if loader_id == "model_loader.model_deck.video":
+        from plugins.model_loader.model_deck.local_loaders.video import routes as video_routes
+        return video_routes.unload(None, settings)
     raise HTTPException(400, f"unsupported image_gen loader: {loader_id}")
+
+
+def _is_workflow_backend_model(model: Dict[str, Any]) -> bool:
+    settings = dict((model or {}).get("settings") or {})
+    backend = str(settings.get("model_backend") or "").strip().lower()
+    if backend == "workflow":
+        return True
+    if str(settings.get("model_workflow_flow_name") or "").strip():
+        return True
+    mode = str(settings.get("workflow_loader_mode") or "").strip().lower()
+    execution = str(settings.get("workflow_execution_backend") or "").strip().lower()
+    return mode in {"workflow", "workflow_model_loader", "native_graph"} or execution == "native_graph"
+
+
+def _workflow_text(*values: Any) -> str:
+    return " ".join(str(value or "") for value in values if value is not None).strip().lower()
+
+
+def _workflow_is_wan22_i2v(settings: Dict[str, Any], type_id: str = "") -> bool:
+    if str(type_id or "").strip() != "video_gen":
+        return False
+    text = _workflow_text(
+        settings.get("model_workflow_flow_name"),
+        settings.get("model_workflow_template_flow_name"),
+        settings.get("model_deck_compat_manifest_id"),
+        settings.get("tested_profile_id"),
+        settings.get("model_family"),
+        settings.get("workflow_variant"),
+        settings.get("workflow_id"),
+    )
+    if "wan" in text and ("i2v" in text or "image" in text):
+        return True
+    # Some cloned split workflows expose the source encode knobs even when an
+    # older profile id is still saved. Treat those as source-conditioning
+    # capable as long as this is a video workflow.
+    return any(str(settings.get(key) or "").strip() for key in (
+        "wan_i2v_source_encode_mode",
+        "wan_i2v_source_conditioning_cache_mode",
+        "wan_i2v_source_vae_encode_device",
+    ))
+
+
+def _workflow_is_wan22(settings: Dict[str, Any], type_id: str = "") -> bool:
+    if str(type_id or "").strip() != "video_gen":
+        return False
+    text = _workflow_text(
+        settings.get("model_workflow_flow_name"),
+        settings.get("model_workflow_template_flow_name"),
+        settings.get("model_deck_compat_manifest_id"),
+        settings.get("tested_profile_id"),
+        settings.get("model_family"),
+        settings.get("workflow_variant"),
+        settings.get("workflow_id"),
+        settings.get("model_id"),
+    )
+    if "wan" in text:
+        return True
+    return any(str(settings.get(key) or "").strip() for key in (
+        "wan_prompt_encoder_cache_mode",
+        "wan_prompt_encoder_persist",
+        "text_encoder_gguf_path",
+        "clip_gguf_path",
+    ))
+
+
+def _workflow_is_hunyuan15(settings: Dict[str, Any], type_id: str = "") -> bool:
+    if str(type_id or "").strip() != "video_gen":
+        return False
+    text = _workflow_text(
+        settings.get("model_workflow_flow_name"),
+        settings.get("model_workflow_template_flow_name"),
+        settings.get("model_deck_compat_manifest_id"),
+        settings.get("tested_profile_id"),
+        settings.get("model_family"),
+        settings.get("workflow_variant"),
+        settings.get("workflow_id"),
+        settings.get("model_id"),
+    )
+    if "hunyuan" in text or "hunyu" in text:
+        return True
+    return any(str(settings.get(key) or "").strip() for key in (
+        "hunyuan_text_encoder_cache_mode",
+        "hunyuan_text_encoder_device",
+        "clip1_path",
+        "clip2_path",
+        "text_encoder_1_path",
+        "text_encoder_2_path",
+    ))
+
+
+def _workflow_path_value(*sources: Dict[str, Any], keys: Tuple[str, ...]) -> str:
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for key in keys:
+            value = source.get(key)
+            if value is not None and str(value).strip():
+                return str(value).strip()
+    return ""
+
+
+def _model_workflow_precache_source_conditioning(app: Any, type_id: str, model: Dict[str, Any]) -> Dict[str, Any]:
+    """Pre-run cacheable source conditioning for workflow-backed models.
+
+    This is intentionally small and conservative. It does not load the full
+    video/image model. Today the cacheable source-conditioning stage we can run
+    independently is Wan2.2 I2V source VAE encode. Other workflow models return
+    a clear skipped result so the Play button stays useful without causing
+    unexpected model loads.
+    """
+    settings = dict((model or {}).get("settings") or {})
+    model_id = str((model or {}).get("model_id") or "").strip()
+    if not _is_workflow_backend_model(model):
+        return {"ok": True, "supported": False, "skipped": True, "reason": "model backend is not workflow"}
+    if str(type_id or "").strip() not in {"video_gen", "image_gen"}:
+        return {"ok": True, "supported": False, "skipped": True, "reason": "model type has no workflow source-conditioning pre-cache"}
+    if not _workflow_is_wan22_i2v(settings, type_id):
+        return {"ok": True, "supported": False, "skipped": True, "reason": "workflow has no supported cacheable source-conditioning node"}
+
+    asset_values, setting_values = _model_workflow_asset_and_setting_values(model, type_id)
+    merged_settings = {**settings, **setting_values}
+    merged_assets = {**asset_values}
+    runtime_assets = _parse_json_dict(settings.get("video_runtime_assets_json") or settings.get("image_runtime_assets_json"))
+    for key, value in runtime_assets.items():
+        if value not in (None, "", [], {}) and key not in merged_assets:
+            merged_assets[key] = value
+
+    source_path = _workflow_path_value(
+        merged_assets,
+        merged_settings,
+        keys=("prepared_source_image_path", "source_image_path", "image_path", "start_image_path", "input_image_path", "first_image_path"),
+    )
+    vae_path = _workflow_path_value(merged_assets, merged_settings, keys=("video_vae_path", "vae_path"))
+    missing: List[str] = []
+    if not source_path:
+        missing.append("source_image_path")
+    elif not Path(source_path).expanduser().exists():
+        missing.append(f"source_image_path not found: {source_path}")
+    if not vae_path:
+        missing.append("video_vae_path")
+    elif not Path(vae_path).expanduser().exists():
+        missing.append(f"video_vae_path not found: {vae_path}")
+    if missing:
+        return {
+            "ok": True,
+            "supported": True,
+            "skipped": True,
+            "reason": "missing saved workflow inputs/assets: " + ", ".join(missing),
+            "model_id": model_id,
+        }
+
+    cache_mode = str(merged_settings.get("wan_i2v_source_conditioning_cache_mode") or "").strip().lower()
+    if cache_mode not in {"cpu", "gpu"}:
+        # Play is an explicit pre-cache action. If the node is still set to
+        # "off", make the play-button behavior useful but safe by defaulting to
+        # CPU cache. Users can choose GPU in the node settings for faster
+        # repeated runs.
+        cache_mode = "cpu"
+    merged_settings["wan_i2v_source_conditioning_cache_mode"] = cache_mode
+    merged_settings["model_workflow_use_model_deck_default_assets"] = False
+    merged_settings["use_model_deck_default_assets"] = False
+    merged_assets.setdefault("source_image_path", source_path)
+    merged_assets.setdefault("image_path", source_path)
+    merged_assets.setdefault("input_image_path", source_path)
+    merged_assets.setdefault("video_vae_path", vae_path)
+
+    try:
+        from plugins.gui_helpers.agent_flow.skills.models import wan22_i2v_source_vae_encode
+
+        ctx = {
+            "app": app,
+            "ext": {
+                "model_workflow_run_id": f"precache:{type_id}:{model_id or 'default'}",
+                "agent_flow_run_id": f"precache:{type_id}:{model_id or 'default'}",
+            },
+        }
+        params = {
+            "run_id": f"precache:{type_id}:{model_id or 'default'}",
+            "node_id": "precache_wan22_i2v_source_conditioning",
+            "settings": merged_settings,
+            "assets": merged_assets,
+            "wan_i2v_source_conditioning_cache_mode": cache_mode,
+        }
+        result = wan22_i2v_source_vae_encode.run(ctx, params)
+        return {
+            "ok": bool((result or {}).get("ok")),
+            "supported": True,
+            "skipped": False,
+            "model_id": model_id,
+            "cache_mode": cache_mode,
+            "result": result,
+        }
+    except Exception as exc:
+        return {"ok": False, "supported": True, "skipped": False, "model_id": model_id, "error": str(exc)}
+
+
+def _clear_model_workflow_precache(app: Any, *, model: Optional[Dict[str, Any]] = None, type_id: str = "") -> Dict[str, Any]:
+    try:
+        from plugins.gui_helpers.agent_flow.skills.models._model_workflow_common import accelerator_cleanup, model_workflow_state, release_workflow_object
+    except Exception as exc:
+        return {"ok": False, "error": f"workflow cleanup unavailable: {exc}"}
+
+    ctx = {"app": app}
+    state = model_workflow_state(ctx)
+    resources = state.setdefault("resources", {}) if isinstance(state, dict) else {}
+    prefixes = ["cache:wan22_i2v_source_conditioning:"]
+    removed: List[str] = []
+    released = 0
+    for key in list(resources.keys()):
+        key_text = str(key or "")
+        if not any(key_text.startswith(prefix) for prefix in prefixes):
+            continue
+        try:
+            released += int(release_workflow_object(resources.get(key)) or 0)
+        except Exception:
+            pass
+        resources.pop(key, None)
+        removed.append(key_text)
+    accelerator_cleanup()
+    return {"ok": True, "removed": removed, "removed_count": len(removed), "released_objects": released, "type_id": type_id}
+
+
+def _model_workflow_warm_prompt_encoder(app: Any, type_id: str, model: Dict[str, Any]) -> Dict[str, Any]:
+    """Warm/cache reusable prompt encoder resources for workflow-backed models.
+
+    Unlike source-conditioning, prompt encoder residency is useful across runs
+    that use different source images. For Wan2.2 this keeps/reuses the UMT5/CLIP
+    GGUF loader according to wan_prompt_encoder_cache_mode:
+    - off/unset -> Play defaults to vram because Play is an explicit warm action.
+    - cpu -> keep reusable CPU/offload cache.
+    - gpu/vram -> keep hot on the main accelerator.
+    """
+    settings = dict((model or {}).get("settings") or {})
+    model_id = str((model or {}).get("model_id") or "").strip()
+    if not _is_workflow_backend_model(model):
+        return {"ok": True, "supported": False, "skipped": True, "reason": "model backend is not workflow"}
+    if _workflow_is_hunyuan15(settings, type_id):
+        return _model_workflow_warm_hunyuan_prompt_encoder(app, type_id, model)
+    if not _workflow_is_wan22(settings, type_id):
+        return {"ok": True, "supported": False, "skipped": True, "reason": "workflow has no supported prompt encoder warmup"}
+
+    asset_values, setting_values = _model_workflow_asset_and_setting_values(model, type_id)
+    merged_settings = {**settings, **setting_values}
+    merged_assets = {**asset_values}
+    runtime_assets = _parse_json_dict(settings.get("video_runtime_assets_json") or settings.get("image_runtime_assets_json"))
+    for key, value in runtime_assets.items():
+        if value not in (None, "", [], {}) and key not in merged_assets:
+            merged_assets[key] = value
+    text_encoder_path = _workflow_path_value(merged_assets, merged_settings, keys=("text_encoder_gguf_path", "clip_gguf_path"))
+    if not text_encoder_path:
+        return {"ok": True, "supported": True, "skipped": True, "reason": "missing text_encoder_gguf_path / clip_gguf_path", "model_id": model_id}
+    if not Path(text_encoder_path).expanduser().exists():
+        return {"ok": True, "supported": True, "skipped": True, "reason": f"text encoder not found: {text_encoder_path}", "model_id": model_id}
+
+    cache_mode_raw = str(merged_settings.get("wan_prompt_encoder_cache_mode") or merged_settings.get("prompt_encoder_cache_mode") or "").strip().lower()
+    aliases = {"gpu": "vram", "xpu": "vram", "cuda": "vram", "main": "vram", "main_video_device": "vram"}
+    cache_mode = aliases.get(cache_mode_raw, cache_mode_raw)
+    if cache_mode not in {"cpu", "vram"}:
+        cache_mode = "vram"
+    merged_settings["wan_prompt_encoder_cache_mode"] = cache_mode
+    merged_settings["wan_prompt_encoder_persist"] = True
+    merged_settings["wan_prompt_encoder_cache_empty_prompt"] = True
+    merged_settings["model_workflow_use_model_deck_default_assets"] = False
+    merged_settings["use_model_deck_default_assets"] = False
+    merged_assets.setdefault("text_encoder_gguf_path", text_encoder_path)
+    warm_prompt = str(merged_settings.get("prompt") or "warm prompt encoder").strip()
+    negative = str(merged_settings.get("negative_prompt") or "").strip()
+
+    try:
+        from plugins.gui_helpers.agent_flow.skills.models import wan22_prompt_encoder
+
+        run_id = f"prompt_warm:{type_id}:{model_id or 'default'}"
+        ctx = {
+            "app": app,
+            "prompt": warm_prompt,
+            "ext": {
+                "model_workflow_run_id": run_id,
+                "agent_flow_run_id": run_id,
+            },
+        }
+        params = {
+            "run_id": run_id,
+            "node_id": "warm_wan22_prompt_encoder",
+            "settings": merged_settings,
+            "assets": merged_assets,
+            "prompt": warm_prompt,
+            "negative_prompt": negative,
+        }
+        result = wan22_prompt_encoder.run(ctx, params)
+        return {
+            "ok": bool((result or {}).get("ok")),
+            "supported": True,
+            "skipped": False,
+            "model_id": model_id,
+            "cache_mode": cache_mode,
+            "result": result,
+        }
+    except Exception as exc:
+        return {"ok": False, "supported": True, "skipped": False, "model_id": model_id, "error": str(exc)}
+
+
+def _model_workflow_warm_hunyuan_prompt_encoder(app: Any, type_id: str, model: Dict[str, Any]) -> Dict[str, Any]:
+    settings = dict((model or {}).get("settings") or {})
+    model_id = str((model or {}).get("model_id") or "").strip()
+    asset_values, setting_values = _model_workflow_asset_and_setting_values(model, type_id)
+    merged_settings = {**settings, **setting_values}
+    merged_assets = {**asset_values}
+    runtime_assets = _parse_json_dict(settings.get("video_runtime_assets_json") or settings.get("image_runtime_assets_json"))
+    for key, value in runtime_assets.items():
+        if value not in (None, "", [], {}) and key not in merged_assets:
+            merged_assets[key] = value
+
+    clip1 = _workflow_path_value(
+        merged_assets,
+        merged_settings,
+        keys=("clip1_path", "text_encoder_1_path", "text_encoder_gguf_path", "umt5_gguf_path", "clip_l_path"),
+    )
+    clip2 = _workflow_path_value(
+        merged_assets,
+        merged_settings,
+        keys=("clip2_path", "text_encoder_2_path", "llava_text_encoder_path", "byt5_text_encoder_path", "clip_g_path"),
+    )
+    missing: List[str] = []
+    for label, path_value in (("clip1_path/text_encoder_1_path", clip1), ("clip2_path/text_encoder_2_path", clip2)):
+        if not path_value:
+            missing.append(label)
+        elif not Path(path_value).expanduser().exists():
+            missing.append(f"{label} not found: {path_value}")
+    if missing:
+        return {
+            "ok": True,
+            "supported": True,
+            "skipped": True,
+            "reason": "missing Hunyuan text encoder assets: " + ", ".join(missing),
+            "model_id": model_id,
+        }
+
+    cache_mode_raw = str(merged_settings.get("hunyuan_text_encoder_cache_mode") or merged_settings.get("prompt_encoder_cache_mode") or "").strip().lower()
+    aliases = {"gpu": "vram", "xpu": "vram", "cuda": "vram", "main": "vram", "main_video_device": "vram"}
+    cache_mode = aliases.get(cache_mode_raw, cache_mode_raw)
+    if cache_mode not in {"cpu", "vram"}:
+        cache_mode = "cpu"
+    merged_settings["hunyuan_text_encoder_cache_mode"] = cache_mode
+    merged_settings["model_workflow_use_model_deck_default_assets"] = False
+    merged_settings["use_model_deck_default_assets"] = False
+    merged_assets.setdefault("clip1_path", clip1)
+    merged_assets.setdefault("clip2_path", clip2)
+    warm_prompt = str(merged_settings.get("prompt") or "warm prompt encoder").strip()
+    negative = str(merged_settings.get("negative_prompt") or "").strip()
+
+    try:
+        from plugins.gui_helpers.agent_flow.skills.models import hunyuan15_text_encoder
+
+        run_id = f"prompt_warm:{type_id}:{model_id or 'default'}"
+        ctx = {
+            "app": app,
+            "prompt": warm_prompt,
+            "ext": {
+                "model_workflow_run_id": run_id,
+                "agent_flow_run_id": run_id,
+            },
+        }
+        params = {
+            "run_id": run_id,
+            "node_id": "warm_hunyuan15_prompt_encoder",
+            "settings": merged_settings,
+            "assets": merged_assets,
+            "prompt": warm_prompt,
+            "negative_prompt": negative,
+        }
+        result = hunyuan15_text_encoder.run(ctx, params)
+        return {
+            "ok": bool((result or {}).get("ok")),
+            "supported": True,
+            "skipped": False,
+            "model_id": model_id,
+            "cache_mode": cache_mode,
+            "result": result,
+        }
+    except Exception as exc:
+        return {"ok": False, "supported": True, "skipped": False, "model_id": model_id, "error": str(exc)}
+
+
+def _clear_model_workflow_prompt_encoder_cache(app: Any, *, type_id: str = "") -> Dict[str, Any]:
+    try:
+        from plugins.gui_helpers.agent_flow.skills.models._model_lifecycle import ModelLifecycleManager
+    except Exception as exc:
+        return {"ok": False, "error": f"lifecycle cleanup unavailable: {exc}"}
+    reports = [ModelLifecycleManager.purge_global_resources(family=family) for family in ("wan22", "hunyuan15")]
+    return {
+        "ok": True,
+        "type_id": type_id,
+        "families": reports,
+        "cache_entries": sum(int(r.get("cache_entries") or 0) for r in reports if isinstance(r, dict)),
+        "resource_entries": sum(int(r.get("resource_entries") or 0) for r in reports if isinstance(r, dict)),
+        "released_values": sum(int(r.get("released_values") or 0) for r in reports if isinstance(r, dict)),
+    }
 
 
 def _pre_download_model(app: Any, loader_id: str, settings: Dict[str, Any]) -> Dict[str, Any]:
@@ -1349,8 +3006,8 @@ def install(app) -> None:
             "llama_manager_base": _llama_manager_base,
             "llama_manager_state_fallback": _llama_manager_state_fallback,
             "llama_manager_status_cached": lambda: _llama_manager_status_cached(app),
-            "post_llama_manager_json": lambda path, payload, timeout_seconds=20.0: _post_llama_manager_json(path, payload, timeout_seconds=timeout_seconds),
-            "get_llama_manager_json": lambda path, timeout_seconds=3.0: _get_llama_manager_json(path, timeout_seconds=timeout_seconds),
+            "post_llama_manager_json": lambda path, payload, timeout_seconds=20.0, auth_headers=None: _post_llama_manager_json(path, payload, timeout_seconds=timeout_seconds, auth_headers=auth_headers),
+            "get_llama_manager_json": lambda path, timeout_seconds=3.0, auth_headers=None: _get_llama_manager_json(path, timeout_seconds=timeout_seconds, auth_headers=auth_headers),
             "resolve_hf_cache_dir": lambda: _resolve_hf_cache_dir(app),
             "resolve_hf_token": lambda: _resolve_hf_token(app),
             "call_maybe_async": _call_maybe_async,
@@ -1402,7 +3059,8 @@ def install(app) -> None:
                 "vlm": {"label": "Multimodal LLM / VLM (vision + language)", "notes": "Text+Image -> text / structured outputs.", "recommended_loader_id": "model_loader.gguf"},
                 "os_agent": {"label": "GUI / OS Agent model (policy + grounding)", "notes": "Screenshot+state -> actions (coords, keystrokes).", "recommended_loader_id": "model_loader.gguf"},
                 "retrieval": {"label": "Retrieval models (embeddings + rerankers)", "notes": "Text -> vectors; (query, doc) -> relevance score.", "recommended_loader_id": "model_loader.gguf"},
-                "speech": {"label": "Speech models (ASR / TTS)", "notes": "Audio -> text; text -> audio.", "recommended_loader_id": "model_loader.gguf"},
+                "speech_asr": {"label": "Speech ASR models", "notes": "Audio -> text.", "recommended_loader_id": "model_loader.model_deck.speech_asr"},
+                "speech_tts": {"label": "Speech TTS models", "notes": "Text -> audio.", "recommended_loader_id": "model_loader.model_deck.speech_tts"},
                 "safety": {"label": "Safety / moderation models", "notes": "Classifier models for guardrails.", "recommended_loader_id": "model_loader.gguf"},
                 "image_gen": {"label": "Image generation models (create + edit)", "notes": "Diffusion/transformer image generation.", "recommended_loader_id": "model_loader.model_deck.diffusers"},
                 "video_gen": {
@@ -1414,6 +3072,54 @@ def install(app) -> None:
                 "gen3d": {"label": "3D generation models", "notes": "Text/images -> 3D assets.", "recommended_loader_id": "model_loader.model_deck.3d"},
             },
         }
+
+    @r.get("/v1/model_deck/compat/catalog")
+    def compat_catalog(request: Request, type_id: str = ""):
+        require_gui_plugin_enabled(request, gui_plugin_id=GUI_PLUGIN_ID)
+        _require_model_deck_permission(app, request, "model_deck.view", "Model Deck is not available for this user")
+        tid = str(type_id or "").strip()
+        if tid not in ("image_gen", "video_gen"):
+            return {"ok": True, "type_id": tid, "manifests": []}
+        manifests = compat_registry.list_manifests(tid)
+        manifests = [
+            row for row in manifests
+            if "sd_cpp" not in {str(item or "").strip().lower() for item in (row.get("backends") or [])}
+        ]
+        return {
+            "ok": True,
+            "type_id": tid,
+            "manifests": [
+                {
+                    "id": row.get("id"),
+                    "label": row.get("label") or row.get("id"),
+                    "description": row.get("description") or "",
+                    "backends": row.get("backends") or [],
+                    "aliases": row.get("aliases") or [],
+                }
+                for row in manifests
+            ],
+        }
+
+    @r.post("/v1/model_deck/compat/status")
+    def compat_status(request: Request, req: CompatStatusRequest):
+        require_gui_plugin_enabled(request, gui_plugin_id=GUI_PLUGIN_ID)
+        _require_model_deck_permission(app, request, "model_deck.view", "Model Deck is not available for this user")
+        tid = str(req.type_id or "").strip()
+        return {"ok": True, **compat_registry.manifest_status(tid, dict(req.settings or {}), str(req.manifest_id or "").strip())}
+
+    @r.post("/v1/model_deck/compat/install")
+    def compat_install(request: Request, req: CompatMutationRequest):
+        require_gui_plugin_enabled(request, gui_plugin_id=GUI_PLUGIN_ID)
+        _require_model_deck_permission(app, request, "model_deck.manage", "Model Deck changes are not allowed for this user")
+        tid = str(req.type_id or "").strip()
+        return compat_registry.install_requirements(tid, dict(req.settings or {}), str(req.manifest_id or "").strip(), list(req.requirement_ids or []))
+
+    @r.post("/v1/model_deck/compat/uninstall")
+    def compat_uninstall(request: Request, req: CompatMutationRequest):
+        require_gui_plugin_enabled(request, gui_plugin_id=GUI_PLUGIN_ID)
+        _require_model_deck_permission(app, request, "model_deck.manage", "Model Deck changes are not allowed for this user")
+        tid = str(req.type_id or "").strip()
+        return compat_registry.uninstall_requirements(tid, dict(req.settings or {}), str(req.manifest_id or "").strip(), list(req.requirement_ids or []))
 
     @r.get("/v1/model_deck/status")
     def status(request: Request):
@@ -1427,6 +3133,15 @@ def install(app) -> None:
         require_gui_plugin_enabled(request, gui_plugin_id=GUI_PLUGIN_ID)
         _require_model_deck_permission(app, request, "model_deck.view", "Model Deck is not available for this user")
         deck = _ensure_defaults(_load_deck(app))
+        try:
+            reconciled, changed = _reconcile_deck_managed_llama_server_settings(app, deck)
+            if changed:
+                deck = reconciled
+                _save_deck(app, deck)
+            else:
+                deck = reconciled
+        except Exception:
+            pass
         return {"ok": True, "deck": deck}
 
     @r.post("/v1/model_deck/type/upsert")
@@ -1473,6 +3188,13 @@ def install(app) -> None:
         t = deck["types"][tid]
 
         m = req.model.model_dump()
+        settings = dict(m.get("settings") or {})
+        if str(settings.get("backend_mode") or "").strip().lower() == "llama_server":
+            try:
+                settings = _reconcile_managed_llama_server_settings(app, settings)
+            except Exception:
+                settings = dict(settings or {})
+            m["settings"] = settings
         mid = str(m.get("model_id") or "").strip()
         if not mid:
             raise HTTPException(400, "model.model_id required")
@@ -1528,6 +3250,15 @@ def install(app) -> None:
             raise HTTPException(409, f"model_id already exists: {new_model_id}")
         cloned = json.loads(json.dumps(source)) if isinstance(source, dict) else dict(source or {})
         cloned["model_id"] = new_model_id
+        cloned_settings = dict(cloned.get("settings") or {})
+        for workflow_key in (
+            "model_workflow_flow_name",
+            "model_workflow_owned",
+            "model_workflow_created_ts",
+            "model_workflow_updated_ts",
+        ):
+            cloned_settings.pop(workflow_key, None)
+        cloned["settings"] = cloned_settings
         if not str(cloned.get("loader_id") or "").strip():
             raise HTTPException(400, "source model missing loader_id")
         models = t.get("models")
@@ -1537,6 +3268,19 @@ def install(app) -> None:
         models.append(cloned)
         _save_deck(app, deck)
         return {"ok": True, "deck": deck, "model": cloned}
+
+    @r.post("/v1/model_deck/model/workflow/ensure")
+    def ensure_model_workflow(request: Request, req: EnsureModelWorkflowRequest):
+        require_gui_plugin_enabled(request, gui_plugin_id=GUI_PLUGIN_ID)
+        _require_model_deck_permission(app, request, "model_deck.manage", "Model Deck changes are not allowed for this user")
+        return _ensure_model_workflow_for_deck_model(
+            app,
+            str(req.type_id or "").strip(),
+            str(req.model_id or "").strip(),
+            str(req.pid or "default").strip() or "default",
+            str(req.template_flow_name or "").strip(),
+            dict(req.settings or {}),
+        )
 
     @r.post("/v1/model_deck/model/set_default")
     def set_default(request: Request, req: SetDefaultRequest):
@@ -1643,9 +3387,12 @@ def install(app) -> None:
         sid = "_default"
         gguf_ids = _gguf_loader_ids()
         image_gen_ids = _image_gen_loader_ids()
+        media_loader_ids = _media_loader_ids()
         server_pid = os.getpid()
         include_managed = str(request.query_params.get("include_managed") or "1").strip().lower() not in ("0", "false", "no", "off")
-        llama_manager_status = _llama_manager_status_cached(app) if include_managed else {}
+        managed_detail = str(request.query_params.get("managed_detail") or "full").strip().lower()
+        managed_lightweight = managed_detail in ("light", "lightweight", "1", "true", "yes", "on")
+        llama_manager_status = _llama_manager_status_cached(app, lightweight=managed_lightweight) if include_managed else {}
         if include_managed and not list((llama_manager_status or {}).get("servers") or []):
             llama_manager_status = _llama_manager_state_fallback()
         managed_server_map = {}
@@ -1703,6 +3450,11 @@ def install(app) -> None:
             loader_id = str(m.get("loader_id") or "")
             slot = f"deck:{tid}:default"
             settings = dict(m.get("settings") or {})
+            if str(settings.get("backend_mode") or "").strip().lower() == "llama_server":
+                try:
+                    settings = _reconcile_managed_llama_server_settings(app, settings)
+                except Exception:
+                    settings = dict(settings or {})
             backend_mode = str(settings.get("backend_mode") or "").strip().lower()
             expected_gguf_filename = _guess_gguf_filename(settings)
             configured_model_path = str(
@@ -1720,7 +3472,7 @@ def install(app) -> None:
             loaded_slot = ""
             if loader_id in gguf_ids:
                 supports = bool(gguf_loader)
-                if supports and gguf_loader is not None:
+                if supports and gguf_loader is not None and backend_mode != "llama_server":
                     try:
                         loaded = gguf_loader.get_model_for(sid, slot) is not None
                     except Exception:
@@ -1734,11 +3486,20 @@ def install(app) -> None:
                                 loaded_model_id = str((st.get("settings") or {}).get("model_id") or st.get("path") or "")
                         except Exception:
                             pass
-            elif loader_id in image_gen_ids:
+            elif loader_id in media_loader_ids:
                 supports = True
                 try:
                     st = _image_gen_state(loader_id)
                     loaded = bool(st.get("loaded"))
+                except Exception:
+                    loaded = False
+            elif loader_id in _speech_loader_ids():
+                supports = True
+                backend_mode = "speech"
+                try:
+                    st = _speech_state(loader_id)
+                    loaded = bool(st.get("loaded"))
+                    loaded_model_id = str(st.get("model_id") or "")
                 except Exception:
                     loaded = False
             defaults.append({
@@ -1769,6 +3530,11 @@ def install(app) -> None:
                 if isinstance(m, dict):
                     loader_id = str(m.get("loader_id") or "")
                     settings = dict(m.get("settings") or {})
+                    if str(settings.get("backend_mode") or "").strip().lower() == "llama_server":
+                        try:
+                            settings = _reconcile_managed_llama_server_settings(app, settings)
+                        except Exception:
+                            settings = dict(settings or {})
                     backend_mode = str(settings.get("backend_mode") or "").strip().lower()
                     expected_gguf_filename = _guess_gguf_filename(settings)
                     configured_model_path = str(
@@ -1784,7 +3550,7 @@ def install(app) -> None:
                     loaded = False
                     loaded_model_id = ""
                     loaded_slot = ""
-                    if supports and gguf_loader is not None:
+                    if supports and gguf_loader is not None and backend_mode != "llama_server":
                         try:
                             loaded = gguf_loader.get_model_for(sid, "text_llm_main") is not None
                         except Exception:
@@ -1876,6 +3642,8 @@ def install(app) -> None:
                 entry["status_note"] = meta.get("note")
             if meta.get("backend_mode"):
                 entry["backend_mode"] = meta.get("backend_mode")
+            if "loaded" in meta:
+                entry["loaded"] = bool(meta.get("loaded"))
 
         if isinstance(main, dict):
             _apply_mem(main)
@@ -1908,6 +3676,11 @@ def install(app) -> None:
                 return
             managed = entry.get("managed_server")
             if not isinstance(managed, dict):
+                if str(entry.get("managed_server_id") or "").strip():
+                    entry["server_running"] = False
+                    entry["loaded"] = False
+                    entry["phase"] = "stopped"
+                    entry["status_note"] = entry.get("status_note") or "managed server not found"
                 return
             server_cpu = managed.get("private_bytes")
             if server_cpu in (None, 0):
@@ -1987,7 +3760,13 @@ def install(app) -> None:
                         entry["status_note"] = effective_model
                 elif candidate_names and effective_name:
                     entry["loaded"] = False
+                    entry["server_running"] = True
+                    entry["phase"] = "stopped"
                     entry["status_note"] = f"server running different model: {effective_name}"
+            else:
+                entry["loaded"] = False
+                entry["server_running"] = False
+                entry["phase"] = "stopped"
 
         if include_managed:
             if isinstance(main, dict):
@@ -2125,10 +3904,55 @@ def install(app) -> None:
         if not bool(m.get("persist", False)):
             raise HTTPException(400, "model is not marked persist")
         loader_id = str(m.get("loader_id") or "")
+        if loader_id in _speech_loader_ids():
+            settings = dict((m or {}).get("settings") or {})
+            settings.setdefault("__server_app", app)
+            settings.setdefault("__model_loader_registry", getattr(app.state, "model_loader_registry", None))
+            _set_process_meta(app, slot, phase="starting", error="", note="", backend_mode="speech")
+            try:
+                res = _speech_load(loader_id, request, settings)
+            except Exception as exc:
+                short_error = str(getattr(exc, "detail", None) or exc or "speech load failed").strip()
+                _set_process_meta(app, slot, phase="failed", error=short_error, note="", backend_mode="speech")
+                raise
+            _set_process_meta(app, slot, phase="running", error="", note="", backend_mode="speech")
+            return {"ok": True, "slot": slot, "result": res}
+
+        if kind != "main" and type_id in {"video_gen", "image_gen"} and _is_workflow_backend_model(m):
+            _set_process_meta(app, slot, phase="warming_prompt_encoder", error="", note="", backend_mode="workflow")
+            res = _model_workflow_warm_prompt_encoder(app, type_id, m)
+            if not bool((res or {}).get("ok", False)):
+                short_error = str((res or {}).get("error") or "workflow prompt encoder warmup failed")
+                _set_process_meta(app, slot, phase="failed", error=short_error, note="", backend_mode="workflow")
+                raise HTTPException(500, short_error)
+            skipped = bool((res or {}).get("skipped"))
+            note = str((res or {}).get("reason") or "")
+            cache_result = (res or {}).get("result") if isinstance((res or {}).get("result"), dict) else {}
+            prompt_handle = (cache_result or {}).get("prompt_context") if isinstance(cache_result, dict) else {}
+            if isinstance(prompt_handle, dict):
+                note = note or str(prompt_handle.get("status") or "")
+            phase = "prompt_encoder_warmed"
+            if skipped:
+                phase = "unsupported"
+            _set_process_meta(
+                app,
+                slot,
+                phase=phase,
+                error="",
+                note=note,
+                backend_mode="workflow",
+                loaded=not skipped,
+            )
+            return {"ok": True, "slot": slot, "result": res}
+
         if loader_id in _gguf_loader_ids():
             gguf_loader = _get_gguf_loader(app)
             if gguf_loader is None:
                 raise HTTPException(400, "model_loader.gguf not available")
+            request_auth_headers = {
+                "Authorization": request.headers.get("Authorization") or "",
+                "X-Auth-Token": request.headers.get("X-Auth-Token") or "",
+            }
             previous_settings = _current_loaded_gguf_settings(app, "_default", slot)
             try:
                 from plugins.model_loader.model_deck.local_loaders.gguf_bridge import map_gguf_settings
@@ -2168,7 +3992,7 @@ def install(app) -> None:
                         previous_backend_mode != "llama_server"
                         or previous_managed_id != next_managed_id
                     ):
-                        _stop_managed_llama_servers_for_settings(app, previous_settings)
+                        _stop_managed_llama_servers_for_settings(app, previous_settings, auth_headers=request_auth_headers)
                     _set_process_meta(app, slot, phase="starting_host_server", error="", note="Preparing managed host llama.cpp server", backend_mode=backend_mode)
                     source_path = str(gguf_settings.get("model_id") or "").strip()
                     _, rel_model_path = _ensure_llama_server_model_copy(source_path)
@@ -2180,6 +4004,7 @@ def install(app) -> None:
                         gguf_settings,
                         rel_model_path,
                         mmproj_relpath=rel_mmproj_path,
+                        auth_headers=request_auth_headers,
                     )
                     if managed_url:
                         gguf_settings["llama_server_url"] = managed_url
@@ -2235,12 +4060,12 @@ def install(app) -> None:
                 except Exception:
                     pass
             return {"ok": True, "slot": slot, "result": res}
-        if loader_id in _image_gen_loader_ids():
+        if loader_id in _media_loader_ids():
             settings = dict(m.get("settings") or {})
             settings.setdefault("__server_app", app)
             settings.setdefault("__model_loader_registry", getattr(app.state, "model_loader_registry", None))
             res = _image_gen_load(loader_id, settings)
-            _set_process_meta(app, slot, phase="loaded" if (res or {}).get("ok") else "failed", error="" if (res or {}).get("ok") else str(res), backend_mode="image_gen")
+            _set_process_meta(app, slot, phase="loaded" if (res or {}).get("ok") else "failed", error="" if (res or {}).get("ok") else str(res), backend_mode=type_id)
             return {"ok": True, "slot": slot, "result": res}
         raise HTTPException(400, "loader does not support persistent load")
 
@@ -2301,6 +4126,10 @@ def install(app) -> None:
             mid = str(t.get("main_model_id") or t.get("default_model_id") or "").strip()
             m = _find_model(t, mid) if mid else None
             settings = dict((m or {}).get("settings") or {})
+            request_auth_headers = {
+                "Authorization": request.headers.get("Authorization") or "",
+                "X-Auth-Token": request.headers.get("X-Auth-Token") or "",
+            }
             current_settings = _current_loaded_gguf_settings(app, "_default", slot)
             try:
                 gguf_loader = _get_gguf_loader(app)
@@ -2344,7 +4173,12 @@ def install(app) -> None:
                     or str(settings.get("llama_server_managed_id") or "").strip()
                     or str(current_settings.get("llama_server_managed_id") or "").strip()
                 ):
-                    stop_results = _stop_managed_llama_servers_for_settings(app, current_settings, settings)
+                    stop_results = _stop_managed_llama_servers_for_settings(
+                        app,
+                        current_settings,
+                        settings,
+                        auth_headers=request_auth_headers,
+                    )
                     if stop_results:
                         res["managed_stop"] = stop_results if len(stop_results) > 1 else stop_results[0]
                     _clear_llama_manager_status_cache(app)
@@ -2361,12 +4195,30 @@ def install(app) -> None:
         m = _find_model(t, mid) if mid else None
         loader_id = str((m or {}).get("loader_id") or "")
         settings = dict((m or {}).get("settings") or {})
-        if loader_id in _image_gen_loader_ids():
+        if type_id in {"video_gen", "image_gen"} and isinstance(m, dict) and _is_workflow_backend_model(m):
+            _set_process_meta(app, slot, phase="stopping", error="", note="", backend_mode="workflow")
+            source_res = _clear_model_workflow_precache(app, model=m, type_id=type_id)
+            prompt_res = _clear_model_workflow_prompt_encoder_cache(app, type_id=type_id)
+            source_count = int((source_res or {}).get("removed_count") or 0)
+            prompt_count = int((prompt_res or {}).get("cache_entries") or 0)
+            note = f"cleared {prompt_count} prompt encoder cache(s), {source_count} source cache resource(s)"
+            _set_process_meta(app, slot, phase="stopped", error="", note=note, backend_mode="workflow", loaded=False)
+            return {"ok": True, "slot": slot, "result": {"ok": True, "prompt_encoder": prompt_res, "source_conditioning": source_res}}
+
+        if loader_id in _media_loader_ids():
             settings = dict((m or {}).get("settings") or {})
             settings.setdefault("__server_app", app)
             settings.setdefault("__model_loader_registry", getattr(app.state, "model_loader_registry", None))
             res = _image_gen_unload(loader_id, settings)
-            _set_process_meta(app, slot, phase="stopped", error="", note="", backend_mode="image_gen")
+            _set_process_meta(app, slot, phase="stopped", error="", note="", backend_mode=type_id)
+            return {"ok": True, "slot": slot, "result": res}
+
+        if loader_id in _speech_loader_ids():
+            settings = dict((m or {}).get("settings") or {})
+            settings.setdefault("__server_app", app)
+            settings.setdefault("__model_loader_registry", getattr(app.state, "model_loader_registry", None))
+            res = _speech_unload(loader_id, request, settings)
+            _set_process_meta(app, slot, phase="stopped", error="", note="", backend_mode="speech")
             return {"ok": True, "slot": slot, "result": res}
 
         gguf_loader = _get_gguf_loader(app)
@@ -2376,6 +4228,10 @@ def install(app) -> None:
         unload_slots = _matching_loaded_slots(gguf_loader, settings, slot)
         res = {"ok": True, "sid": "_default", "slot": slot, "unloaded_slots": unload_slots}
         backend_mode = str(settings.get("backend_mode") or "").strip().lower() or "embedded"
+        request_auth_headers = {
+            "Authorization": request.headers.get("Authorization") or "",
+            "X-Auth-Token": request.headers.get("X-Auth-Token") or "",
+        }
         _set_process_meta(app, slot, phase="stopping", error="", note="", backend_mode=backend_mode)
         for unload_slot in unload_slots:
             _call_maybe_async(gguf_loader.unload_for, "_default", unload_slot)
@@ -2385,7 +4241,12 @@ def install(app) -> None:
                 or str(settings.get("llama_server_managed_id") or "").strip()
                 or str(current_settings.get("llama_server_managed_id") or "").strip()
             ):
-                stop_results = _stop_managed_llama_servers_for_settings(app, current_settings, settings)
+                stop_results = _stop_managed_llama_servers_for_settings(
+                    app,
+                    current_settings,
+                    settings,
+                    auth_headers=request_auth_headers,
+                )
                 if stop_results:
                     res["managed_stop"] = stop_results if len(stop_results) > 1 else stop_results[0]
                 _clear_llama_manager_status_cache(app)
@@ -2412,5 +4273,214 @@ def install(app) -> None:
         except Exception:
             pass
         return {"ok": True}
+
+    @r.post("/v1/model_deck/hf_repo_search")
+    def hf_repo_search(request: Request, req: HfRepoSearchRequest):
+        require_gui_plugin_enabled(request, gui_plugin_id=GUI_PLUGIN_ID)
+        try:
+            _require_model_deck_permission(app, request, "model_deck.manage", "Model Deck changes are not allowed for this user")
+            token = _resolve_hf_token(app)
+            rows = _search_hf_repos(
+                str(req.query or "").strip(),
+                token=token,
+                limit=max(1, min(int(req.limit or 12), 30)),
+                task=str(req.task or "").strip().lower(),
+            )
+            return {"ok": True, "query": str(req.query or "").strip(), "task": str(req.task or "").strip().lower(), "results": rows}
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(500, f"hf_repo_search_failed: {exc}") from exc
+
+    @r.post("/v1/model_deck/hf_gguf_search")
+    def hf_gguf_search(request: Request, req: HfGgufSearchRequest):
+        require_gui_plugin_enabled(request, gui_plugin_id=GUI_PLUGIN_ID)
+        try:
+            _require_model_deck_permission(app, request, "model_deck.manage", "Model Deck changes are not allowed for this user")
+            rows = _search_hf_gguf_models(app, str(req.query or "").strip(), limit=max(1, min(int(req.limit or 10), 20)))
+            return {"ok": True, "query": str(req.query or "").strip(), "results": rows}
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(500, f"hf_gguf_search_failed: {exc}") from exc
+
+    @r.post("/v1/model_deck/hf_asset_search")
+    def hf_asset_search(request: Request, req: HfAssetSearchRequest):
+        require_gui_plugin_enabled(request, gui_plugin_id=GUI_PLUGIN_ID)
+        try:
+            _require_model_deck_permission(app, request, "model_deck.manage", "Model Deck changes are not allowed for this user")
+            rows = _search_hf_asset_files(
+                app,
+                str(req.query or "").strip(),
+                limit=max(1, min(int(req.limit or 10), 20)),
+                extensions=list(req.extensions or []),
+            )
+            return {
+                "ok": True,
+                "query": str(req.query or "").strip(),
+                "extensions": _normalize_hf_extensions(req.extensions),
+                "results": rows,
+            }
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(500, f"hf_asset_search_failed: {exc}") from exc
+
+    @r.post("/v1/model_deck/hf_gguf_download")
+    def hf_gguf_download(request: Request, req: HfGgufDownloadRequest):
+        require_gui_plugin_enabled(request, gui_plugin_id=GUI_PLUGIN_ID)
+        try:
+            _require_model_deck_permission(app, request, "model_deck.manage", "Model Deck changes are not allowed for this user")
+            result = _materialize_hf_model(
+                app,
+                str(req.repo_id or "").strip(),
+                str(req.filename or "").strip(),
+                str(req.backend_mode or "embedded").strip(),
+                str(req.destination_mode or "auto").strip(),
+            )
+            return {"ok": True, **result}
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(500, f"hf_gguf_download_failed: {exc}") from exc
+
+    @r.post("/v1/model_deck/hf_asset_download")
+    def hf_asset_download(request: Request, req: HfGgufDownloadRequest):
+        require_gui_plugin_enabled(request, gui_plugin_id=GUI_PLUGIN_ID)
+        try:
+            _require_model_deck_permission(app, request, "model_deck.manage", "Model Deck changes are not allowed for this user")
+            result = _materialize_hf_model(
+                app,
+                str(req.repo_id or "").strip(),
+                str(req.filename or "").strip(),
+                str(req.backend_mode or "embedded").strip(),
+                str(req.destination_mode or "auto").strip(),
+            )
+            return {"ok": True, **result}
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(500, f"hf_asset_download_failed: {exc}") from exc
+
+    @r.post("/v1/model_deck/hf_gguf_download_start")
+    def hf_gguf_download_start(request: Request, req: HfGgufDownloadRequest):
+        require_gui_plugin_enabled(request, gui_plugin_id=GUI_PLUGIN_ID)
+        try:
+            _require_model_deck_permission(app, request, "model_deck.manage", "Model Deck changes are not allowed for this user")
+            job_id = _start_model_deck_download_job(
+                app,
+                str(req.repo_id or "").strip(),
+                str(req.filename or "").strip(),
+                str(req.backend_mode or "embedded").strip(),
+                str(req.destination_mode or "auto").strip(),
+                int(req.expected_bytes or 0),
+            )
+            return {"ok": True, "job_id": job_id}
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(500, f"hf_gguf_download_start_failed: {exc}") from exc
+
+    @r.post("/v1/model_deck/hf_asset_download_start")
+    def hf_asset_download_start(request: Request, req: HfGgufDownloadRequest):
+        require_gui_plugin_enabled(request, gui_plugin_id=GUI_PLUGIN_ID)
+        try:
+            _require_model_deck_permission(app, request, "model_deck.manage", "Model Deck changes are not allowed for this user")
+            job_id = _start_model_deck_download_job(
+                app,
+                str(req.repo_id or "").strip(),
+                str(req.filename or "").strip(),
+                str(req.backend_mode or "embedded").strip(),
+                str(req.destination_mode or "auto").strip(),
+                int(req.expected_bytes or 0),
+            )
+            return {"ok": True, "job_id": job_id}
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(500, f"hf_asset_download_start_failed: {exc}") from exc
+
+    @r.get("/v1/model_deck/hf_gguf_download_status")
+    def hf_gguf_download_status(request: Request, job_id: str):
+        require_gui_plugin_enabled(request, gui_plugin_id=GUI_PLUGIN_ID)
+        try:
+            _require_model_deck_permission(app, request, "model_deck.manage", "Model Deck changes are not allowed for this user")
+            key = str(job_id or "").strip()
+            if not key:
+                raise HTTPException(400, "job_id required")
+            row = _model_deck_download_jobs(app).get(key)
+            if not isinstance(row, dict):
+                raise HTTPException(404, "download job not found")
+            return {"ok": True, **row}
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(500, f"hf_gguf_download_status_failed: {exc}") from exc
+
+    @r.get("/v1/model_deck/hf_asset_download_status")
+    def hf_asset_download_status(request: Request, job_id: str):
+        require_gui_plugin_enabled(request, gui_plugin_id=GUI_PLUGIN_ID)
+        try:
+            _require_model_deck_permission(app, request, "model_deck.manage", "Model Deck changes are not allowed for this user")
+            key = str(job_id or "").strip()
+            if not key:
+                raise HTTPException(400, "job_id required")
+            row = _model_deck_download_jobs(app).get(key)
+            if not isinstance(row, dict):
+                raise HTTPException(404, "download job not found")
+            return {"ok": True, **row}
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(500, f"hf_asset_download_status_failed: {exc}") from exc
+
+    @r.post("/v1/model_deck/hf_repo_download")
+    def hf_repo_download(request: Request, req: HfRepoDownloadRequest):
+        require_gui_plugin_enabled(request, gui_plugin_id=GUI_PLUGIN_ID)
+        try:
+            _require_model_deck_permission(app, request, "model_deck.manage", "Model Deck changes are not allowed for this user")
+            repo_id = str(req.repo_id or "").strip()
+            if not repo_id:
+                raise HTTPException(400, "repo_id required")
+            token = _resolve_hf_token(app)
+            cache_dir = _resolve_hf_cache_dir(app)
+            cache_path = _snapshot_download(repo_id, token=token, cache_dir=cache_dir)
+            return {"ok": True, "repo_id": repo_id, "cache_path": cache_path, "model_source": repo_id, "storage": "hf_cache_repo"}
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(500, f"hf_repo_download_failed: {exc}") from exc
+
+    @r.post("/v1/model_deck/hf_repo_download_start")
+    def hf_repo_download_start(request: Request, req: HfRepoDownloadRequest):
+        require_gui_plugin_enabled(request, gui_plugin_id=GUI_PLUGIN_ID)
+        try:
+            _require_model_deck_permission(app, request, "model_deck.manage", "Model Deck changes are not allowed for this user")
+            repo_id = str(req.repo_id or "").strip()
+            if not repo_id:
+                raise HTTPException(400, "repo_id required")
+            job_id = _start_model_deck_repo_download_job(app, repo_id)
+            return {"ok": True, "job_id": job_id}
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(500, f"hf_repo_download_start_failed: {exc}") from exc
+
+    @r.get("/v1/model_deck/hf_repo_download_status")
+    def hf_repo_download_status(request: Request, job_id: str):
+        require_gui_plugin_enabled(request, gui_plugin_id=GUI_PLUGIN_ID)
+        try:
+            _require_model_deck_permission(app, request, "model_deck.manage", "Model Deck changes are not allowed for this user")
+            key = str(job_id or "").strip()
+            if not key:
+                raise HTTPException(400, "job_id required")
+            row = _model_deck_download_jobs(app).get(key)
+            if not isinstance(row, dict):
+                raise HTTPException(404, "download job not found")
+            return {"ok": True, **row}
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(500, f"hf_repo_download_status_failed: {exc}") from exc
 
     app.include_router(r)

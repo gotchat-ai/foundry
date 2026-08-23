@@ -11,6 +11,7 @@ import re
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
+from pathlib import Path
 
 from plugins.gui_helpers._framework.services import get_plugin_service
 from plugins.gui_helpers._framework.utils import require_gui_plugin_enabled
@@ -30,6 +31,9 @@ from .tools import register_default_tools
 
 
 GUI_PLUGIN_ID = "agent_workflow"
+
+
+_PRESET_DIR = Path(__file__).resolve().parent / "presets" / "agent_flow_imports"
 
 
 def _framework_data_dir(app: Any) -> str:
@@ -64,6 +68,42 @@ def _utc_now() -> datetime:
 
 def _repo_context_service(app: Any) -> Any:
     return get_plugin_service(app, "repo_context")
+
+
+def _canonical_agent_flow_project_flows(app: Any, pid: str = "project2") -> Dict[str, Any]:
+    try:
+        from plugins.gui_helpers.agent_flow.skills.workflow import _workflow_store  # type: ignore
+        flows = _workflow_store.load_project_flows({"app": app, "pid": pid}, pid)
+        return dict(flows or {}) if isinstance(flows, dict) else {}
+    except Exception:
+        return {}
+
+
+def _load_import_preset_file(name: str) -> Dict[str, Any]:
+    p = _PRESET_DIR / f"{str(name or '').strip()}.json"
+    if not p.is_file():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return dict(data or {}) if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _select_import_flows_payload(app: Any, flow_names: List[str], *, default_flow: str, preset_name: str = "") -> Dict[str, Any]:
+    wanted = [str(x or "").strip() for x in (flow_names or []) if str(x or "").strip()]
+    canonical = _canonical_agent_flow_project_flows(app, "project2")
+    if wanted and all(isinstance(canonical.get(name), dict) for name in wanted):
+        flows = {name: canonical[name] for name in wanted}
+        active = default_flow if default_flow in flows else wanted[0]
+        return {
+            "flows": flows,
+            "default_flow": active,
+            "active_flow": active,
+            "mode": "execute",
+        }
+    preset = _load_import_preset_file(preset_name) if preset_name else {}
+    return dict(preset or {})
 
 
 def _scan_stat_index_for_app(app: Any, root: str, *, ignore_dirs: Any, ignore_exts: Any) -> Dict[str, Any]:
@@ -147,7 +187,16 @@ def install(app) -> None:
 
     def _tool_registry() -> WorkflowToolRegistry:
         reg = getattr(app.state, "agent_workflow_tools", None)
-        if reg is None:
+        required_tools = {"repo.read_range", "repo.search"}
+        existing = set()
+        if reg is not None and hasattr(reg, "list_tools"):
+            try:
+                rows = reg.list_tools()
+                if isinstance(rows, dict):
+                    existing = {str(k or "").strip() for k in rows.keys() if str(k or "").strip()}
+            except Exception:
+                existing = set()
+        if reg is None or not required_tools.issubset(existing):
             reg = WorkflowToolRegistry()
             register_default_tools(app, reg)
             app.state.agent_workflow_tools = reg
@@ -533,6 +582,24 @@ def install(app) -> None:
 
         team = str((payload or {}).get("team") or "feature").strip() or "feature"
         flow_name = str((payload or {}).get("flow_name") or f"workflow_{team}").strip() or f"workflow_{team}"
+        canonical = _canonical_agent_flow_project_flows(app, "project2")
+        canonical_flow = canonical.get(flow_name) if isinstance(canonical.get(flow_name), dict) else None
+        if canonical_flow:
+            return {
+                "ok": True,
+                "team": team,
+                "profile_ids": [],
+                "warnings": ["canonical_flow_imported_from_project2"],
+                "flow_name": flow_name,
+                "flow": canonical_flow,
+                "agent_flow_import": {
+                    "flows": {flow_name: canonical_flow},
+                    "default_flow": flow_name,
+                    "active_flow": flow_name,
+                    "mode": "execute",
+                    "max_steps": 24,
+                },
+            }
         profile_ids = profile_registry.resolve_team(team, explicit=team)
         if not profile_ids:
             profile_ids = profile_registry.resolve_team("feature", explicit="feature")
@@ -623,6 +690,42 @@ def install(app) -> None:
                 "max_steps": max(8, len(order) + 2),
             },
         }
+
+    @r.get("/v1/agent_workflow/agent_flow_import_preset")
+    def workflow_agent_flow_import_preset(request: Request, preset: str = ""):
+        require_gui_plugin_enabled(request, gui_plugin_id=GUI_PLUGIN_ID)
+        _require_user(app, request)
+        key = str(preset or "").strip().lower()
+        if key == "dev_pipeline":
+            payload = _select_import_flows_payload(
+                app,
+                [
+                    "workflow_dev_pipeline",
+                    "workflow_team_discovery",
+                    "workflow_team_build",
+                    "workflow_team_quality",
+                    "workflow_team_release",
+                ],
+                default_flow="workflow_dev_pipeline",
+                preset_name="dev_pipeline",
+            )
+        elif key == "repo_improvement":
+            payload = _select_import_flows_payload(
+                app,
+                [
+                    "workflow_repo_improvement",
+                    "workflow_repo_improvement_interactive",
+                    "workflow_repo_improvement_rag_git",
+                    "workflow_repo_improvement_system_debugger",
+                ],
+                default_flow="workflow_repo_improvement",
+                preset_name="repo_improvement",
+            )
+        else:
+            raise HTTPException(status_code=400, detail="unknown preset")
+        if not isinstance(payload.get("flows"), dict) or not payload.get("flows"):
+            raise HTTPException(status_code=404, detail="preset not available")
+        return {"ok": True, "preset": key, "agent_flow_import": payload}
 
     @r.get("/v1/agent_workflow/tools")
     def workflow_tools(request: Request):

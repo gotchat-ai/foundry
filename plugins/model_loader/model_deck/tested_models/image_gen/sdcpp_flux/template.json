@@ -1,0 +1,54 @@
+{
+  "argv": [
+    "{command_path}",
+    "--model",
+    "{gguf_path}",
+    "--prompt",
+    "{prompt}",
+    "--output",
+    "{output_path}"
+  ],
+  "optional": [
+    {
+      "setting": "vae_path",
+      "flag": "--vae"
+    },
+    {
+      "setting": "clip_l_path",
+      "flag": "--clip-l"
+    },
+    {
+      "setting": "clip_g_path",
+      "flag": "--clip-g"
+    },
+    {
+      "setting": "t5xxl_path",
+      "flag": "--t5xxl"
+    },
+    {
+      "setting": "device",
+      "flag": "--device"
+    },
+    {
+      "setting": "width",
+      "flag": "--width"
+    },
+    {
+      "setting": "height",
+      "flag": "--height"
+    },
+    {
+      "setting": "steps",
+      "flag": "--steps"
+    },
+    {
+      "setting": "cfg_scale",
+      "flag": "--cfg-scale"
+    },
+    {
+      "setting": "seed",
+      "flag": "--seed"
+    }
+  ],
+  "append_extra_args_setting": "image_runtime_extra_args"
+}

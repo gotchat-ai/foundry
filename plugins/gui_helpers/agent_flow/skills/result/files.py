@@ -275,6 +275,44 @@ def _target_root_from_text(params):
     return str(m.group(1) or "").strip().rstrip(".,;)") if m else ""
 
 
+def _target_root_hint(ctx, params):
+    params = _coerce_params(params)
+    ctx = ctx if isinstance(ctx, dict) else {}
+    settings = ctx.get("settings") if isinstance(ctx.get("settings"), dict) else {}
+    hint = (
+        params.get("target_repo_root")
+        or params.get("root")
+        or settings.get("target_repo_root")
+        or settings.get("selected_repo_root")
+        or _target_root_from_text(params)
+        or ""
+    )
+    return str(hint or "").strip().replace("\\", "/").strip("/")
+
+
+def _filter_recovered_to_target_root(files, ctx, params):
+    hint = _target_root_hint(ctx, params)
+    if not hint:
+        return list(files or [])
+    allowed = []
+    hint_low = hint.lower().strip("/")
+    for item in files or []:
+        text = str(item or "").strip().replace("\\", "/").strip("/")
+        if not text:
+            continue
+        low = text.lower()
+        if low == hint_low or low.startswith(hint_low + "/"):
+            allowed.append(item)
+            continue
+        resolved = _resolve_existing_file(item, ctx, params)
+        if resolved is None:
+            continue
+        resolved_low = str(resolved).replace("\\", "/").lower()
+        if f"/{hint_low}/" in resolved_low or resolved_low.endswith("/" + hint_low):
+            allowed.append(item)
+    return allowed
+
+
 def _resolve_existing_file(raw, ctx=None, params=None):
     text = str(raw or "").strip()
     if not text:
@@ -349,9 +387,10 @@ def _stage_files(ctx, params, files):
 
 def run(ctx, params):
     params = _coerce_params(params)
-    normalized = _extract_files(params)
+    explicit = _extract_files(params)
+    normalized = explicit
     if not normalized:
-        normalized = _recover_files_from_ctx(ctx)
+        normalized = _filter_recovered_to_target_root(_recover_files_from_ctx(ctx), ctx, params)
     staged = _stage_files(ctx, params, normalized) if normalized else []
     missing = [f for f in normalized if not any(str(item.get("path") or "") == str(_resolve_existing_file(f, ctx, params) or "") for item in staged)]
     summary_bits = []

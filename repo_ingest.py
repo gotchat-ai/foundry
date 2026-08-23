@@ -86,7 +86,7 @@ def file_should_skip(path: Path, max_bytes: int, include_lang: Optional[List[str
     return False
 
 def ingest_dir_to_user_rag_cold(user_rag, sid: str, repo_id: str, root_dir: str, tokenizer, max_file_bytes: int = 200000, include_lang: Optional[List[str]] = None, exclude_globs: Optional[List[str]] = None, include_glob: Optional[List[str]] = None, chunk_lines: int = 200, version: Optional[str] = None, parent_version: Optional[str] = None, tags: Optional[List[str]] = None, analyze_repo: Optional[bool] = True) -> Dict[str, Any]:
-    # print(2342324)
+    print(2342324)
     import sys
     import traceback
     from tools.repo_analyzer import scan_repo
@@ -127,8 +127,10 @@ def ingest_dir_to_user_rag_cold(user_rag, sid: str, repo_id: str, root_dir: str,
         # print(23423284)
 
         for p in root.rglob('*'):
-            print("filename:", p.name)
-            if file_should_skip(p, max_file_bytes, include_lang, exclude_globs): print("skipped: ", p.name);continue
+            # print("filename:", p.name)
+            if file_should_skip(p, max_file_bytes, include_lang, exclude_globs): 
+                # print("skipped: ", p.name);
+                continue
             try: text = p.read_text(encoding='utf-8', errors='ignore')
             except Exception: continue
             # write full file snapshot into version directory
@@ -632,7 +634,7 @@ def analyze_repo_dir(
             user_rag._save_repo_meta(sid, repo_id, meta)
         except Exception as e:
             print(e)
-            # print(25234543534)
+            print(25234543534)
         # try:
         #     meta = user_rag._load_repo_meta(proj_key, repo_id)
         #     for v in meta.get("versions", []):
@@ -647,7 +649,7 @@ def analyze_repo_dir(
 
         return analyzer_out
     except Exception as e:
-        # print(234235252)
+        print(234235252)
         print(e)
         return {}
     

@@ -15,6 +15,13 @@ from runtime_cuda import empty_accelerator_cache, preferred_torch_device
 
 from fastapi import APIRouter, Request, HTTPException
 from plugins.gui_helpers._framework.utils import require_gui_plugin_enabled
+from plugins.model_loader.model_deck import compat_registry
+from plugins.model_loader.model_deck import internal_workflows
+from plugins.model_loader.model_deck.local_loaders.diffusers_manifest import build_pipeline_from_runtime_profile, build_transformer_and_pipeline, resolve_manifest, resolve_runtime_profile
+try:
+    from plugins.gui_helpers._framework.event_bus import publish_gui_event
+except Exception:
+    publish_gui_event = None
 
 GUI_PLUGIN_ID = "model_deck"
 LOADER_ID = "model_loader.model_deck.video"
@@ -29,6 +36,78 @@ _STATE: Dict[str, Any] = {
 }
 _PIPELINE: Optional[Any] = None
 _LAST_KEY: Optional[str] = None
+
+
+def _teardown_pipeline(pipe: Any) -> None:
+    if pipe is None:
+        return
+    try:
+        maybe_free = getattr(pipe, "maybe_free_model_hooks", None)
+        if callable(maybe_free):
+            maybe_free()
+    except Exception:
+        pass
+    for attr in ("components", "hf_device_map", "device_map", "_all_hooks"):
+        try:
+            if hasattr(pipe, attr):
+                setattr(pipe, attr, None if attr != "components" else {})
+        except Exception:
+            pass
+
+
+def _release_runtime_memory(torch_module: Any, device: Optional[str]) -> None:
+    import gc
+    import time
+
+    dev = str(device or "").strip().lower()
+    dev_index = None
+    if ":" in dev:
+        base, raw_idx = dev.split(":", 1)
+        dev = base.strip()
+        try:
+            dev_index = int(str(raw_idx).strip())
+        except Exception:
+            dev_index = None
+
+    for _ in range(2):
+        gc.collect()
+        try:
+            if dev == "xpu":
+                xpu_mod = getattr(torch_module, "xpu", None)
+                if xpu_mod is not None:
+                    if dev_index is not None and hasattr(xpu_mod, "set_device"):
+                        xpu_mod.set_device(dev_index)
+                    if hasattr(xpu_mod, "synchronize"):
+                        xpu_mod.synchronize()
+                    if hasattr(xpu_mod, "empty_cache"):
+                        xpu_mod.empty_cache()
+                    if hasattr(xpu_mod, "synchronize"):
+                        xpu_mod.synchronize()
+            else:
+                empty_accelerator_cache(torch_module, device)
+        except Exception:
+            pass
+        time.sleep(0.15)
+    try:
+        empty_accelerator_cache(torch_module, device)
+    except Exception:
+        pass
+    for attr in ("unet", "vae", "text_encoder", "text_encoder_2", "transformer", "image_encoder"):
+        try:
+            module = getattr(pipe, attr, None)
+            if module is not None and hasattr(module, "to"):
+                try:
+                    module.to("cpu")
+                except Exception:
+                    pass
+            setattr(pipe, attr, None)
+        except Exception:
+            pass
+    try:
+        if hasattr(pipe, "to"):
+            pipe.to("cpu")
+    except Exception:
+        pass
 
 
 def _ensure_stdlib_profile_module() -> None:
@@ -63,9 +142,30 @@ def _ensure_ftfy() -> None:
     sys.modules.setdefault("ftfy", mod)
 
 
+def _device_base(device: str) -> str:
+    text = str(device or "").strip().lower()
+    if ":" in text:
+        return text.split(":", 1)[0].strip()
+    return text
+
+
 def _resolve_device(settings: Dict[str, Any]) -> str:
     device = str(settings.get("device") or "").strip().lower()
-    if device and device != "auto":
+    if not device or device == "auto":
+        try:
+            import torch
+            device = preferred_torch_device(torch)
+        except Exception:
+            device = "cpu"
+    selection_mode = str(settings.get("gpu_selection_mode") or "").strip().lower()
+    if selection_mode == "single" and ":" not in device and _device_base(device) in ("cuda", "xpu"):
+        try:
+            main_gpu = int(settings.get("main_gpu"))
+        except Exception:
+            main_gpu = 0
+        if main_gpu >= 0:
+            return f"{_device_base(device)}:{main_gpu}"
+    if device:
         return device
     try:
         import torch
@@ -76,7 +176,7 @@ def _resolve_device(settings: Dict[str, Any]) -> str:
 
 
 def _should_block_cuda_flash_attn(settings: Dict[str, Any]) -> bool:
-    device = str(settings.get("device") or "").strip().lower()
+    device = _device_base(_resolve_device(settings))
     if device and device not in ("auto", "cuda"):
         return True
     try:
@@ -126,6 +226,7 @@ def _block_cuda_flash_attn_imports(settings: Dict[str, Any]):
 
 def _resolve_dtype(settings: Dict[str, Any], device: str):
     dtype = str(settings.get("dtype") or "").strip().lower()
+    base_device = _device_base(device)
     try:
         import torch
     except Exception:
@@ -138,11 +239,34 @@ def _resolve_dtype(settings: Dict[str, Any], device: str):
     elif dtype in ("fp32", "float32"):
         out = torch.float32
     else:
-        out = torch.float16 if device != "cpu" else torch.float32
+        out = torch.float16 if base_device != "cpu" else torch.float32
 
-    if device == "cpu" and out in (torch.float16, torch.bfloat16):
+    if base_device == "cpu" and out in (torch.float16, torch.bfloat16):
         out = torch.float32
     return out
+
+
+def _diffusers_offload_kwargs(method: Any, device: str) -> Dict[str, Any]:
+    try:
+        sig = inspect.signature(method)
+    except Exception:
+        return {}
+    params = sig.parameters
+    base_device = str(device or "").strip().lower()
+    gpu_id = None
+    if ":" in base_device:
+        maybe_base, maybe_idx = base_device.split(":", 1)
+        try:
+            gpu_id = int(maybe_idx)
+            base_device = maybe_base
+        except Exception:
+            pass
+    kwargs: Dict[str, Any] = {}
+    if "device" in params and base_device:
+        kwargs["device"] = base_device
+    if "gpu_id" in params and gpu_id is not None:
+        kwargs["gpu_id"] = gpu_id
+    return kwargs
 
 
 def _resolve_bool(value: Any) -> Optional[bool]:
@@ -197,6 +321,74 @@ def _resolve_vae_dtype(settings: Dict[str, Any]):
     return None
 
 
+def _apply_token_kwargs(fn: Any, kwargs: Dict[str, Any], token: str) -> Dict[str, Any]:
+    if not token:
+        return kwargs
+    try:
+        sig = inspect.signature(fn)
+        if "token" in sig.parameters:
+            kwargs["token"] = token
+        elif "use_auth_token" in sig.parameters:
+            kwargs["use_auth_token"] = token
+    except Exception:
+        kwargs.setdefault("token", token)
+    return kwargs
+
+
+def _resolve_hf_token(request: Optional[Request], settings: Dict[str, Any]) -> str:
+    token = str(settings.get("hf_token") or settings.get("hf_access_token") or "").strip()
+    if token:
+        return token
+    app = getattr(request, "app", None) if request is not None else settings.get("__server_app")
+    if app is None:
+        return ""
+    try:
+        settings_obj = getattr(app.state, "settings", None)
+        if callable(settings_obj):
+            token = str((settings_obj() or {}).get("hf_token") or "").strip()
+        elif isinstance(settings_obj, dict):
+            token = str(settings_obj.get("hf_token") or "").strip()
+    except Exception:
+        token = ""
+    return token or ""
+
+
+def _resolve_manifest_pipeline(request: Optional[Request], settings: Dict[str, Any], torch_dtype: Any, hf_token: str) -> Optional[Any]:
+    runtime_profile = resolve_runtime_profile(compat_registry, type_id="video_gen", settings=settings)
+    loader_spec = resolve_manifest(compat_registry, type_id="video_gen", settings=settings)
+    if not loader_spec:
+        loader_spec = {}
+    try:
+        import torch
+        compute_dtype = torch_dtype or torch.float32
+    except Exception:
+        compute_dtype = torch_dtype
+
+    def _resolve_source(source: str) -> str:
+        return str(source or "").strip()
+
+    pipe = build_pipeline_from_runtime_profile(
+        runtime_profile=runtime_profile,
+        settings=settings,
+        torch_dtype=torch_dtype,
+        hf_token=hf_token,
+        compute_dtype=compute_dtype,
+        apply_token_kwargs=_apply_token_kwargs,
+        resolve_source=_resolve_source,
+    )
+    if pipe is not None:
+        return pipe
+    return build_transformer_and_pipeline(
+        loader_spec=loader_spec,
+        settings=settings,
+        torch_dtype=torch_dtype,
+        hf_token=hf_token,
+        compute_dtype=compute_dtype,
+        apply_token_kwargs=_apply_token_kwargs,
+        resolve_source=_resolve_source,
+    )
+
+
 def _settings_key(settings: Dict[str, Any]) -> str:
     parts = [
         str(settings.get("backend") or "diffusers"),
@@ -226,12 +418,89 @@ def _normalize_model_id(model_id: str) -> str:
 def ensure_loaded(settings: Dict[str, Any]) -> None:
     global _LAST_KEY
     key = _settings_key(settings)
+    internal_profile = internal_workflows.resolve_internal_workflow("video_gen", settings)
+    if _STATE.get("loaded") and _LAST_KEY == key:
+        if internal_profile:
+            return
+        if _PIPELINE is not None:
+            return
     if _STATE.get("loaded") and _PIPELINE is not None and _LAST_KEY == key:
         return
     load(None, settings)
 
 
 def load(request: Request, settings: Dict[str, Any]) -> Dict[str, Any]:
+    global _PIPELINE, _LAST_KEY
+    internal_profile = internal_workflows.resolve_internal_workflow("video_gen", settings)
+    if internal_profile:
+        result = internal_workflows.load_internal_workflow("video_gen", settings)
+        inspection = internal_workflows.inspect_video_internal_workflow(settings)
+        preload = internal_workflows.preload_video_internal_workflow(settings)
+        model_ref = settings.get("model_id") or settings.get("model") or settings.get("gguf_path")
+        model_id = _normalize_model_id(model_ref)
+        _PIPELINE = preload.get("pipeline")
+        _LAST_KEY = _settings_key(settings)
+        _STATE.update({
+            "loaded": True,
+            "model_id": model_id or None,
+            "settings": settings,
+            "ts": int(time.time()),
+            "device": preload.get("device"),
+            "dtype": str(preload.get("dtype") or ""),
+            "workflow_id": result.get("workflow_id"),
+            "mode": "internal_workflow",
+            "internal_preloaded": bool(preload.get("preloaded")),
+            "execution_mode": str(preload.get("execution_mode") or "diffusers_preload"),
+        })
+        if callable(publish_gui_event):
+            try:
+                publish_gui_event(
+                    "processes.changed",
+                    {"kind": "video_gen", "action": "load", "loader_id": LOADER_ID, "model_id": model_id},
+                )
+            except Exception:
+                pass
+        return {
+            "ok": True,
+            "loader_id": LOADER_ID,
+            "loaded": True,
+            "model_id": model_id,
+            "mode": "internal_workflow",
+            "workflow_id": result.get("workflow_id"),
+            "device": preload.get("device"),
+            "dtype": str(preload.get("dtype") or ""),
+            "preloaded": bool(preload.get("preloaded")),
+            "execution_mode": str(preload.get("execution_mode") or "diffusers_preload"),
+            "diagnostics": list(preload.get("diagnostics") or []),
+            "workflow_inspection": inspection,
+        }
+    if str(settings.get("video_command_mode") or "standard").strip().lower() == "advanced":
+        model_ref = settings.get("model_id") or settings.get("model") or settings.get("gguf_path")
+        model_id = _normalize_model_id(model_ref)
+        _STATE.update({
+            "loaded": True,
+            "model_id": model_id or None,
+            "settings": settings,
+            "ts": int(time.time()),
+            "device": None,
+            "dtype": None,
+        })
+        if callable(publish_gui_event):
+            try:
+                publish_gui_event(
+                    "processes.changed",
+                    {"kind": "video_gen", "action": "load", "loader_id": LOADER_ID, "model_id": model_id},
+                )
+            except Exception:
+                pass
+        return {
+            "ok": True,
+            "loader_id": LOADER_ID,
+            "loaded": True,
+            "model_id": model_id,
+            "mode": "advanced",
+        }
+
     backend = str(settings.get("backend") or "diffusers").strip().lower()
     if backend != "diffusers":
         raise HTTPException(400, f"unsupported backend: {backend}")
@@ -251,6 +520,7 @@ def load(request: Request, settings: Dict[str, Any]) -> Dict[str, Any]:
 
     device = _resolve_device(settings)
     torch_dtype = _resolve_dtype(settings, device)
+    hf_token = _resolve_hf_token(request, settings)
     enable_model_cpu_offload = _resolve_bool(settings.get("enable_model_cpu_offload"))
     enable_sequential_cpu_offload = _resolve_bool(settings.get("enable_sequential_cpu_offload"))
     use_wan_vae = _resolve_bool(settings.get("use_wan_vae"))
@@ -258,7 +528,10 @@ def load(request: Request, settings: Dict[str, Any]) -> Dict[str, Any]:
     vae_dtype = _resolve_vae_dtype(settings)
 
     try:
-        if _wants_wan(model_id, settings):
+        manifest_pipe = _resolve_manifest_pipeline(request, settings, torch_dtype, hf_token)
+        if manifest_pipe is not None:
+            pipe = manifest_pipe
+        elif _wants_wan(model_id, settings):
             vae_obj = None
             if use_wan_vae:
                 try:
@@ -284,15 +557,14 @@ def load(request: Request, settings: Dict[str, Any]) -> Dict[str, Any]:
 
     try:
         if enable_sequential_cpu_offload and hasattr(pipe, "enable_sequential_cpu_offload"):
-            pipe.enable_sequential_cpu_offload()
+            pipe.enable_sequential_cpu_offload(**_diffusers_offload_kwargs(pipe.enable_sequential_cpu_offload, device))
         elif enable_model_cpu_offload and hasattr(pipe, "enable_model_cpu_offload"):
-            pipe.enable_model_cpu_offload()
+            pipe.enable_model_cpu_offload(**_diffusers_offload_kwargs(pipe.enable_model_cpu_offload, device))
         elif hasattr(pipe, "to"):
             pipe = pipe.to(device)
     except Exception as exc:
         raise HTTPException(500, f"device init failed: {exc}") from exc
 
-    global _PIPELINE, _LAST_KEY
     _PIPELINE = pipe
     _LAST_KEY = _settings_key(settings)
     _STATE.update({
@@ -304,6 +576,14 @@ def load(request: Request, settings: Dict[str, Any]) -> Dict[str, Any]:
         "dtype": str(torch_dtype),
         "cpu_offload": bool(enable_model_cpu_offload or enable_sequential_cpu_offload),
     })
+    if callable(publish_gui_event):
+        try:
+            publish_gui_event(
+                "processes.changed",
+                {"kind": "video_gen", "action": "load", "loader_id": LOADER_ID, "model_id": model_id},
+            )
+        except Exception:
+            pass
     return {
         "ok": True,
         "loader_id": LOADER_ID,
@@ -316,11 +596,16 @@ def load(request: Request, settings: Dict[str, Any]) -> Dict[str, Any]:
 
 def unload(request: Request, settings: Dict[str, Any]) -> Dict[str, Any]:
     global _PIPELINE, _LAST_KEY
+    pipe = _PIPELINE
     _PIPELINE = None
     _LAST_KEY = None
     try:
+        import gc
         import torch
-        empty_accelerator_cache(torch, _STATE.get("device"))
+        _teardown_pipeline(pipe)
+        del pipe
+        gc.collect()
+        _release_runtime_memory(torch, _STATE.get("device"))
     except Exception:
         pass
     _STATE.update({
@@ -331,6 +616,14 @@ def unload(request: Request, settings: Dict[str, Any]) -> Dict[str, Any]:
         "device": None,
         "dtype": None,
     })
+    if callable(publish_gui_event):
+        try:
+            publish_gui_event(
+                "processes.changed",
+                {"kind": "video_gen", "action": "unload", "loader_id": LOADER_ID},
+            )
+        except Exception:
+            pass
     return {"ok": True, "loader_id": LOADER_ID, "loaded": False}
 
 
@@ -403,6 +696,31 @@ def generate_text2video(
     output_dir: Optional[str] = None,
 ) -> str:
     ensure_loaded(settings)
+    internal_profile = internal_workflows.resolve_internal_workflow("video_gen", settings)
+    if internal_profile:
+        runtime_settings = dict(settings or {})
+        if _PIPELINE is not None and _LAST_KEY == _settings_key(settings):
+            runtime_settings["__internal_preloaded_runtime"] = {
+                "pipeline": _PIPELINE,
+                "device": _STATE.get("device"),
+                "torch_dtype": _STATE.get("dtype"),
+                "effective_settings": dict(settings or {}),
+                "diagnostics": list((settings or {}).get("__internal_workflow_last_diagnostics") or []),
+                "preloaded": True,
+            }
+        return internal_workflows.generate_video_with_internal_workflow(
+            settings=runtime_settings,
+            prompt=prompt,
+            num_frames=num_frames,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            width=width,
+            height=height,
+            fps=fps,
+            seed=seed,
+            progress_callback=progress_callback,
+            output_dir=output_dir,
+        )
     if _PIPELINE is None:
         raise HTTPException(500, "video pipeline not loaded")
 

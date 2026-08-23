@@ -13,5 +13,6 @@
     "/v1/projects/{pid}/sessions/{sid}/agent_flow/run",
     "/v1/projects/{pid}/sessions/{sid}/agent_flow/status",
     "/v1/projects/{pid}/sessions/{sid}/agent_flow/flows"
-  ]
+  ],
+  "category": "Agent/Workflows"
 }

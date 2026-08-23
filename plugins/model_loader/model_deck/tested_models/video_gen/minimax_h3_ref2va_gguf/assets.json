@@ -1,0 +1,95 @@
+{
+  "model_family": "minimax_h3_ref2va_gguf",
+  "gguf_path": "${MODEL_DECK_MODELS_DIR}/minimax_h3/diffusion_models/ref2va/minimax_h3_ref2va-Q4_K_M.gguf",
+  "ref2va_gguf_path": "${MODEL_DECK_MODELS_DIR}/minimax_h3/diffusion_models/ref2va/minimax_h3_ref2va-Q4_K_M.gguf",
+  "fl2va_gguf_path": "${MODEL_DECK_MODELS_DIR}/minimax_h3/diffusion_models/MiniMax-H3-FL2VA-Q4_K_M.gguf",
+  "text_encoder_path": "${MODEL_DECK_MODELS_DIR}/minimax_h3/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+  "text_encoder_safetensors_path": "${MODEL_DECK_MODELS_DIR}/minimax_h3/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+  "text_encoder_gguf_path": "${MODEL_DECK_MODELS_DIR}/minimax_h3/text_encoders/qwen3vl-32B-MiniMax-H3-Q4_K_M.gguf",
+  "video_vae_path": "${MODEL_DECK_MODELS_DIR}/minimax_h3/vae/minimax_h3_video_vae_fp16.safetensors",
+  "audio_vae_path": "${MODEL_DECK_MODELS_DIR}/minimax_h3/vae/minimax_h3_audio_vae_fp32.safetensors",
+  "reference_image_1_path": "",
+  "reference_image_2_path": "",
+  "reference_video_path": "",
+  "reference_audio_path": "",
+  "python_bin": "python",
+  "width": 1344,
+  "height": 768,
+  "duration_seconds": 5,
+  "fps": 24,
+  "frames": 124,
+  "steps": 25,
+  "guidance_scale": 1,
+  "sampler_name": "res_multistep",
+  "scheduler": "simple",
+  "minimax_ref_image_size": "match",
+  "minimax_conditioning_mode": "ref2va",
+  "minimax_unet_loader": "advanced",
+  "minimax_gguf_dequant_dtype": "bfloat16",
+  "minimax_gguf_patch_dtype": "bfloat16",
+  "minimax_gguf_patch_on_device": false,
+  "minimax_resize_references": true,
+  "minimax_ref1_width": 512,
+  "minimax_ref1_height": 512,
+  "minimax_ref2_width": 1024,
+  "minimax_ref2_height": 576,
+  "minimax_shift_video": 12,
+  "minimax_shift_audio": 3,
+  "minimax_text_encoder_device": "gpu",
+  "minimax_video_vae_device": "gpu",
+  "minimax_audio_vae_device": "cpu",
+  "minimax_enable_audio": false,
+  "minimax_rtx_upscale_enabled": true,
+  "minimax_rtx_upscale_mode": "scale by multiplier",
+  "minimax_rtx_upscale_multiplier": 2,
+  "minimax_rtx_upscale_quality": "ULTRA",
+  "video_codec": "libx264",
+  "audio_codec": "aac",
+  "output_ext": "mp4",
+  "_asset_sources": {
+    "gguf_path": {
+      "type": "huggingface",
+      "repo_id": "vantagewithai/MiniMax-H3-comfyUI-GGUF",
+      "filename": "ref2va",
+      "url": "https://huggingface.co/vantagewithai/MiniMax-H3-comfyUI-GGUF/tree/main/ref2va"
+    },
+    "ref2va_gguf_path": {
+      "type": "huggingface",
+      "repo_id": "vantagewithai/MiniMax-H3-comfyUI-GGUF",
+      "filename": "ref2va",
+      "url": "https://huggingface.co/vantagewithai/MiniMax-H3-comfyUI-GGUF/tree/main/ref2va"
+    },
+    "fl2va_gguf_path": {
+      "type": "huggingface",
+      "repo_id": "realrebelai/MiniMax-H3_GGUFs",
+      "url": "https://huggingface.co/realrebelai/MiniMax-H3_GGUFs"
+    },
+    "video_vae_path": {
+      "type": "huggingface",
+      "repo_id": "Comfy-Org/MiniMax-H3",
+      "filename": "vae",
+      "url": "https://huggingface.co/Comfy-Org/MiniMax-H3/tree/main/vae"
+    },
+    "audio_vae_path": {
+      "type": "huggingface",
+      "repo_id": "Comfy-Org/MiniMax-H3",
+      "filename": "vae",
+      "url": "https://huggingface.co/Comfy-Org/MiniMax-H3/tree/main/vae"
+    },
+    "text_encoder_gguf_path": {
+      "type": "huggingface",
+      "repo_id": "realrebelai/MiniMax-H3_GGUFs",
+      "url": "https://huggingface.co/realrebelai/MiniMax-H3_GGUFs"
+    },
+    "text_encoder_path": {
+      "type": "huggingface",
+      "repo_id": "realrebelai/MiniMax-H3_GGUFs",
+      "url": "https://huggingface.co/realrebelai/MiniMax-H3_GGUFs"
+    },
+    "text_encoder_safetensors_path": {
+      "type": "huggingface",
+      "repo_id": "realrebelai/MiniMax-H3_GGUFs",
+      "url": "https://huggingface.co/realrebelai/MiniMax-H3_GGUFs"
+    }
+  }
+}

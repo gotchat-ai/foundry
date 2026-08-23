@@ -1,0 +1,123 @@
+{
+  "id": "zimage_diffusers",
+  "label": "Z-Image Diffusers",
+  "description": "Tested Z-Image diffusers profile using the ZImage pipeline family.",
+  "aliases": [
+    "z-image",
+    "z-image-turbo",
+    "tongyi-mai/z-image-turbo"
+  ],
+  "backends": [
+    "diffusers"
+  ],
+  "diffusers_loader": {
+    "pipeline_class": "ZImagePipeline",
+    "pipeline_module": "diffusers",
+    "pipeline_load_method": "from_pretrained",
+    "pipeline_source_setting": "model_id",
+    "pipeline_source_default": "Tongyi-MAI/Z-Image-Turbo",
+    "pipeline_inject_key": "transformer",
+    "pipeline_kwargs_from_settings": [
+      {
+        "setting": "text_encoder_path"
+      },
+      {
+        "setting": "vae_path"
+      },
+      {
+        "setting": "clip_path"
+      },
+      {
+        "setting": "low_cpu_mem_usage"
+      }
+    ],
+    "transformer_class": "ZImageTransformer2DModel",
+    "transformer_module": "diffusers",
+    "transformer_load_method": "from_single_file",
+    "transformer_source_setting": "gguf_path",
+    "transformer_source_default": "",
+    "transformer_static_kwargs": {
+      "config": "Tongyi-MAI/Z-Image-Turbo",
+      "subfolder": "transformer"
+    },
+    "transformer_quantization_class": "GGUFQuantizationConfig",
+    "transformer_quantization_module": "diffusers",
+    "transformer_subfolder": ""
+  },
+  "requirements": [
+    {
+      "id": "torch",
+      "label": "PyTorch",
+      "kind": "python_package",
+      "package": "torch",
+      "import_name": "torch",
+      "install": [
+        "torch"
+      ],
+      "uninstall": [
+        "torch"
+      ]
+    },
+    {
+      "id": "diffusers",
+      "label": "diffusers",
+      "kind": "python_package",
+      "package": "diffusers",
+      "import_name": "diffusers",
+      "install": [
+        "diffusers"
+      ],
+      "uninstall": [
+        "diffusers"
+      ]
+    },
+    {
+      "id": "zimage_pipeline",
+      "label": "ZImagePipeline",
+      "kind": "python_symbol",
+      "module": "diffusers",
+      "symbol": "ZImagePipeline",
+      "install": [
+        "diffusers"
+      ],
+      "uninstall": []
+    },
+    {
+      "id": "zimage_transformer",
+      "label": "ZImageTransformer2DModel",
+      "kind": "python_symbol",
+      "module": "diffusers",
+      "symbol": "ZImageTransformer2DModel",
+      "install": [
+        "diffusers"
+      ],
+      "uninstall": []
+    },
+    {
+      "id": "transformers",
+      "label": "transformers",
+      "kind": "python_package",
+      "package": "transformers",
+      "import_name": "transformers",
+      "install": [
+        "transformers"
+      ],
+      "uninstall": [
+        "transformers"
+      ]
+    },
+    {
+      "id": "accelerate",
+      "label": "accelerate",
+      "kind": "python_package",
+      "package": "accelerate",
+      "import_name": "accelerate",
+      "install": [
+        "accelerate"
+      ],
+      "uninstall": [
+        "accelerate"
+      ]
+    }
+  ]
+}

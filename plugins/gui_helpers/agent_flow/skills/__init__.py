@@ -191,11 +191,22 @@ def build_agent_flow_tool_registry(app: Any, extra_skill_dirs: List[str] | None 
         except Exception as exc:
             warnings.append(f"skill_register_failed:{tool_id}:{exc}")
 
+    model_adapter_catalog: Dict[str, Any] = {"adapters": {}, "warnings": []}
+    try:
+        from .models._model_adapter_manifests import get_model_adapter_catalog
+        model_adapter_catalog = get_model_adapter_catalog()
+        adapter_warnings = model_adapter_catalog.get("warnings")
+        if isinstance(adapter_warnings, list):
+            warnings.extend(str(x) for x in adapter_warnings if str(x or "").strip())
+    except Exception as exc:
+        warnings.append(f"model_adapter_catalog_load_failed:{exc}")
+
     return {
         "registry": reg,
         "registered": sorted(set(registered)),
         "categories": {k: sorted(set(v)) for k, v in by_category.items()},
         "skill_specs": spec_map,
+        "model_adapters": model_adapter_catalog.get("adapters") if isinstance(model_adapter_catalog, dict) else {},
         "warnings": warnings,
     }
 
@@ -205,11 +216,13 @@ def register_agent_flow_skills(app: Any) -> Dict[str, Any]:
     app.state.agent_workflow_tools = built.get("registry")
     app.state.agent_flow_skill_specs = dict(built.get("skill_specs") or {})
     app.state.agent_flow_skill_categories = dict(built.get("categories") or {})
+    app.state.agent_flow_model_adapters = dict(built.get("model_adapters") or {})
     app.state.agent_flow_skill_load_warnings = list(built.get("warnings") or [])
     return {
         "ok": True,
         "registered": list(built.get("registered") or []),
         "categories": dict(built.get("categories") or {}),
+        "model_adapters": dict(built.get("model_adapters") or {}),
         "warnings": list(built.get("warnings") or []),
     }
 

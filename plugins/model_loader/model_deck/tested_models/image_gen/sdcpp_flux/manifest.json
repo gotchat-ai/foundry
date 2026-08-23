@@ -1,0 +1,29 @@
+{
+  "id": "sdcpp_flux",
+  "label": "FLUX stable-diffusion-cpp",
+  "description": "Tested stable-diffusion-cpp style FLUX profile with companion encoder files.",
+  "aliases": [
+    "flux1-schnell",
+    "stable-diffusion-cpp",
+    "sdcpp"
+  ],
+  "backends": [
+    "sd_cpp",
+    "gguf_cli"
+  ],
+  "requirements": [
+    {
+      "id": "stable_diffusion_cpp",
+      "label": "stable_diffusion_cpp",
+      "kind": "python_package",
+      "package": "stable-diffusion-cpp-python",
+      "import_name": "stable_diffusion_cpp",
+      "install": [
+        "stable-diffusion-cpp-python"
+      ],
+      "uninstall": [
+        "stable-diffusion-cpp-python"
+      ]
+    }
+  ]
+}

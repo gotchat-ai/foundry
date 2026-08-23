@@ -1,0 +1,74 @@
+{
+  "hunyuan_gguf_path": "${MODEL_DECK_MODELS_DIR}/hunyuan_video_1_5/diffusion_models/t2v/hunyuanvideo1.5_720p_t2v-Q5_K_M.gguf",
+  "gguf_path": "${MODEL_DECK_MODELS_DIR}/hunyuan_video_1_5/diffusion_models/t2v/hunyuanvideo1.5_720p_t2v-Q5_K_M.gguf",
+  "width": 480,
+  "height": 320,
+  "fps": 16,
+  "frames": 45,
+  "steps": 12,
+  "source_image_path": "",
+  "python_bin": "python",
+  "video_vae_path": "${MODEL_DECK_MODELS_DIR}/hunyuan_video_1_5/vae/hunyuanvideo15_vae_fp16.safetensors",
+  "legacy_video_vae_path": "${MODEL_DECK_MODELS_DIR}/hunyuan_video_1_5/vae/hunyuan_video_vae_bf16.safetensors",
+  "text_encoder_1_path": "${MODEL_DECK_MODELS_DIR}/hunyuan_video_1_5/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors",
+  "text_encoder_2_path": "${MODEL_DECK_MODELS_DIR}/hunyuan_video_1_5/text_encoders/byt5_small_glyphxl_fp16.safetensors",
+  "legacy_text_encoder_1_path": "${MODEL_DECK_MODELS_DIR}/hunyuan_video_1_5/text_encoders/Long-ViT-L-14-GmP-SAE-TE-only.safetensors",
+  "legacy_text_encoder_2_path": "${MODEL_DECK_MODELS_DIR}/hunyuan_video_1_5/text_encoders/llava_llama3_fp8_scaled.safetensors",
+  "qwen_text_encoder_path": "${MODEL_DECK_MODELS_DIR}/hunyuan_video_1_5/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors",
+  "byt5_text_encoder_path": "${MODEL_DECK_MODELS_DIR}/hunyuan_video_1_5/text_encoders/byt5_small_glyphxl_fp16.safetensors",
+  "upscale_model_path": "${MODEL_DECK_MODELS_DIR}/hunyuan_video_1_5/upscaler/hunyuan_video_1.5_720p_upscaler.safetensors",
+  "hunyuan_fast_lora_path": "${MODEL_DECK_MODELS_DIR}/hunyuan_video_1_5/loras/hyvideo_FastVideo_LoRA-fp8.safetensors",
+  "hunyuan_leapfusion_lora_path": "${MODEL_DECK_MODELS_DIR}/hunyuan_video_1_5/loras/img2vid544p.safetensors",
+  "_asset_sources": {
+    "gguf_path": {
+      "type": "huggingface",
+      "repo_id": "jayn7/HunyuanVideo-1.5_T2V_720p-GGUF",
+      "url": "https://huggingface.co/jayn7/HunyuanVideo-1.5_T2V_720p-GGUF"
+    },
+    "hunyuan_gguf_path": {
+      "type": "huggingface",
+      "repo_id": "jayn7/HunyuanVideo-1.5_T2V_720p-GGUF",
+      "url": "https://huggingface.co/jayn7/HunyuanVideo-1.5_T2V_720p-GGUF"
+    },
+    "text_encoder_1_path": {
+      "type": "huggingface",
+      "repo_id": "tencent/HunyuanVideo-1.5",
+      "url": "https://huggingface.co/tencent/HunyuanVideo-1.5"
+    },
+    "text_encoder_2_path": {
+      "type": "huggingface",
+      "repo_id": "tencent/HunyuanVideo-1.5",
+      "url": "https://huggingface.co/tencent/HunyuanVideo-1.5"
+    },
+    "qwen_text_encoder_path": {
+      "type": "huggingface",
+      "repo_id": "tencent/HunyuanVideo-1.5",
+      "url": "https://huggingface.co/tencent/HunyuanVideo-1.5"
+    },
+    "byt5_text_encoder_path": {
+      "type": "huggingface",
+      "repo_id": "tencent/HunyuanVideo-1.5",
+      "url": "https://huggingface.co/tencent/HunyuanVideo-1.5"
+    },
+    "video_vae_path": {
+      "type": "huggingface",
+      "repo_id": "tencent/HunyuanVideo-1.5",
+      "url": "https://huggingface.co/tencent/HunyuanVideo-1.5"
+    },
+    "upscale_model_path": {
+      "type": "huggingface",
+      "repo_id": "tencent/HunyuanVideo-1.5",
+      "url": "https://huggingface.co/tencent/HunyuanVideo-1.5"
+    },
+    "hunyuan_fast_lora_path": {
+      "type": "huggingface",
+      "repo_id": "tencent/HunyuanVideo-1.5",
+      "url": "https://huggingface.co/tencent/HunyuanVideo-1.5"
+    },
+    "hunyuan_leapfusion_lora_path": {
+      "type": "huggingface",
+      "repo_id": "tencent/HunyuanVideo-1.5",
+      "url": "https://huggingface.co/tencent/HunyuanVideo-1.5"
+    }
+  }
+}

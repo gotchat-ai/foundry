@@ -98,6 +98,25 @@ function ensureStyles() {
 .agent-flow .flow-meta-card[open] summary::after { content: "▾"; }
 .agent-flow .flow-meta-card-body { padding: 0 10px 10px; display: flex; flex-direction: column; gap: 8px; }
 .agent-flow .flow-meta-card textarea { min-height: 110px; resize: vertical; }
+.agent-flow-json-form-popover { position: fixed; inset: 18px; z-index: 2147483200; background: var(--panel); color: var(--ui-ink); border: 1px solid var(--border); border-radius: 16px; box-shadow: var(--shadow); padding: 14px; display: flex; flex-direction: column; gap: 12px; overflow: hidden; box-sizing: border-box; }
+.agent-flow-json-form-popover .json-form-head { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+.agent-flow-json-form-popover .json-form-title { font-weight:700; font-size:13px; }
+.agent-flow-json-form-popover .json-form-body { overflow:auto; display:flex; flex-direction:column; gap:10px; padding-right:4px; }
+.agent-flow-json-form-popover .json-form-section { border:1px solid var(--border); border-radius:12px; padding:10px; background: var(--ui-popover-item-bg); display:flex; flex-direction:column; gap:8px; }
+.agent-flow-json-form-popover .json-form-section-title { font-size:11px; font-weight:700; color:var(--ui-muted); text-transform:uppercase; letter-spacing:.8px; }
+.agent-flow-json-form-popover .json-form-field { display:flex; flex-direction:column; gap:4px; }
+.agent-flow-json-form-popover .json-form-field span { font-size:11px; color:var(--ui-muted); }
+.agent-flow-json-form-popover .json-form-actions { display:flex; justify-content:flex-end; gap:8px; }
+.agent-flow .model-node-editor { display:flex; flex-direction:column; gap:10px; }
+.agent-flow .model-node-section { border:1px solid var(--border); border-radius:12px; padding:10px; background:var(--ui-popover-item-bg); display:flex; flex-direction:column; gap:8px; }
+.agent-flow .model-node-section-title { font-size:11px; font-weight:700; color:var(--ui-muted); text-transform:uppercase; letter-spacing:.8px; }
+.agent-flow .model-node-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(210px, 1fr)); gap:8px; }
+.agent-flow .model-node-field { display:flex; flex-direction:column; gap:4px; min-width:0; }
+.agent-flow .model-node-field span { font-size:11px; color:var(--ui-muted); }
+.agent-flow .model-node-field input,
+.agent-flow .model-node-field select,
+.agent-flow .model-node-field textarea { width:100%; box-sizing:border-box; }
+.agent-flow .model-node-advanced summary { font-size:12px; color:var(--ui-muted); cursor:pointer; }
 .agent-flow .agent-flow-canvas-wrap { position: relative; flex: 1; min-height: 0; height: 100%; padding-top: 36px; }
 .agent-flow .flow-canvas { position: relative; border: 1px dashed var(--border); border-radius: 14px; background: radial-gradient(circle at 20% 20%, rgba(20, 20, 20, 0.08), transparent 60%), #faf6f0; height: 100%; min-height: 520px; overflow: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; touch-action: pan-x pan-y; user-select: none; -webkit-user-select: none; }
 .agent-flow .flow-canvas-inner { position: relative; min-width: 100%; min-height: 100%; zoom: var(--agent-flow-zoom, 1); }
@@ -384,6 +403,47 @@ function getAgentFlowSkillHoverText(skillId) {
   const meta = getAgentFlowSkillMeta(sid) || {};
   const desc = String(meta.description || meta.short_description || meta.summary || "").trim();
   return desc ? `${sid}\n${desc}` : sid;
+}
+
+function getAgentFlowModelAdapters() {
+  const catalog = agentFlowSkillCatalog || {};
+  const adapters = catalog.model_adapters && typeof catalog.model_adapters === "object" ? catalog.model_adapters : {};
+  return adapters;
+}
+
+function findModelAdapterForTool(toolId, values = {}) {
+  const tool = String(toolId || "").trim();
+  if (!tool.startsWith("models.")) return null;
+  const adapters = getAgentFlowModelAdapters();
+  const toolConfig = values?.tool_config && typeof values.tool_config === "object" ? values.tool_config : {};
+  const params = toolConfig.params && typeof toolConfig.params === "object" ? toolConfig.params : {};
+  const settings = params.settings && typeof params.settings === "object" ? params.settings : {};
+  const explicit = String(
+    params.model_runtime_adapter ||
+    params.runtime_adapter ||
+    settings.model_runtime_adapter ||
+    settings.runtime_adapter ||
+    settings.workflow_adapter ||
+    ""
+  ).trim();
+  if (explicit && adapters[explicit]) return adapters[explicit];
+  const wantedProfile = String(settings.model_deck_compat_manifest_id || settings.tested_profile || settings.compat_profile || "").trim().toLowerCase();
+  const wantedFamily = String(settings.model_family || settings.architecture || settings.workflow_family || "").trim().toLowerCase();
+  for (const adapter of Object.values(adapters)) {
+    if (!adapter || typeof adapter !== "object") continue;
+    const skills = adapter.skills && typeof adapter.skills === "object" ? Object.values(adapter.skills).map((v) => String(v || "").trim()) : [];
+    if (!skills.includes(tool)) continue;
+    const aliases = Array.isArray(adapter.aliases) ? adapter.aliases.map((v) => String(v || "").trim().toLowerCase()) : [];
+    const families = Array.isArray(adapter.families) ? adapter.families.map((v) => String(v || "").trim().toLowerCase()) : [];
+    if (wantedProfile && aliases.includes(wantedProfile)) return adapter;
+    if (wantedFamily && families.includes(wantedFamily)) return adapter;
+  }
+  for (const adapter of Object.values(adapters)) {
+    if (!adapter || typeof adapter !== "object") continue;
+    const skills = adapter.skills && typeof adapter.skills === "object" ? Object.values(adapter.skills).map((v) => String(v || "").trim()) : [];
+    if (skills.includes(tool)) return adapter;
+  }
+  return null;
 }
 
 
@@ -4244,10 +4304,24 @@ function renderPanel(container, ctx) {
     const freshSettings = getAgentFlowSettings(ctx, sid) || {};
     const rawActive = String(freshSettings.agent_flow_active_flow || "").trim();
     const resolvedActive = rawActive === NO_FLOW_VALUE ? NO_FLOW_VALUE : (resolveActiveFlowName(freshSettings, flows) || "");
+    const selectedFlowName = currentFlow && flows?.[currentFlow]
+      ? currentFlow
+      : ((resolvedActive && resolvedActive !== NO_FLOW_VALUE && flows?.[resolvedActive]) ? resolvedActive : "");
+    if (!selectedFlowName || !flows?.[selectedFlowName]) {
+      throw new Error("No selected workflow to export.");
+    }
+    const selectedWorkflowId = getFlowStableId(freshSettings, selectedFlowName);
+    const selectedFlowIds = selectedWorkflowId ? { [selectedFlowName]: selectedWorkflowId } : {};
     const payload = {
-      flows: deepClone(flows || {}),
-      default_flow: String(defaultFlow || freshSettings.agent_flow_default_flow || "").trim(),
-      active_flow: resolvedActive || "",
+      flows: {
+        [selectedFlowName]: deepClone(flows[selectedFlowName] || {}),
+      },
+      flow_ids_by_name: selectedFlowIds,
+      default_flow_ids_by_name: selectedFlowIds,
+      root_flow: selectedFlowName,
+      exported_workflow_id: selectedWorkflowId,
+      default_flow: selectedFlowName,
+      active_flow: selectedFlowName,
       mode: String(freshSettings.agent_flow_mode || "execute").trim() || "execute",
       max_steps: Number(freshSettings.agent_flow_max_steps || 32),
       loop_max_passes: normalizeLoopMaxSetting(freshSettings.agent_flow_loop_max_passes, 16),
@@ -4261,7 +4335,7 @@ function renderPanel(container, ctx) {
       autobuild_independent_wait_s: normalizeTimeoutSetting(freshSettings.agent_flow_autobuild_independent_wait_s, 180),
       autobuild_independent_final_grace_s: normalizeTimeoutSetting(freshSettings.agent_flow_autobuild_independent_final_grace_s, 20),
     };
-    const flowPart = (resolvedActive && resolvedActive !== NO_FLOW_VALUE) ? resolvedActive : "flows";
+    const flowPart = selectedFlowName;
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
     const filename = `agent_flow_${flowPart}_${stamp}.json`;
     const json = JSON.stringify(payload, null, 2);
@@ -4274,7 +4348,7 @@ function renderPanel(container, ctx) {
     a.click();
     a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 0);
-    ctx.log?.(`[agent_flow] exported flows JSON: ${filename}`, "info");
+    ctx.log?.(`[agent_flow] exported selected flow JSON: ${filename}`, "info");
   }
 
   function updateDefaultLabel() {
@@ -4492,8 +4566,37 @@ function renderPanel(container, ctx) {
 
   function ensureFlow(name) {
     if (!flows[name]) flows[name] = { start: null, nodes: {} };
-    if (!flows[name].nodes) flows[name].nodes = {};
+    if (Array.isArray(flows[name].nodes)) {
+      const mapped = {};
+      flows[name].nodes.forEach((rawNode, index) => {
+        if (!rawNode || typeof rawNode !== "object" || Array.isArray(rawNode)) return;
+        const nodeId = String(rawNode.id || rawNode.node_id || `node_${index + 1}`).trim() || `node_${index + 1}`;
+        mapped[nodeId] = {
+          ...rawNode,
+          label: rawNode.label || nodeId,
+          plugin_id: rawNode.plugin_id || rawNode.type || "chat",
+          agent_kind: rawNode.agent_kind || "agent_workflow_member",
+          x: typeof rawNode.x === "number" ? rawNode.x : 80 + (index % 4) * 260,
+          y: typeof rawNode.y === "number" ? rawNode.y : 80 + Math.floor(index / 4) * 180,
+        };
+        delete mapped[nodeId].id;
+        delete mapped[nodeId].node_id;
+      });
+      flows[name].nodes = mapped;
+    }
+    if (!flows[name].nodes || typeof flows[name].nodes !== "object") flows[name].nodes = {};
     if (typeof flows[name].read_only !== "boolean") flows[name].read_only = false;
+    if (!flows[name].settings || typeof flows[name].settings !== "object" || Array.isArray(flows[name].settings)) {
+      flows[name].settings = {};
+    }
+    Object.keys(flows[name].nodes || {}).forEach((nodeId) => {
+      const node = flows[name].nodes[nodeId];
+      if (node && typeof node === "object" && !Array.isArray(node)) return;
+      if (!Object.prototype.hasOwnProperty.call(flows[name].settings, nodeId)) {
+        flows[name].settings[nodeId] = node;
+      }
+      delete flows[name].nodes[nodeId];
+    });
     Object.keys(flows[name].nodes || {}).forEach((nodeId) => {
       const node = flows[name].nodes[nodeId];
       if (!node || typeof node !== "object") return;
@@ -4608,6 +4711,61 @@ function renderPanel(container, ctx) {
     }
   }
 
+  function getBundleManifestSettings(record) {
+    const metadata = record && typeof record.metadata === "object" ? record.metadata : null;
+    const manifest = metadata && typeof metadata.bundle_manifest === "object" ? metadata.bundle_manifest : null;
+    const settings = manifest && typeof manifest.agent_flow_settings === "object" ? manifest.agent_flow_settings : null;
+    return settings && Object.keys(settings).length ? settings : null;
+  }
+
+  function applyBundleManifestSettings(record, flowNameHint = "") {
+    const settings = getBundleManifestSettings(record);
+    if (!settings) return false;
+    const currentSettings = getAgentFlowSettings(ctx, sid) || {};
+    const next = { ...currentSettings };
+    let changed = false;
+    const setIfPresent = (targetKey, sourceKey, normalize) => {
+      if (!Object.prototype.hasOwnProperty.call(settings, sourceKey)) return;
+      const raw = settings[sourceKey];
+      if (raw == null) return;
+      if (typeof raw === "string" && !raw.trim()) return;
+      const value = typeof normalize === "function" ? normalize(raw) : raw;
+      if (value == null) return;
+      if (next[targetKey] === value) return;
+      next[targetKey] = value;
+      changed = true;
+    };
+    const flowName = String(flowNameHint || record?.flow_name || "").trim();
+    const normalizedDefault = String(settings.default_flow || "").trim();
+    const normalizedActive = String(settings.active_flow || "").trim();
+    if (normalizedDefault) {
+      next.agent_flow_default_flow = normalizedDefault;
+      changed = changed || currentSettings.agent_flow_default_flow !== normalizedDefault;
+    }
+    if (normalizedActive) {
+      next.agent_flow_active_flow = normalizedActive;
+      changed = changed || currentSettings.agent_flow_active_flow !== normalizedActive;
+    } else if (flowName && !String(currentSettings.agent_flow_active_flow || "").trim()) {
+      next.agent_flow_active_flow = flowName;
+      changed = true;
+    }
+    setIfPresent("agent_flow_mode", "mode", (v) => String(v || "").trim() || "execute");
+    setIfPresent("agent_flow_max_steps", "max_steps", (v) => Number(v || 32));
+    setIfPresent("agent_flow_loop_max_passes", "loop_max_passes", (v) => normalizeLoopMaxSetting(v, 16));
+    setIfPresent("agent_flow_force_loop_max_passes", "force_loop_max_passes", (v) => normalizeBoolSetting(v, false));
+    setIfPresent("agent_flow_request_timeout_s", "request_timeout_s", (v) => normalizeTimeoutSetting(v, 45));
+    setIfPresent("agent_flow_autobuild_sandbox_profile", "autobuild_sandbox_profile", (v) => normalizeSandboxProfileSetting(v, "lightweight"));
+    setIfPresent("agent_flow_autobuild_lightweight_max_requests", "autobuild_lightweight_max_requests", (v) => Math.max(1, Math.trunc(Number(v) || 1)));
+    setIfPresent("agent_flow_autobuild_lightweight_wait_s", "autobuild_lightweight_wait_s", (v) => normalizeTimeoutSetting(v, 120));
+    setIfPresent("agent_flow_autobuild_lightweight_final_grace_s", "autobuild_lightweight_final_grace_s", (v) => normalizeTimeoutSetting(v, 10));
+    setIfPresent("agent_flow_autobuild_independent_max_requests", "autobuild_independent_max_requests", (v) => Math.max(1, Math.trunc(Number(v) || 3)));
+    setIfPresent("agent_flow_autobuild_independent_wait_s", "autobuild_independent_wait_s", (v) => normalizeTimeoutSetting(v, 180));
+    setIfPresent("agent_flow_autobuild_independent_final_grace_s", "autobuild_independent_final_grace_s", (v) => normalizeTimeoutSetting(v, 20));
+    if (!changed) return false;
+    setRouterSettings(ctx, sid, "agent_flow", next);
+    return true;
+  }
+
   async function consumeTempLibraryOpenRequest() {
     const req = tempLibraryRequestFromWindow();
     if (!req) return false;
@@ -4621,11 +4779,13 @@ function renderPanel(container, ctx) {
     const workflowId = String(req.workflow_id || "").trim();
     if (recordId) {
       try {
-        const rows = await fetchAwfLibraryRecords();
+        const payload = await fetchAwfLibraryRecords();
+        const rows = Array.isArray(payload?.records) ? payload.records : [];
         const row = rows.find((item) => String(item?.id || "").trim() === recordId);
         if (row) {
           target = String(row?.flow_name || target || "").trim();
           req.workflow_id = String(row?.workflow_id || row?.id || workflowId || "").trim();
+          req._record = row;
         }
       } catch (err) {
         ctx?.log?.(`[agent_flow] temp library lookup failed: ${err?.message || err}`, "warn");
@@ -4641,6 +4801,7 @@ function renderPanel(container, ctx) {
     if (!target) return false;
     if (flows[target]) {
       clearTempLibraryRequestFromWindow();
+      applyBundleManifestSettings(req._record, target);
       loadFlow(target);
       setLeftOpen(true);
       return true;
@@ -4653,6 +4814,7 @@ function renderPanel(container, ctx) {
     }
     if (flows[target]) {
       clearTempLibraryRequestFromWindow();
+      applyBundleManifestSettings(req._record, target);
       setLeftOpen(true);
       return true;
     }
@@ -5236,11 +5398,1165 @@ function renderPanel(container, ctx) {
     return wrap;
   }
 
+  function parseJsonEditorValue(textarea) {
+    const text = String(textarea?.value || "").trim();
+    if (!text) return {};
+    try {
+      const parsed = JSON.parse(text);
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+    } catch (err) {
+      ctx.log?.(`Tool params JSON parse failed: ${err?.message || err}`, "warn");
+      return {};
+    }
+  }
+
+  const MODEL_NODE_DEFS = {
+    asset_resolver: {
+      label: "Asset resolver",
+      tool: "models.asset_resolver",
+      help: "Resolves model-deck assets and validates required file paths before later nodes run.",
+      assetKeys: ["gguf_path", "embeddings_connectors_path", "video_vae_path", "audio_vae_path", "text_encoder_gguf_path", "text_encoder_safetensors_path", "text_encoder_projection_path", "text_encoder_mmproj_path", "distilled_lora_path", "spatial_upscaler_path"],
+      settingKeys: ["model_id", "model_family", "workflow_variant", "device", "dtype", "workflow_loader_mode", "workflow_execution_backend"],
+      paramKeys: ["asset_keys"],
+    },
+    prompt_encoder: {
+      label: "Prompt encoder / text encoder",
+      tool: "models.prompt_encoder",
+      help: "Loads Gemma/text encoder assets and turns prompt text into conditioning embeddings.",
+      assetKeys: ["text_encoder_safetensors_path", "text_encoder_gguf_path", "text_encoder_tokenizer_gguf_path", "text_encoder_projection_path", "text_encoder_mmproj_path", "embeddings_connectors_path"],
+      settingKeys: ["gemma_text_encoding_device", "gemma_max_tokens", "allow_eager_gemma_gpu", "device", "dtype", "negative_prompt", "native_default_negative_prompt"],
+      paramKeys: ["negative_prompt"],
+      paramsFromInput: ["prompt", "negative_prompt"],
+    },
+    text_encoder_loader: {
+      label: "Text encoder loader",
+      tool: "models.prompt_encoder",
+      help: "Generic text encoder loader/encoder node. Tested adapters can split tokenizer, text encoder, and projection behavior as needed.",
+      assetKeys: ["text_encoder_safetensors_path", "text_encoder_gguf_path", "text_encoder_tokenizer_gguf_path", "text_encoder_projection_path", "text_encoder_mmproj_path"],
+      settingKeys: ["gemma_text_encoding_device", "gemma_max_tokens", "allow_eager_gemma_gpu", "device", "dtype"],
+      paramKeys: [],
+      paramsFromInput: ["prompt", "negative_prompt"],
+    },
+    diffusers_repo_prompt_encoder: {
+      label: "Image prompt / request text",
+      tool: "models.prompt_encoder",
+      help: "Prepares the image generation prompt and negative prompt for generic Diffusers image/repo workflows.",
+      assetKeys: [],
+      settingKeys: ["prompt", "default_prompt", "negative_prompt", "use_default_when_blank"],
+      paramKeys: ["negative_prompt"],
+      paramsFromInput: ["prompt", "negative_prompt"],
+    },
+    diffusers_repo_pipeline_loader: {
+      label: "Diffusers pipeline / model loader",
+      tool: "models.transformer_loader",
+      help: "Loads the Diffusers image pipeline, tested profile, GGUF transformer, SDXL Lightning UNet, or repo pipeline.",
+      assetKeys: ["gguf_path", "sdxl_unet_path", "text_encoder_path", "vae_path", "clip_path"],
+      settingKeys: ["backend", "model_id", "repo_id", "model_deck_compat_manifest_id", "model_family", "diffusers_pipeline_class", "diffusers_transformer_class", "use_unet", "sdxl_base_model", "sdxl_variant", "sdxl_timestep_spacing", "dtype", "device", "gpu_selection_mode", "main_gpu", "enable_model_cpu_offload", "enable_sequential_cpu_offload", "low_cpu_mem_usage"],
+      paramKeys: [],
+    },
+    diffusers_repo_sampler: {
+      label: "Image sampler / generate",
+      tool: "models.sampler",
+      help: "Runs the loaded image pipeline with prompt, size, steps, CFG/guidance, and seed.",
+      assetKeys: [],
+      settingKeys: ["width", "height", "steps", "num_inference_steps", "cfg_scale", "guidance_scale", "sampler", "scheduler", "seed", "max_sequence_length"],
+      paramKeys: ["width", "height", "steps", "guidance_scale", "seed"],
+      paramsFromInput: ["prompt", "negative_prompt", "width", "height", "steps", "guidance_scale", "seed"],
+    },
+    diffusers_repo_vae_decode: {
+      label: "Image VAE / decode pass-through",
+      tool: "models.vae_decode",
+      help: "For Diffusers image pipelines, VAE decode usually happens inside the sampler. This node records/validates that decoded output is available.",
+      assetKeys: ["vae_path"],
+      settingKeys: ["dtype", "device"],
+      paramKeys: [],
+    },
+    diffusers_repo_media_encode: {
+      label: "Image file output",
+      tool: "models.media_encode",
+      help: "Publishes the generated image as the workflow result.",
+      assetKeys: [],
+      settingKeys: ["output_ext"],
+      paramKeys: ["output_path"],
+      paramsFromInput: ["prompt"],
+    },
+    diffusers_repo_cleanup: {
+      label: "Diffusers cleanup / unload",
+      tool: "models.cleanup",
+      help: "Releases the image Diffusers pipeline and accelerator cache after generation.",
+      assetKeys: [],
+      settingKeys: ["release_workflow_object", "cleanup_xpu_cache", "cleanup_cuda_cache", "workflow_node_lifecycle_policy"],
+      paramKeys: ["targets"],
+    },
+    gguf_transformer_loader: {
+      label: "GGUF transformer loader",
+      tool: "models.transformer_loader",
+      help: "Loads the video/image transformer GGUF using the selected memory policy.",
+      assetKeys: ["gguf_path", "model_path", "embeddings_connectors_path"],
+      settingKeys: ["native_gguf_execution_mode", "native_lazy_quantized_packed_device", "native_transformer_offload", "native_transformer_gpu_slots", "device", "main_gpu", "gpu_selection_mode", "dtype"],
+      paramKeys: [],
+    },
+    dual_transformer_loader: {
+      label: "Dual GGUF transformer loader",
+      tool: "models.dual_transformer_loader",
+      help: "Loads/declares paired transformer stages such as Wan HighNoise and LowNoise GGUF models.",
+      assetKeys: ["high_noise_gguf_path", "low_noise_gguf_path", "gguf_path_high", "gguf_path_low"],
+      settingKeys: ["native_gguf_execution_mode", "native_lazy_quantized_packed_device", "native_transformer_offload", "device", "main_gpu", "gpu_selection_mode", "dtype", "high_noise_model_role", "low_noise_model_role"],
+      paramKeys: ["high_noise_steps", "low_noise_steps", "stage_split"],
+    },
+    connector_lora_attach: {
+      label: "Connector / LoRA attach",
+      tool: "models.connector_loader",
+      help: "Attaches connector/projection files and optional LoRA weights to the transformer.",
+      assetKeys: ["embeddings_connectors_path", "text_encoder_projection_path", "text_encoder_mmproj_path", "distilled_lora_path"],
+      settingKeys: ["native_skip_lora", "skip_lora", "native_allow_lora_mismatch_fallback", "native_lora_partial_fuse", "ltx_distilled_lora_strength", "ltx_detailer_lora_strength", "native_require_asset_pairing"],
+      paramKeys: [],
+    },
+    lora_loader: {
+      label: "LoRA / adapter loader",
+      tool: "models.lora_loader",
+      help: "Loads one optional LoRA/adapter asset. Add multiple nodes when a model supports multiple LoRAs.",
+      assetKeys: ["distilled_lora_path", "lora_adapter_path"],
+      settingKeys: ["native_skip_lora", "skip_lora", "native_allow_lora_mismatch_fallback", "native_lora_partial_fuse", "ltx_distilled_lora_strength", "ltx_detailer_lora_strength"],
+      paramKeys: ["lora_name", "strength", "apply_stage"],
+    },
+    vae_loader: {
+      label: "VAE loader",
+      tool: "models.vae_decode",
+      help: "Loads/declares VAE assets. Some adapters combine VAE loading with decode; others can preload the VAE here.",
+      assetKeys: ["video_vae_path", "audio_vae_path", "vae_path"],
+      settingKeys: ["device", "dtype", "vae_dtype", "enable_model_cpu_offload", "enable_sequential_cpu_offload"],
+      paramKeys: ["vae_role"],
+    },
+    ltx_graph_settings: {
+      label: "LTX graph settings / crop guides",
+      tool: "models.graph_settings",
+      help: "Comfy-parity settings such as crop guides, chunking, samplers, sigmas, CFG, and stage controls.",
+      assetKeys: ["spatial_upscaler_path"],
+      settingKeys: ["width", "height", "frames", "fps", "steps", "guidance_scale", "ltx_crop_guides_enabled", "ltx_stage1_sampler", "ltx_stage1_sigmas", "ltx_stage1_cfg", "ltx_stage2_sampler", "ltx_stage2_sigmas", "ltx_stage2_cfg", "ltx_chunk_feedforward_chunks", "ltx_chunk_feedforward_dim_threshold", "native_force_stage2", "native_debug_skip_stage2", "native_normalize_stage1_latent", "native_stage1_latent_target_std"],
+      paramKeys: [],
+    },
+    latent_video_init: {
+      label: "Latent video initializer",
+      tool: "models.latent_video_init",
+      help: "Creates the initial empty latent video tensor for T2V workflows. Wan uses Hunyuan-shaped latent video initialization.",
+      assetKeys: [],
+      settingKeys: ["width", "height", "frames", "batch_size", "latent_format", "device", "dtype"],
+      paramKeys: ["width", "height", "frames", "batch_size", "latent_format"],
+      paramsFromInput: ["width", "height", "frames"],
+    },
+    staged_sampler: {
+      label: "Staged sampler",
+      tool: "models.staged_sampler",
+      help: "Runs multi-stage sampling where one model handles early/noisy steps and another handles later/low-noise steps.",
+      assetKeys: ["high_noise_gguf_path", "low_noise_gguf_path", "lora_adapter_path"],
+      settingKeys: ["steps", "high_noise_steps", "low_noise_steps", "guidance_scale", "high_noise_cfg", "low_noise_cfg", "sampler_name", "scheduler", "seed", "device", "dtype", "workflow_node_lifecycle_policy"],
+      paramKeys: ["steps", "high_noise_steps", "low_noise_steps", "guidance_scale", "high_noise_cfg", "low_noise_cfg", "sampler_name", "scheduler", "seed"],
+      paramsFromInput: ["steps", "guidance_scale", "seed"],
+    },
+    sampler: {
+      label: "Video latent sampler",
+      tool: "models.sampler",
+      help: "Runs denoising/sampling and produces video latents.",
+      assetKeys: ["gguf_path", "embeddings_connectors_path", "distilled_lora_path", "spatial_upscaler_path"],
+      settingKeys: ["width", "height", "frames", "fps", "steps", "guidance_scale", "seed", "ltx_video_only", "native_force_stage2", "native_skip_lora", "ltx_stage1_cfg", "ltx_stage2_cfg", "device", "dtype"],
+      paramKeys: ["width", "height", "frames", "fps", "steps", "guidance_scale", "seed"],
+      paramsFromInput: ["width", "height", "frames", "fps", "steps", "guidance_scale", "seed"],
+    },
+    vae_decode: {
+      label: "Video VAE decode",
+      tool: "models.vae_decode",
+      help: "Loads the selected VAE assets and decodes latents into frames.",
+      assetKeys: ["video_vae_path", "audio_vae_path"],
+      settingKeys: ["device", "dtype", "vae_dtype"],
+      paramKeys: [],
+    },
+    video_encode: {
+      label: "MP4/video encoder",
+      tool: "models.media_encode",
+      help: "Encodes decoded frames to an MP4 artifact.",
+      assetKeys: [],
+      settingKeys: ["fps", "video_codec"],
+      paramKeys: ["fps", "codec"],
+      paramsFromInput: ["fps", "prompt"],
+    },
+    frame_interpolator: {
+      label: "Frame interpolation",
+      tool: "models.frame_interpolator",
+      help: "Optional post-process node such as RIFE frame interpolation before final MP4 encode.",
+      assetKeys: ["frame_interpolator_model_path", "rife_model_path"],
+      settingKeys: ["fps", "target_fps", "interpolation_multiplier", "frame_interpolator_dtype", "device"],
+      paramKeys: ["target_fps", "interpolation_multiplier"],
+    },
+    wan_optional_prompt: {
+      label: "Wan optional prompt",
+      tool: "models.wan22_optional_prompt",
+      help: "Consumes/normalizes the user's optional I2V/T2V prompt before prompt encoding.",
+      assetKeys: [],
+      settingKeys: ["prompt", "negative_prompt"],
+      paramKeys: ["prompt", "negative_prompt"],
+      paramsFromInput: ["prompt", "negative_prompt"],
+    },
+    wan_prompt_encoder: {
+      label: "Wan prompt encoder / UMT5",
+      tool: "models.wan22_prompt_encoder",
+      help: "Loads the Wan UMT5 text encoder GGUF and encodes prompt conditioning.",
+      assetKeys: ["text_encoder_gguf_path"],
+      settingKeys: ["wan_prompt_encoder_cache_mode", "wan_prompt_encoder_persist", "device", "dtype", "negative_prompt"],
+      paramKeys: ["negative_prompt"],
+      paramsFromInput: ["prompt", "negative_prompt"],
+    },
+    wan_source_prepare: {
+      label: "Wan I2V source image prepare",
+      tool: "models.wan22_i2v_source_prepare",
+      help: "Fits/crops the source image to the model workflow size before VAE source encoding.",
+      assetKeys: ["source_image_path"],
+      settingKeys: ["width", "height", "wan_i2v_prepare_source_to_output_size", "wan_i2v_source_fit_mode"],
+      paramKeys: ["source_image_path"],
+    },
+    wan_source_vae_encode: {
+      label: "Wan I2V source VAE encode",
+      tool: "models.wan22_i2v_source_vae_encode",
+      help: "Encodes the prepared source image into Wan I2V latent conditioning, including CPU/GPU and temporal-halo source encode controls.",
+      assetKeys: ["video_vae_path", "source_image_path"],
+      settingKeys: ["wan_i2v_vae_encode_device", "wan_i2v_vae_encode_dtype", "wan_i2v_source_encode_mode", "wan_i2v_source_halo_core_latent_frames", "wan_i2v_source_halo_latent_frames", "wan_i2v_source_halo_max_window_latent_frames", "wan_i2v_source_encode_cleanup_each_stage", "wan_i2v_min_gpu_free_mb", "device", "dtype"],
+      paramKeys: ["node_id"],
+    },
+    wan_i2v_conditioning: {
+      label: "Wan I2V conditioning inject",
+      tool: "models.wan22_i2v_conditioning_inject",
+      help: "Injects source-image latent conditioning into the prompt conditioning before sampling.",
+      assetKeys: [],
+      settingKeys: ["wan_i2v_denoise_strength", "wan_i2v_source_hold_frames", "wan_i2v_source_tail_mode", "wan_i2v_source_tail_min_strength"],
+      paramKeys: ["node_id"],
+    },
+    wan_stage_transformer_loader: {
+      label: "Wan stage GGUF transformer loader",
+      tool: "models.wan22_stage_transformer_loader",
+      help: "Loads one Wan HighNoise or LowNoise GGUF transformer stage so split workflows do not keep both resident.",
+      assetKeys: ["high_noise_gguf_path", "low_noise_gguf_path"],
+      settingKeys: ["stage", "device", "dtype", "native_gguf_execution_mode", "native_lazy_quantized_packed_device", "workflow_node_lifecycle_policy"],
+      paramKeys: ["stage", "node_id"],
+    },
+    wan_dual_transformer_loader: {
+      label: "Wan dual GGUF transformer loader",
+      tool: "models.wan22_dual_transformer_loader",
+      help: "Loads/declares both Wan HighNoise and LowNoise transformer stages for non-split workflows.",
+      assetKeys: ["high_noise_gguf_path", "low_noise_gguf_path"],
+      settingKeys: ["device", "dtype", "native_gguf_execution_mode", "native_lazy_quantized_packed_device"],
+      paramKeys: ["high_noise_steps", "low_noise_steps"],
+    },
+    wan_lora_attach: {
+      label: "Wan LoRA attach",
+      tool: "models.wan22_lora_attach",
+      help: "Attaches the Wan high/low LoRA adapters with per-stage strengths.",
+      assetKeys: ["high_noise_lora_path", "low_noise_lora_path"],
+      settingKeys: ["wan_apply_stage_lora", "wan_stage_lora_stock_loader", "wan_stage_lora_strength", "high_noise_lora_strength", "low_noise_lora_strength", "wan_stage_lora_mismatch_fallback"],
+      paramKeys: ["stage"],
+    },
+    wan_latent_video_init: {
+      label: "Wan latent video init",
+      tool: "models.wan22_latent_video_init",
+      help: "Creates the empty Hunyuan/Wan latent video tensor for T2V or the base latent for I2V.",
+      assetKeys: [],
+      settingKeys: ["width", "height", "frames", "batch_size", "latent_format", "device", "dtype"],
+      paramKeys: ["width", "height", "frames", "batch_size", "latent_format"],
+      paramsFromInput: ["width", "height", "frames"],
+    },
+    wan_i2v_latent_init: {
+      label: "Wan I2V latent init",
+      tool: "models.wan22_i2v_latent_init",
+      help: "Creates/merges the Wan I2V latent payload from source conditioning and empty video latents.",
+      assetKeys: [],
+      settingKeys: ["width", "height", "frames", "batch_size", "latent_format", "wan_i2v_denoise_strength", "device", "dtype"],
+      paramKeys: ["width", "height", "frames", "batch_size", "latent_format"],
+      paramsFromInput: ["width", "height", "frames"],
+    },
+    wan_stage_sampler: {
+      label: "Wan stage sampler",
+      tool: "models.wan22_stage_sampler",
+      help: "Runs a single Wan high-noise or low-noise sampling stage.",
+      assetKeys: ["high_noise_gguf_path", "low_noise_gguf_path", "high_noise_lora_path", "low_noise_lora_path"],
+      settingKeys: ["stage", "steps", "high_noise_steps", "low_noise_steps", "guidance_scale", "high_noise_cfg", "low_noise_cfg", "sampler_name", "scheduler", "seed", "shift", "high_noise_shift", "low_noise_shift", "device", "dtype"],
+      paramKeys: ["stage", "steps", "seed"],
+      paramsFromInput: ["steps", "guidance_scale", "seed"],
+    },
+    wan_staged_sampler: {
+      label: "Wan staged sampler",
+      tool: "models.wan22_staged_sampler",
+      help: "Runs the combined Comfy-style Wan high-noise then low-noise sampling path.",
+      assetKeys: ["high_noise_gguf_path", "low_noise_gguf_path", "high_noise_lora_path", "low_noise_lora_path"],
+      settingKeys: ["steps", "high_noise_steps", "low_noise_steps", "guidance_scale", "high_noise_cfg", "low_noise_cfg", "sampler_name", "scheduler", "seed", "shift", "high_noise_shift", "low_noise_shift", "device", "dtype"],
+      paramKeys: ["steps", "seed"],
+      paramsFromInput: ["steps", "guidance_scale", "seed"],
+    },
+    wan_release_transformer: {
+      label: "Wan release transformer",
+      tool: "models.wan22_release_transformer",
+      help: "Releases one Wan transformer stage and clears cache before the next heavy stage.",
+      assetKeys: [],
+      settingKeys: ["stage", "cleanup_xpu_cache", "cleanup_cuda_cache"],
+      paramKeys: ["stage", "targets"],
+    },
+    wan_vae_decode: {
+      label: "Wan video VAE decode",
+      tool: "models.wan22_vae_decode",
+      help: "Decodes Wan video latents to frames, including CPU/GPU full decode, temporal halo chunking, and spatial tiling controls.",
+      assetKeys: ["video_vae_path"],
+      settingKeys: ["wan_vae_decode_device", "wan_vae_decode_mode", "wan_vae_dtype", "wan_vae_halo_core_latent_frames", "wan_vae_halo_core_overlap_latent_frames", "wan_vae_halo_latent_frames", "wan_vae_halo_max_window_latent_frames", "wan_vae_halo_spatial_tiled", "wan_vae_halo_tile_size", "wan_vae_halo_tile_overlap", "wan_vae_halo_cpu_fallback", "wan_luminance_stabilize", "wan_luminance_strength", "device", "dtype"],
+      paramKeys: ["node_id"],
+    },
+    wan_frame_interpolator: {
+      label: "Wan frame interpolation",
+      tool: "models.wan22_frame_interpolator",
+      help: "Optional Wan frame interpolation/pass-through stage.",
+      assetKeys: ["frame_interpolator_model_path", "rife_model_path"],
+      settingKeys: ["fps", "target_fps", "interpolation_multiplier", "frame_interpolator_dtype", "device"],
+      paramKeys: ["target_fps", "interpolation_multiplier"],
+    },
+    wan_media_encode: {
+      label: "Wan MP4/video encode",
+      tool: "models.wan22_media_encode",
+      help: "Encodes decoded Wan frames to MP4 and can apply post-VAE temporal denoise.",
+      assetKeys: [],
+      settingKeys: ["fps", "target_fps", "video_codec", "wan_video_temporal_denoise", "wan_video_temporal_denoise_strength", "wan_video_temporal_denoise_radius", "wan_video_temporal_denoise_motion_gate"],
+      paramKeys: ["fps", "codec"],
+      paramsFromInput: ["fps", "prompt"],
+    },
+
+    minimax_ref_inputs: {
+      label: "MiniMax H3 reference inputs",
+      tool: "models.minimax_ref_inputs",
+      help: "Declares REF2V reference image/video/audio inputs and the tag mapping used by MiniMaxH3ReferenceToVideo.",
+      assetKeys: ["reference_image_1_path", "reference_image_2_path", "reference_video_path", "reference_audio_path"],
+      settingKeys: ["minimax_conditioning_mode", "minimax_ref_image_size", "minimax_reference_conditioning_device", "minimax_reference_tags", "minimax_resize_references", "minimax_ref1_width", "minimax_ref1_height", "minimax_ref2_width", "minimax_ref2_height", "width", "height", "frames", "fps"],
+      paramKeys: ["ref_image_size", "reference_tags"],
+      paramsFromInput: ["prompt", "source_image_path"],
+    },
+    minimax_text_encoder: {
+      label: "MiniMax H3 Qwen text encoder",
+      tool: "models.minimax_text_encoder",
+      help: "Loads/declares the Qwen3-VL text encoder GGUF/safetensors and prepares MiniMax prompt conditioning.",
+      assetKeys: ["text_encoder_gguf_path", "text_encoder_safetensors_path"],
+      settingKeys: ["minimax_text_encoder_device", "minimax_text_encoder_cache_mode", "max_sequence_length", "device", "dtype", "negative_prompt"],
+      paramKeys: ["negative_prompt"],
+      paramsFromInput: ["prompt", "negative_prompt"],
+    },
+    minimax_ref2va_transformer_loader: {
+      label: "MiniMax H3 REF2VA transformer loader",
+      tool: "models.minimax_ref2va_transformer_loader",
+      help: "Loads/declares the active REF2VA transformer GGUF or safetensors model.",
+      assetKeys: ["gguf_path", "ref2va_gguf_path", "fl2va_gguf_path", "ref2va_safetensors_path"],
+      settingKeys: ["minimax_model_role", "minimax_conditioning_mode", "minimax_unet_loader", "minimax_gguf_dequant_dtype", "minimax_gguf_patch_dtype", "minimax_gguf_patch_on_device", "native_gguf_execution_mode", "native_lazy_quantized_packed_device", "native_transformer_offload", "device", "main_gpu", "gpu_selection_mode", "dtype"],
+      paramKeys: [],
+    },
+    minimax_ref2v_conditioning: {
+      label: "MiniMax H3 REF2V conditioning",
+      tool: "models.minimax_ref2v_conditioning",
+      help: "Represents the MiniMaxH3ReferenceToVideo conditioning node: prompt plus tagged references into video/audio latent conditioning.",
+      assetKeys: ["ref_image_1_path", "ref_image_2_path", "ref_video_1_path", "ref_audio_1_path"],
+      settingKeys: ["width", "height", "frames", "fps", "duration_seconds", "minimax_ref_image_size", "minimax_reference_conditioning_device", "minimax_reference_tags"],
+      paramKeys: ["ref_image_size", "reference_tags"],
+      paramsFromInput: ["prompt", "width", "height", "frames"],
+    },
+    minimax_sampler: {
+      label: "MiniMax H3 sampler",
+      tool: "models.minimax_sampler",
+      help: "MiniMax H3 sampling settings matching the Comfy SamplerCustomAdvanced path.",
+      assetKeys: ["gguf_path", "text_encoder_gguf_path"],
+      settingKeys: ["steps", "guidance_scale", "sampler_name", "scheduler", "seed", "minimax_shift_video", "minimax_shift_audio", "minimax_noise_seed_mode", "device", "dtype"],
+      paramKeys: ["steps", "guidance_scale", "sampler_name", "scheduler", "seed"],
+      paramsFromInput: ["steps", "guidance_scale", "seed"],
+    },
+    minimax_video_vae_decode: {
+      label: "MiniMax H3 video VAE decode",
+      tool: "models.minimax_video_vae_decode",
+      help: "Decodes the video half of MiniMax H3 packed latent using the video VAE. Low-resource workflows can expose GPU chunking and temporal-halo settings here.",
+      assetKeys: ["video_vae_path"],
+      settingKeys: ["minimax_video_vae_decode_mode", "minimax_video_vae_device", "minimax_vae_chunk_latent_frames", "minimax_vae_chunk_overlap_latent_frames", "minimax_vae_chunk_blend_frames", "minimax_vae_halo_core_latent_frames", "minimax_vae_halo_latent_frames", "minimax_vae_halo_max_window_latent_frames", "minimax_vae_tile_size", "minimax_vae_tile_overlap", "vae_dtype", "enable_model_cpu_offload", "enable_sequential_cpu_offload", "device", "dtype"],
+      paramKeys: ["vae_role"],
+    },
+    minimax_audio_vae_decode: {
+      label: "MiniMax H3 audio VAE decode",
+      tool: "models.minimax_audio_vae_decode",
+      help: "Decodes the audio half of MiniMax H3 packed latent using the audio VAE.",
+      assetKeys: ["audio_vae_path"],
+      settingKeys: ["minimax_enable_audio", "minimax_audio_vae_device", "audio_sample_rate", "vae_dtype", "device", "dtype"],
+      paramKeys: ["vae_role"],
+    },
+    minimax_rtx_upscale: {
+      label: "MiniMax H3 RTX video upscale",
+      tool: "models.minimax_rtx_upscale",
+      help: "Optional RTX video super-resolution/upscale stage from the Comfy workflow.",
+      assetKeys: [],
+      settingKeys: ["minimax_rtx_upscale_enabled", "minimax_rtx_upscale_mode", "minimax_rtx_upscale_multiplier", "minimax_rtx_upscale_quality"],
+      paramKeys: ["enabled", "scale", "quality"],
+    },
+    minimax_media_encode: {
+      label: "MiniMax H3 mux / MP4 output",
+      tool: "models.minimax_media_encode",
+      help: "Muxes decoded MiniMax video and audio into the final MP4.",
+      assetKeys: [],
+      settingKeys: ["fps", "target_fps", "video_codec", "audio_codec", "minimax_enable_audio", "output_ext"],
+      paramKeys: ["fps", "codec"],
+      paramsFromInput: ["fps", "prompt"],
+    },
+    hunyuan15_assets: {
+      label: "HunyuanVideo 1.5 assets",
+      tool: "models.hunyuan15_assets",
+      help: "Declares HunyuanVideo 1.5 GGUF, VAE, dual text encoders, optional LoRA/upscale, and source image assets.",
+      assetKeys: ["hunyuan_gguf_path", "gguf_path", "video_vae_path", "text_encoder_1_path", "text_encoder_2_path", "source_image_path", "hunyuan_fast_lora_path", "hunyuan_leapfusion_lora_path", "upscale_model_path"],
+      settingKeys: ["workflow_variant", "hunyuan_conditioning_mode", "width", "height", "frames", "fps"],
+      paramKeys: ["node_id"],
+      paramsFromInput: ["prompt", "source_image_path"],
+    },
+    hunyuan15_text_encoder: {
+      label: "Hunyuan dual text encoder",
+      tool: "models.hunyuan15_text_encoder",
+      help: "Loads the Hunyuan dual text encoders through Comfy DualCLIPLoader.",
+      assetKeys: ["text_encoder_1_path", "text_encoder_2_path", "clip_l_path", "llava_text_encoder_path", "qwen_text_encoder_path", "byt5_text_encoder_path"],
+      settingKeys: ["hunyuan_text_encoder_device", "hunyuan_text_encoder_cache_mode", "clip_type", "hunyuan_clip_type", "negative_prompt", "device", "dtype"],
+      paramKeys: ["node_id"],
+      paramsFromInput: ["prompt", "negative_prompt"],
+    },
+    hunyuan15_transformer_loader: {
+      label: "Hunyuan GGUF transformer loader",
+      tool: "models.hunyuan15_transformer_loader",
+      help: "Loads/declares the HunyuanVideo 1.5 T2V or I2V GGUF transformer.",
+      assetKeys: ["hunyuan_gguf_path", "gguf_path"],
+      settingKeys: ["hunyuan_unet_loader", "hunyuan_gguf_dequant_dtype", "hunyuan_gguf_patch_dtype", "hunyuan_gguf_patch_on_device", "native_gguf_execution_mode", "native_lazy_quantized_packed_device", "native_transformer_offload", "device", "main_gpu", "gpu_selection_mode", "dtype"],
+      paramKeys: ["node_id"],
+    },
+    hunyuan15_conditioning: {
+      label: "Hunyuan T2V/I2V conditioning",
+      tool: "models.hunyuan15_conditioning",
+      help: "Creates HunyuanVideo 1.5 empty T2V latent or I2V source-image conditioning.",
+      assetKeys: ["source_image_path", "reference_image_path", "image_path", "video_vae_path"],
+      settingKeys: ["hunyuan_conditioning_mode", "width", "height", "frames", "batch_size", "hunyuan_i2v_source_fit_mode", "hunyuan_i2v_source_encode_device", "device", "dtype"],
+      paramKeys: ["node_id"],
+      paramsFromInput: ["prompt", "source_image_path", "width", "height", "frames"],
+    },
+    hunyuan15_sampler: {
+      label: "Hunyuan sampler",
+      tool: "models.hunyuan15_sampler",
+      help: "Runs HunyuanVideo 1.5 sampling settings matching the Comfy sampler path.",
+      assetKeys: ["hunyuan_gguf_path", "hunyuan_fast_lora_path", "hunyuan_leapfusion_lora_path"],
+      settingKeys: ["steps", "guidance_scale", "sampler_name", "scheduler", "shift", "denoise", "seed", "hunyuan_apply_model_sampling_sd3", "device", "dtype"],
+      paramKeys: ["steps", "guidance_scale", "sampler_name", "scheduler", "seed"],
+      paramsFromInput: ["steps", "guidance_scale", "seed"],
+    },
+    hunyuan15_latent_upscale: {
+      label: "Hunyuan latent upscaler",
+      tool: "models.hunyuan15_latent_upscale",
+      help: "Optionally applies the official HunyuanVideo 1.5 latent upscaler before VAE decode.",
+      assetKeys: ["upscale_model_path", "latent_upscale_model_path"],
+      settingKeys: ["hunyuan_upscale_enabled", "hunyuan_upscale_width", "hunyuan_upscale_height", "hunyuan_upscale_method", "hunyuan_upscale_crop", "device", "dtype"],
+      paramKeys: ["node_id"],
+    },
+    hunyuan15_vae_decode: {
+      label: "Hunyuan video VAE decode",
+      tool: "models.hunyuan15_vae_decode",
+      help: "Decodes Hunyuan latents with full/tiled/temporal VAE controls.",
+      assetKeys: ["video_vae_path", "hunyuan_video_vae_path"],
+      settingKeys: ["hunyuan_vae_decode_mode", "hunyuan_video_vae_device", "hunyuan_vae_tile_size", "hunyuan_vae_tile_overlap", "hunyuan_vae_temporal_size", "hunyuan_vae_temporal_overlap", "vae_dtype", "enable_model_cpu_offload", "enable_sequential_cpu_offload", "device", "dtype"],
+      paramKeys: ["node_id"],
+    },
+    hunyuan15_media_encode: {
+      label: "Hunyuan MP4/video encode",
+      tool: "models.hunyuan15_media_encode",
+      help: "Executes the native Hunyuan graph and writes the final MP4.",
+      assetKeys: [],
+      settingKeys: ["fps", "target_fps", "video_codec", "output_ext"],
+      paramKeys: ["fps", "codec"],
+      paramsFromInput: ["fps", "prompt"],
+    },
+    hunyuan15_cleanup: {
+      label: "Hunyuan cleanup / unload",
+      tool: "models.hunyuan15_cleanup",
+      help: "Releases Hunyuan workflow handles, tensors, and accelerator caches.",
+      assetKeys: [],
+      settingKeys: ["release_workflow_object", "cleanup_xpu_cache", "cleanup_cuda_cache", "workflow_node_lifecycle_policy"],
+      paramKeys: ["targets"],
+    },
+    cleanup: {
+      label: "Cleanup / unload resources",
+      tool: "models.cleanup",
+      help: "Releases workflow handles, tensors, and cached model resources.",
+      assetKeys: [],
+      settingKeys: ["release_workflow_object", "cleanup_xpu_cache", "cleanup_cuda_cache", "workflow_node_lifecycle_policy"],
+      paramKeys: ["targets"],
+    },
+  };
+
+  const MODEL_TOOL_TO_NODE_TYPE = Object.fromEntries(
+    Object.entries(MODEL_NODE_DEFS).map(([key, def]) => [def.tool, key])
+  );
+  Object.assign(MODEL_TOOL_TO_NODE_TYPE, {
+    "models.ltx_prompt_encoder": "prompt_encoder",
+    "models.gguf_transformer_loader": "gguf_transformer_loader",
+    "models.ltx_asset_attach": "connector_lora_attach",
+    "models.ltx_graph_settings": "ltx_graph_settings",
+    "models.ltx_sampler": "sampler",
+    "models.video_vae_decode": "vae_decode",
+    "models.video_encode": "video_encode",
+    "models.diffusers_repo_prompt_encoder": "diffusers_repo_prompt_encoder",
+    "models.diffusers_repo_pipeline_loader": "diffusers_repo_pipeline_loader",
+    "models.diffusers_repo_sampler": "diffusers_repo_sampler",
+    "models.diffusers_repo_vae_decode": "diffusers_repo_vae_decode",
+    "models.diffusers_repo_media_encode": "diffusers_repo_media_encode",
+    "models.diffusers_repo_cleanup": "diffusers_repo_cleanup",
+    "models.wan22_optional_prompt": "wan_optional_prompt",
+    "models.wan22_prompt_encoder": "wan_prompt_encoder",
+    "models.wan22_i2v_source_prepare": "wan_source_prepare",
+    "models.wan22_i2v_source_vae_encode": "wan_source_vae_encode",
+    "models.wan22_i2v_conditioning_inject": "wan_i2v_conditioning",
+    "models.wan22_stage_transformer_loader": "wan_stage_transformer_loader",
+    "models.wan22_dual_transformer_loader": "wan_dual_transformer_loader",
+    "models.wan22_lora_attach": "wan_lora_attach",
+    "models.wan22_latent_video_init": "wan_latent_video_init",
+    "models.wan22_i2v_latent_init": "wan_i2v_latent_init",
+    "models.wan22_stage_sampler": "wan_stage_sampler",
+    "models.wan22_staged_sampler": "wan_staged_sampler",
+    "models.wan22_release_transformer": "wan_release_transformer",
+    "models.wan22_vae_decode": "wan_vae_decode",
+    "models.wan22_frame_interpolator": "wan_frame_interpolator",
+    "models.wan22_media_encode": "wan_media_encode",
+    "models.minimax_ref_inputs": "minimax_ref_inputs",
+    "models.minimax_text_encoder": "minimax_text_encoder",
+    "models.minimax_ref2va_transformer_loader": "minimax_ref2va_transformer_loader",
+    "models.minimax_ref2v_conditioning": "minimax_ref2v_conditioning",
+    "models.minimax_sampler": "minimax_sampler",
+    "models.minimax_video_vae_decode": "minimax_video_vae_decode",
+    "models.minimax_audio_vae_decode": "minimax_audio_vae_decode",
+    "models.minimax_rtx_upscale": "minimax_rtx_upscale",
+    "models.minimax_media_encode": "minimax_media_encode",
+    "models.hunyuan15_assets": "hunyuan15_assets",
+    "models.hunyuan15_text_encoder": "hunyuan15_text_encoder",
+    "models.hunyuan15_transformer_loader": "hunyuan15_transformer_loader",
+    "models.hunyuan15_conditioning": "hunyuan15_conditioning",
+    "models.hunyuan15_sampler": "hunyuan15_sampler",
+    "models.hunyuan15_latent_upscale": "hunyuan15_latent_upscale",
+    "models.hunyuan15_vae_decode": "hunyuan15_vae_decode",
+    "models.hunyuan15_media_encode": "hunyuan15_media_encode",
+    "models.hunyuan15_cleanup": "hunyuan15_cleanup",
+  });
+
+  function isModelToolNodeValues(values) {
+    const tool = String(values?.tool_config?.tool || "").trim();
+    return String(values?.node_type || "").trim().toLowerCase() === "tool_node" && tool.startsWith("models.");
+  }
+
+  function inferModelNodeType(values) {
+    const toolConfig = values?.tool_config && typeof values.tool_config === "object" ? values.tool_config : {};
+    const params = toolConfig.params && typeof toolConfig.params === "object" ? toolConfig.params : {};
+    const tool = String(toolConfig.tool || "").trim();
+    const toolMapped = MODEL_TOOL_TO_NODE_TYPE[tool] || "";
+    // Prefer exact tool mappings for model-family nodes. Older saved graphs can
+    // carry a stale generic model_node_type (for example "vae_decode") even
+    // though the bound tool is Wan-specific ("models.wan22_vae_decode").
+    if (toolMapped && /^(models\.(wan22|minimax|hunyuan15)_)/i.test(tool)) return toolMapped;
+    const explicit = String(
+      values?.model_node_type ||
+      values?.model_asset_type ||
+      toolConfig.model_node_type ||
+      toolConfig.model_asset_type ||
+      params.model_node_type ||
+      params.model_asset_type ||
+      ""
+    ).trim();
+    if (explicit && MODEL_NODE_DEFS[explicit]) return explicit;
+    return toolMapped || (tool.startsWith("models.") ? "asset_resolver" : "");
+  }
+
+  function modelNodeValueType(key, value) {
+    if (typeof value === "boolean") return "bool";
+    if (typeof value === "number") return Number.isInteger(value) ? "int" : "float";
+    if (["width", "height", "frames", "fps", "steps", "num_inference_steps", "main_gpu", "seed", "native_transformer_gpu_slots", "gemma_max_tokens", "ltx_chunk_feedforward_chunks", "ltx_chunk_feedforward_dim_threshold", "max_sequence_length", "duration_seconds", "audio_sample_rate", "minimax_rtx_upscale_multiplier", "minimax_ref1_width", "minimax_ref1_height", "minimax_ref2_width", "minimax_ref2_height", "minimax_vae_chunk_latent_frames", "minimax_vae_chunk_overlap_latent_frames", "minimax_vae_chunk_blend_frames", "minimax_vae_halo_core_latent_frames", "minimax_vae_halo_latent_frames", "minimax_vae_halo_max_window_latent_frames", "minimax_vae_tile_size", "minimax_vae_tile_overlap", "hunyuan_vae_tile_size", "hunyuan_vae_tile_overlap", "hunyuan_vae_temporal_size", "hunyuan_vae_temporal_overlap", "hunyuan_upscale_width", "hunyuan_upscale_height"].includes(key)) return "int";
+    if (["guidance_scale", "cfg_scale", "denoise", "shift", "ltx_stage1_cfg", "ltx_stage2_cfg", "ltx_distilled_lora_strength", "ltx_detailer_lora_strength", "native_stage1_latent_target_std", "minimax_shift_video", "minimax_shift_audio"].includes(key)) return "float";
+    if (["native_skip_lora", "skip_lora", "native_allow_lora_mismatch_fallback", "native_lora_partial_fuse", "native_force_stage2", "native_debug_skip_stage2", "native_normalize_stage1_latent", "native_require_asset_pairing", "allow_eager_gemma_gpu", "ltx_crop_guides_enabled", "enable_model_cpu_offload", "enable_sequential_cpu_offload", "ltx_video_only", "release_workflow_object", "cleanup_xpu_cache", "cleanup_cuda_cache", "use_unet", "low_cpu_mem_usage", "use_default_when_blank", "minimax_rtx_upscale_enabled", "minimax_enable_audio", "minimax_gguf_patch_on_device", "minimax_resize_references", "hunyuan_gguf_patch_on_device", "hunyuan_apply_model_sampling_sd3", "hunyuan_upscale_enabled"].includes(key)) return "bool";
+    if (["gemma_text_encoding_device"].includes(key)) return "select:cpu,gpu,main,cpu_after_encode";
+    if (["workflow_node_lifecycle_policy", "lifecycle"].includes(key)) return "select:lazy_unload,lazy_persist,preload_persist,persist,terminal";
+    if (["wan_i2v_source_encode_mode"].includes(key)) return "select:source_motion_burst,source_latent_hold,comfy_temporal_halo,comfy_exact,masked_start_only";
+    if (["wan_i2v_source_tail_mode"].includes(key)) return "select:blend_source_to_neutral,neutral";
+    if (["wan_i2v_resource_guard_action"].includes(key)) return "select:fallback_cpu,fail,warn";
+    if (["stage", "wan_noise_stage"].includes(key)) return "select:high_noise,low_noise";
+    if (["video_codec", "codec"].includes(key)) return "select:libx264,libx265,h264,h265,hevc,mpeg4";
+    if (["minimax_text_encoder_device", "minimax_video_vae_device", "minimax_audio_vae_device", "minimax_reference_conditioning_device"].includes(key)) return "select:auto,cpu,gpu";
+    if (["minimax_text_encoder_cache_mode"].includes(key)) return "select:off,cpu,gpu";
+    if (["minimax_video_vae_decode_mode"].includes(key)) return "select:cpu_full,gpu_full,gpu_chunked,gpu_temporal_halo";
+    if (["hunyuan_text_encoder_device", "hunyuan_video_vae_device", "hunyuan_i2v_source_encode_device"].includes(key)) return "select:auto,cpu,gpu";
+    if (["hunyuan_text_encoder_cache_mode"].includes(key)) return "select:off,cpu,gpu";
+    if (["hunyuan_vae_decode_mode"].includes(key)) return "select:cpu_full,gpu_full,gpu_chunked,gpu_temporal_halo";
+    if (["device"].includes(key)) return "select:auto,cpu,cuda,xpu,mps";
+    if (["dtype"].includes(key)) return "select:auto,float16,bfloat16,float32";
+    if (["native_transformer_offload"].includes(key)) return "select:none,cpu_slots,disk_cpu_slots";
+    if (["native_gguf_execution_mode"].includes(key)) return "select:lazy_quantized,eager_dequantized,comfy_gguf_lazy";
+    if (["native_lazy_quantized_packed_device"].includes(key)) return "select:gpu,cpu";
+    if (["workflow_loader_mode"].includes(key)) return "select:workflow_model_loader,built_in";
+    if (["workflow_execution_backend"].includes(key)) return "select:native_graph,external_runtime_template";
+    if (["backend"].includes(key)) return "select:diffusers";
+    if (["gpu_selection_mode"].includes(key)) return "select:auto,single";
+    if (["diffusers_pipeline_class"].includes(key)) return "select:DiffusionPipeline,AutoPipelineForText2Image,FluxPipeline,ZImagePipeline,StableDiffusionXLPipeline";
+    if (["diffusers_transformer_class"].includes(key)) return "select:,FluxTransformer2DModel,ZImageTransformer2DModel";
+    if (["model_deck_compat_manifest_id"].includes(key)) return "select:,flux_diffusers,zimage_diffusers,sdxl_lightning_diffusers";
+    if (["sdxl_timestep_spacing"].includes(key)) return "select:trailing,leading,linspace";
+    if (["sampler", "sampler_name"].includes(key)) return "select:gradient_estimation,euler,euler_ancestral,dpmpp_2m,dpmpp_sde,res_multistep";
+    if (["scheduler"].includes(key)) return "select:simple,linear_quadratic,beta,normal,karras,trailing";
+    if (["minimax_conditioning_mode"].includes(key)) return "select:ref2va,fl2va";
+    if (["minimax_unet_loader"].includes(key)) return "select:advanced,basic";
+    if (["minimax_gguf_dequant_dtype", "minimax_gguf_patch_dtype"].includes(key)) return "select:default,target,float32,float16,bfloat16";
+    if (["minimax_ref_image_size"].includes(key)) return "select:match,max";
+    if (["hunyuan_conditioning_mode"].includes(key)) return "select:t2v,i2v";
+    if (["hunyuan_unet_loader"].includes(key)) return "select:basic,advanced";
+    if (["hunyuan_gguf_dequant_dtype", "hunyuan_gguf_patch_dtype"].includes(key)) return "select:default,target,float32,float16,bfloat16";
+    if (["hunyuan_clip_type", "clip_type"].includes(key)) return "select:hunyuan_video_15,hunyuan_video";
+    if (["hunyuan_i2v_source_fit_mode"].includes(key)) return "select:center,contain,cover";
+    if (["hunyuan_upscale_method"].includes(key)) return "select:bilinear,bicubic,bislerp,area,nearest-exact";
+    if (["hunyuan_upscale_crop"].includes(key)) return "select:center,disabled";
+    if (["minimax_rtx_upscale_quality"].includes(key)) return "select:LOW,MEDIUM,HIGH,ULTRA";
+    if (["minimax_rtx_upscale_mode"].includes(key)) return "select:off,scale by multiplier,scale to size";
+    if (["output_ext"].includes(key)) return "select:png,jpg,jpeg,webp,mp4";
+    return "text";
+  }
+
+  function appendModelNodeField(parent, labelText, value, onRead, options = {}) {
+    const field = document.createElement("label");
+    field.className = "model-node-field";
+    const label = document.createElement("span");
+    label.textContent = labelText;
+    field.appendChild(label);
+    const valueType = options.type || modelNodeValueType(String(options.key || labelText), value);
+    let input;
+    if (valueType === "bool") {
+      input = document.createElement("input");
+      input.type = "checkbox";
+      input.checked = Boolean(value);
+      onRead(() => Boolean(input.checked));
+    } else if (valueType === "int" || valueType === "float") {
+      input = document.createElement("input");
+      input.type = "number";
+      input.step = valueType === "int" ? "1" : "any";
+      input.value = value ?? "";
+      onRead(() => {
+        const n = valueType === "int" ? parseInt(input.value, 10) : parseFloat(input.value);
+        return Number.isFinite(n) ? n : value;
+      });
+    } else if (String(valueType).startsWith("select:")) {
+      input = document.createElement("select");
+      String(valueType).slice("select:".length).split(",").forEach((opt) => {
+        const o = document.createElement("option");
+        o.value = opt;
+        o.textContent = opt;
+        input.appendChild(o);
+      });
+      input.value = String(value ?? "");
+      onRead(() => input.value);
+    } else if (String(value ?? "").length > 120 || String(options.key || "").includes("prompt")) {
+      input = document.createElement("textarea");
+      input.rows = 3;
+      input.value = String(value ?? "");
+      onRead(() => input.value);
+    } else {
+      input = document.createElement("input");
+      input.type = "text";
+      input.value = String(value ?? "");
+      onRead(() => input.value);
+    }
+    if (options.help) input.title = String(options.help);
+    field.appendChild(input);
+    parent.appendChild(field);
+    return input;
+  }
+
+  function buildModelNodeSettingsEditor(mergedValues) {
+    const values = mergedValues && typeof mergedValues === "object" ? JSON.parse(JSON.stringify(mergedValues)) : {};
+    const toolConfig = values.tool_config && typeof values.tool_config === "object" ? values.tool_config : {};
+    const params = toolConfig.params && typeof toolConfig.params === "object" ? toolConfig.params : {};
+    const settings = params.settings && typeof params.settings === "object" ? params.settings : {};
+    const assets = params.assets && typeof params.assets === "object" ? params.assets : {};
+    let nodeType = inferModelNodeType(values);
+    let def = MODEL_NODE_DEFS[nodeType] || MODEL_NODE_DEFS.asset_resolver;
+    const readers = [];
+
+    const wrap = document.createElement("div");
+    wrap.className = "model-node-editor";
+    const intro = document.createElement("div");
+    intro.className = "muted";
+    intro.textContent = "Typed model node: only this node's relevant assets/settings are shown. Advanced raw JSON is still available below.";
+    wrap.appendChild(intro);
+    const adapterInfo = document.createElement("div");
+    adapterInfo.className = "muted";
+    adapterInfo.style.fontSize = "12px";
+    adapterInfo.style.marginTop = "4px";
+    const boundToolForAdapter = String(toolConfig.tool || "").trim();
+    const adapter = findModelAdapterForTool(boundToolForAdapter, values);
+    if (adapter && typeof adapter === "object") {
+      const adapterName = String(adapter.name || adapter.id || "Model adapter").trim();
+      const adapterId = String(adapter.id || "").trim();
+      const skills = adapter.skills && typeof adapter.skills === "object" ? adapter.skills : {};
+      const stageNames = Object.keys(skills).slice(0, 8);
+      adapterInfo.textContent = `${adapterName}${adapterId ? ` (${adapterId})` : ""} capability provider. This workflow node calls ${boundToolForAdapter}; the adapter does not auto-load workflows.`;
+      if (stageNames.length) adapterInfo.title = `Declared adapter stages: ${stageNames.join(", ")}${Object.keys(skills).length > stageNames.length ? ", ..." : ""}`;
+    } else if (boundToolForAdapter.startsWith("models.")) {
+      adapterInfo.textContent = `This workflow node calls ${boundToolForAdapter}. No adapter manifest matched it yet, so it uses the built-in/static model node definition.`;
+    }
+    if (adapterInfo.textContent) wrap.appendChild(adapterInfo);
+
+    const actionSection = document.createElement("div");
+    actionSection.className = "model-node-section";
+    const actionTitle = document.createElement("div");
+    actionTitle.className = "model-node-section-title";
+    actionTitle.textContent = "Node actions";
+    actionSection.appendChild(actionTitle);
+    const actionRow = document.createElement("div");
+    actionRow.className = "button-row";
+    const btnPrecache = document.createElement("button");
+    btnPrecache.type = "button";
+    btnPrecache.className = "secondary";
+    btnPrecache.textContent = "Pre-run / warm prompt encoder";
+    btnPrecache.title = "Warm the workflow prompt encoder cache with saved workflow inputs. This is reusable across runs with different source images.";
+    const btnClearCache = document.createElement("button");
+    btnClearCache.type = "button";
+    btnClearCache.className = "secondary";
+    btnClearCache.textContent = "Stop / clear model cache";
+    btnClearCache.title = "Clear cached prompt encoder/model workflow resources.";
+    const actionStatus = document.createElement("div");
+    actionStatus.className = "muted";
+    actionStatus.style.fontSize = "12px";
+    actionStatus.textContent = "Use this for cacheable prompt encoder nodes such as Wan or Hunyuan text encoders.";
+    actionRow.appendChild(btnPrecache);
+    actionRow.appendChild(btnClearCache);
+    actionSection.appendChild(actionRow);
+    actionSection.appendChild(actionStatus);
+    wrap.appendChild(actionSection);
+
+    async function runModelNodeAction(actionName) {
+      const pid = String(ctx?.state?.ui?.activePid || "default").trim() || "default";
+      const sid = String(ctx?.state?.ui?.activeSid || "").trim();
+      if (!sid) {
+        actionStatus.textContent = "No active session is selected.";
+        return;
+      }
+      const afSettings = getAgentFlowSettings(ctx, sid) || {};
+      const flowName = String(afSettings.agent_flow_active_flow || bottomBarButton?.dataset?.activeFlow || "").trim();
+      if (!flowName) {
+        actionStatus.textContent = "No active workflow is selected.";
+        return;
+      }
+      if (!selectedNodeId) {
+        actionStatus.textContent = "No workflow node is selected.";
+        return;
+      }
+      let collected = values;
+      try {
+        if (typeof wrap._agentFlowCollectValue === "function") collected = wrap._agentFlowCollectValue();
+      } catch (_err) {}
+      const collectedToolConfig = collected?.tool_config && typeof collected.tool_config === "object" ? collected.tool_config : {};
+      const collectedParams = collectedToolConfig.params && typeof collectedToolConfig.params === "object" ? collectedToolConfig.params : {};
+      const previousText = actionStatus.textContent;
+      const isClear = String(actionName || "").toLowerCase().includes("clear") || String(actionName || "").toLowerCase().includes("stop");
+      const targetBtn = isClear ? btnClearCache : btnPrecache;
+      targetBtn.disabled = true;
+      actionStatus.textContent = isClear ? "Clearing model workflow cache..." : "Warming workflow prompt encoder cache...";
+      try {
+        const body = {
+          action: actionName,
+          flow_name: flowName,
+          params: collectedParams,
+        };
+        if (String(actionName || "").toLowerCase() !== "warm_prompt_encoder") {
+          body.node_id = selectedNodeId;
+        }
+        const res = await ctx.apiJson(`/v1/projects/${encodeURIComponent(pid)}/sessions/${encodeURIComponent(sid)}/agent_flow/node_action`, {
+          method: "POST",
+          body,
+        });
+        const result = res?.result || {};
+        const nested = result?.result || result;
+        const source = nested?.source_conditioning || nested?.data?.source_conditioning || {};
+        const reason = nested?.reason || result?.reason || nested?.error || res?.error || "";
+        if (source && typeof source === "object" && (source.status || source.cache_mode)) {
+          actionStatus.textContent = `Source conditioning ${source.status || "cached"} (${source.cache_mode || "cache"}).`;
+        } else if (nested?.prompt_context || nested?.data?.prompt_context) {
+          const promptCtx = nested.prompt_context || nested.data.prompt_context || {};
+          actionStatus.textContent = `Prompt encoder ${promptCtx.status || "warmed"}.`;
+        } else if (result?.removed_count !== undefined || nested?.removed_count !== undefined) {
+          actionStatus.textContent = `Cleared ${Number(result.removed_count ?? nested.removed_count ?? 0)} cached source-conditioning resource(s).`;
+        } else {
+          actionStatus.textContent = reason ? String(reason) : "Node action completed.";
+        }
+      } catch (err) {
+        actionStatus.textContent = `Node action failed: ${err?.message || err}`;
+      } finally {
+        targetBtn.disabled = false;
+        if (!actionStatus.textContent) actionStatus.textContent = previousText;
+      }
+    }
+
+    btnPrecache.addEventListener("click", (event) => {
+      event.preventDefault();
+      void runModelNodeAction("warm_prompt_encoder");
+    });
+    btnClearCache.addEventListener("click", (event) => {
+      event.preventDefault();
+      void runModelNodeAction("clear_model_workflow_cache");
+    });
+
+    const typeSection = document.createElement("div");
+    typeSection.className = "model-node-section";
+    const typeTitle = document.createElement("div");
+    typeTitle.className = "model-node-section-title";
+    typeTitle.textContent = "Model node type";
+    typeSection.appendChild(typeTitle);
+    const typeGrid = document.createElement("div");
+    typeGrid.className = "model-node-grid";
+    const typeLabel = document.createElement("label");
+    typeLabel.className = "model-node-field";
+    const typeSpan = document.createElement("span");
+    typeSpan.textContent = "Asset / stage type";
+    const typeSelect = document.createElement("select");
+    Object.entries(MODEL_NODE_DEFS).forEach(([key, row]) => {
+      const opt = document.createElement("option");
+      opt.value = key;
+      opt.textContent = row.label;
+      typeSelect.appendChild(opt);
+    });
+    typeSelect.value = nodeType;
+    typeLabel.appendChild(typeSpan);
+    typeLabel.appendChild(typeSelect);
+    const help = document.createElement("div");
+    help.className = "muted";
+    help.style.fontSize = "12px";
+    help.textContent = def.help || "";
+    typeGrid.appendChild(typeLabel);
+    typeSection.appendChild(typeGrid);
+    typeSection.appendChild(help);
+    wrap.appendChild(typeSection);
+
+    const assetSection = document.createElement("div");
+    assetSection.className = "model-node-section";
+    const assetTitle = document.createElement("div");
+    assetTitle.className = "model-node-section-title";
+    assetTitle.textContent = "Assets for this node";
+    assetSection.appendChild(assetTitle);
+    const assetGrid = document.createElement("div");
+    assetGrid.className = "model-node-grid";
+    assetSection.appendChild(assetGrid);
+    wrap.appendChild(assetSection);
+
+    const settingSection = document.createElement("div");
+    settingSection.className = "model-node-section";
+    const settingTitle = document.createElement("div");
+    settingTitle.className = "model-node-section-title";
+    settingTitle.textContent = "Node settings";
+    settingSection.appendChild(settingTitle);
+    const settingGrid = document.createElement("div");
+    settingGrid.className = "model-node-grid";
+    settingSection.appendChild(settingGrid);
+    wrap.appendChild(settingSection);
+
+    const paramSection = document.createElement("div");
+    paramSection.className = "model-node-section";
+    const paramTitle = document.createElement("div");
+    paramTitle.className = "model-node-section-title";
+    paramTitle.textContent = "Runtime params / inputs";
+    paramSection.appendChild(paramTitle);
+    const paramGrid = document.createElement("div");
+    paramGrid.className = "model-node-grid";
+    paramSection.appendChild(paramGrid);
+    wrap.appendChild(paramSection);
+
+    const advanced = document.createElement("details");
+    advanced.className = "model-node-section model-node-advanced";
+    const advSummary = document.createElement("summary");
+    advSummary.textContent = "Advanced raw tool_config JSON";
+    advanced.appendChild(advSummary);
+    const raw = document.createElement("textarea");
+    raw.rows = 12;
+    raw.spellcheck = false;
+    raw.style.fontFamily = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
+    raw.style.fontSize = "11px";
+    raw.value = JSON.stringify(toolConfig, null, 2);
+    advanced.appendChild(raw);
+    const rawBtn = document.createElement("button");
+    rawBtn.type = "button";
+    rawBtn.className = "secondary";
+    rawBtn.textContent = "Open parsed editor";
+    rawBtn.addEventListener("click", (event) => {
+      event.preventDefault();
+      openJsonFormEditor({ title: "Edit model node raw tool_config", textarea: raw });
+    });
+    advanced.appendChild(rawBtn);
+    wrap.appendChild(advanced);
+
+    function addScopedFields() {
+      readers.length = 0;
+      assetGrid.innerHTML = "";
+      settingGrid.innerHTML = "";
+      paramGrid.innerHTML = "";
+      nodeType = String(typeSelect.value || nodeType || "asset_resolver");
+      def = MODEL_NODE_DEFS[nodeType] || MODEL_NODE_DEFS.asset_resolver;
+      help.textContent = def.help || "";
+      const scopedAssets = {};
+      const scopedSettings = {};
+      const scopedParams = {};
+      (def.assetKeys || []).forEach((key) => {
+        scopedAssets[key] = assets[key] ?? settings[key] ?? "";
+        appendModelNodeField(assetGrid, key, scopedAssets[key], (reader) => readers.push(() => { scopedAssets[key] = reader(); }), { key });
+      });
+      if (!(def.assetKeys || []).length) {
+        const empty = document.createElement("div");
+        empty.className = "muted";
+        empty.textContent = "No file assets needed for this node.";
+        assetGrid.appendChild(empty);
+      }
+      (def.settingKeys || []).forEach((key) => {
+        scopedSettings[key] = settings[key] ?? params[key] ?? "";
+        appendModelNodeField(settingGrid, key, scopedSettings[key], (reader) => readers.push(() => { scopedSettings[key] = reader(); }), { key });
+      });
+      (def.paramKeys || []).forEach((key) => {
+        scopedParams[key] = params[key] ?? settings[key] ?? "";
+        appendModelNodeField(paramGrid, key, scopedParams[key], (reader) => readers.push(() => { scopedParams[key] = reader(); }), { key });
+      });
+      appendModelNodeField(paramGrid, "params_from_input", def.paramsFromInput || toolConfig.params_from_input || [], (reader) => readers.push(() => {
+        const rawValue = reader();
+        scopedParams.__params_from_input = Array.isArray(rawValue)
+          ? rawValue
+          : String(rawValue || "").split(",").map((item) => item.trim()).filter(Boolean);
+      }), { key: "params_from_input", type: "text", help: "Comma-separated request/runtime keys copied into this node." });
+      wrap._modelNodeScoped = { scopedAssets, scopedSettings, scopedParams };
+    }
+
+    typeSelect.addEventListener("change", addScopedFields);
+    addScopedFields();
+
+    wrap._agentFlowCollectValue = () => {
+      readers.forEach((reader) => {
+        try { reader(); } catch (_err) {}
+      });
+      let rawToolConfig = {};
+      try {
+        rawToolConfig = JSON.parse(String(raw.value || "{}"));
+      } catch (_err) {
+        rawToolConfig = toolConfig && typeof toolConfig === "object" ? JSON.parse(JSON.stringify(toolConfig)) : {};
+      }
+      const selectedType = String(typeSelect.value || nodeType || "asset_resolver");
+      const selectedDef = MODEL_NODE_DEFS[selectedType] || MODEL_NODE_DEFS.asset_resolver;
+      const scoped = wrap._modelNodeScoped || {};
+      const nextParams = rawToolConfig.params && typeof rawToolConfig.params === "object" ? rawToolConfig.params : {};
+      const nextAssets = nextParams.assets && typeof nextParams.assets === "object" ? nextParams.assets : {};
+      const nextSettings = nextParams.settings && typeof nextParams.settings === "object" ? nextParams.settings : {};
+      Object.entries(scoped.scopedAssets || {}).forEach(([key, value]) => {
+        if (value !== undefined && value !== null && value !== "") {
+          nextAssets[key] = value;
+          nextSettings[key] = value;
+        }
+      });
+      Object.entries(scoped.scopedSettings || {}).forEach(([key, value]) => {
+        if (value !== undefined && value !== null && value !== "") nextSettings[key] = value;
+      });
+      Object.entries(scoped.scopedParams || {}).forEach(([key, value]) => {
+        if (key === "__params_from_input") return;
+        if (value !== undefined && value !== null && value !== "") nextParams[key] = value;
+      });
+      nextParams.assets = nextAssets;
+      nextParams.settings = nextSettings;
+      const existingAssetKeys = Array.isArray(nextParams.asset_keys) ? nextParams.asset_keys.map((item) => String(item || "").trim()).filter(Boolean) : [];
+      const mergedAssetKeys = [];
+      const seenAssetKeys = new Set();
+      [...existingAssetKeys, ...(selectedDef.assetKeys || [])].forEach((key) => {
+        if (!key || seenAssetKeys.has(key)) return;
+        seenAssetKeys.add(key);
+        mergedAssetKeys.push(key);
+      });
+      if (mergedAssetKeys.length) nextParams.asset_keys = mergedAssetKeys;
+      rawToolConfig.tool = selectedDef.tool;
+      rawToolConfig.params = nextParams;
+      rawToolConfig.params_from_input = Array.isArray(scoped.scopedParams?.__params_from_input)
+        ? scoped.scopedParams.__params_from_input
+        : (selectedDef.paramsFromInput || rawToolConfig.params_from_input || []);
+      const selectedSkills = normalizeSkillArray(values.action_skills);
+      if (!selectedSkills.includes(selectedDef.tool)) selectedSkills.unshift(selectedDef.tool);
+      return {
+        ...values,
+        node_type: "tool_node",
+        role: values.role || "Model workflow node",
+        model_node_type: selectedType,
+        model_asset_type: selectedType,
+        action_skills: selectedSkills,
+        tool_config: rawToolConfig,
+      };
+    };
+    return wrap;
+  }
+
+  function coerceJsonFormValue(rawValue, previousValue) {
+    if (previousValue === true || previousValue === false) return Boolean(rawValue);
+    if (typeof previousValue === "number") {
+      const n = Number(rawValue);
+      return Number.isFinite(n) ? n : previousValue;
+    }
+    if (Array.isArray(previousValue)) {
+      if (Array.isArray(rawValue)) return rawValue;
+      return String(rawValue || "")
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+    }
+    if (previousValue && typeof previousValue === "object") return rawValue && typeof rawValue === "object" ? rawValue : previousValue;
+    return String(rawValue ?? "");
+  }
+
+  function appendJsonFormField(parent, labelText, value, onRead) {
+    const field = document.createElement("label");
+    field.className = "json-form-field";
+    const label = document.createElement("span");
+    label.textContent = labelText;
+    field.appendChild(label);
+    let input;
+    if (value === true || value === false) {
+      input = document.createElement("input");
+      input.type = "checkbox";
+      input.checked = Boolean(value);
+      onRead(() => Boolean(input.checked));
+    } else if (typeof value === "number") {
+      input = document.createElement("input");
+      input.type = "number";
+      input.step = Number.isInteger(value) ? "1" : "any";
+      input.value = String(value);
+      onRead(() => coerceJsonFormValue(input.value, value));
+    } else if (Array.isArray(value)) {
+      input = document.createElement("input");
+      input.type = "text";
+      input.value = value.map((v) => String(v ?? "")).join(", ");
+      onRead(() => coerceJsonFormValue(input.value, value));
+    } else if (value && typeof value === "object") {
+      input = document.createElement("textarea");
+      input.rows = 5;
+      input.spellcheck = false;
+      input.style.fontFamily = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
+      input.value = JSON.stringify(value, null, 2);
+      onRead(() => {
+        try {
+          const parsed = JSON.parse(String(input.value || "{}"));
+          return parsed && typeof parsed === "object" ? parsed : value;
+        } catch (_err) {
+          return value;
+        }
+      });
+    } else {
+      input = document.createElement("input");
+      input.type = "text";
+      input.value = String(value ?? "");
+      onRead(() => input.value);
+    }
+    field.appendChild(input);
+    parent.appendChild(field);
+  }
+
+  function openJsonFormEditor({ title, textarea, onSave } = {}) {
+    if (!(textarea instanceof HTMLTextAreaElement)) return;
+    const original = parseJsonEditorValue(textarea);
+    const draft = JSON.parse(JSON.stringify(original || {}));
+    const readers = [];
+
+    const overlay = document.createElement("div");
+    overlay.className = "agent-flow-json-form-popover";
+    const head = document.createElement("div");
+    head.className = "json-form-head";
+    const heading = document.createElement("div");
+    heading.className = "json-form-title";
+    heading.textContent = String(title || "Edit JSON");
+    const closeBtn = document.createElement("button");
+    closeBtn.type = "button";
+    closeBtn.className = "secondary";
+    closeBtn.textContent = "Close";
+    head.appendChild(heading);
+    head.appendChild(closeBtn);
+
+    const body = document.createElement("div");
+    body.className = "json-form-body";
+
+    const addSection = (sectionTitle) => {
+      const section = document.createElement("div");
+      section.className = "json-form-section";
+      const st = document.createElement("div");
+      st.className = "json-form-section-title";
+      st.textContent = sectionTitle;
+      section.appendChild(st);
+      body.appendChild(section);
+      return section;
+    };
+
+    const rootSection = addSection("Tool binding");
+    ["tool"].forEach((key) => {
+      appendJsonFormField(rootSection, key, draft[key] ?? "", (reader) => readers.push(() => { draft[key] = reader(); }));
+    });
+    appendJsonFormField(rootSection, "params_from_input", draft.params_from_input ?? [], (reader) => readers.push(() => { draft.params_from_input = reader(); }));
+
+    const params = draft.params && typeof draft.params === "object" && !Array.isArray(draft.params) ? draft.params : {};
+    draft.params = params;
+    const simpleParamsSection = addSection("Node params");
+    Object.keys(params).sort().forEach((key) => {
+      if (key === "assets" || key === "settings") return;
+      appendJsonFormField(simpleParamsSection, `params.${key}`, params[key], (reader) => readers.push(() => { params[key] = reader(); }));
+    });
+
+    const assets = params.assets && typeof params.assets === "object" && !Array.isArray(params.assets) ? params.assets : {};
+    params.assets = assets;
+    const assetsSection = addSection("Assets / paths");
+    Object.keys(assets).sort().forEach((key) => {
+      appendJsonFormField(assetsSection, `assets.${key}`, assets[key], (reader) => readers.push(() => { assets[key] = reader(); }));
+    });
+
+    const settings = params.settings && typeof params.settings === "object" && !Array.isArray(params.settings) ? params.settings : {};
+    params.settings = settings;
+    const settingsSection = addSection("Settings / runtime");
+    Object.keys(settings).sort().forEach((key) => {
+      appendJsonFormField(settingsSection, `settings.${key}`, settings[key], (reader) => readers.push(() => { settings[key] = reader(); }));
+    });
+
+    const actions = document.createElement("div");
+    actions.className = "json-form-actions";
+    const cancelBtn = document.createElement("button");
+    cancelBtn.type = "button";
+    cancelBtn.className = "secondary";
+    cancelBtn.textContent = "Cancel";
+    const saveBtn = document.createElement("button");
+    saveBtn.type = "button";
+    saveBtn.textContent = "Save to JSON";
+    actions.appendChild(cancelBtn);
+    actions.appendChild(saveBtn);
+
+    const close = () => overlay.remove();
+    closeBtn.addEventListener("click", close);
+    cancelBtn.addEventListener("click", close);
+    saveBtn.addEventListener("click", () => {
+      readers.forEach((reader) => {
+        try { reader(); } catch (_err) {}
+      });
+      textarea.value = JSON.stringify(draft, null, 2);
+      if (typeof onSave === "function") onSave(draft);
+      close();
+    });
+
+    overlay.appendChild(head);
+    overlay.appendChild(body);
+    overlay.appendChild(actions);
+    document.body.appendChild(overlay);
+  }
+
   function buildPluginSettingsForm(schema, values) {
     pluginSettingsBox.innerHTML = "";
     pluginSettingsInputs = [];
     const defaults = schemaDefaults(schema);
     const merged = { ...defaults, ...(values || {}) };
+    if (isModelToolNodeValues(merged)) {
+      const editor = buildModelNodeSettingsEditor(merged);
+      pluginSettingsBox.appendChild(editor);
+      pluginSettingsInputs.push({ key: "__model_node_editor", type: "custom", input: editor, wrapper: editor, field: { key: "__model_node_editor" } });
+      return;
+    }
     if (!schema || !schema.length) {
       const empty = document.createElement("div");
       empty.className = "muted";
@@ -5393,13 +6709,41 @@ function renderPanel(container, ctx) {
             input.appendChild(row);
           });
         }
+      } else if (type === "json" || type === "object" || type === "array") {
+        input = document.createElement("textarea");
+        input.rows = key === "tool_config" ? 14 : 8;
+        input.spellcheck = false;
+        input.style.fontFamily = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
+        input.style.fontSize = "11px";
+        input.value = value === undefined || value === null || value === ""
+          ? ""
+          : JSON.stringify(value, null, 2);
       } else {
         input = document.createElement("input");
         input.type = "text";
-        input.value = value ?? "";
+        input.value = value && typeof value === "object" ? JSON.stringify(value, null, 2) : value ?? "";
       }
       if (help) input.title = help;
       contentHost.appendChild(input);
+      if (key === "tool_config" && input instanceof HTMLTextAreaElement) {
+        const editBtn = document.createElement("button");
+        editBtn.type = "button";
+        editBtn.className = "secondary";
+        editBtn.textContent = "Open parsed editor";
+        editBtn.style.alignSelf = "flex-start";
+        editBtn.addEventListener("click", (event) => {
+          event.preventDefault();
+          openJsonFormEditor({
+            title: "Edit tool params",
+            textarea: input,
+            onSave: () => {
+              input.dispatchEvent(new Event("input", { bubbles: true }));
+              input.dispatchEvent(new Event("change", { bubbles: true }));
+            },
+          });
+        });
+        contentHost.appendChild(editBtn);
+      }
       pluginSettingsBox.appendChild(wrapper);
       pluginSettingsInputs.push({ key, type, input, wrapper, field });
     });
@@ -5416,6 +6760,15 @@ function renderPanel(container, ctx) {
       if (type === "multiselect" || type === "multi_select" || type === "enum_multi") {
         const checks = Array.from(input.querySelectorAll("input[type='checkbox']"));
         return checks.filter((c) => c.checked).map((c) => String(c.value || "").trim()).filter(Boolean);
+      }
+      if (type === "json" || type === "object" || type === "array") {
+        const text = String(input.value || "").trim();
+        if (!text) return type === "array" ? [] : {};
+        try {
+          return JSON.parse(text);
+        } catch (_err) {
+          return text;
+        }
       }
       return input.value;
     };
@@ -5965,6 +7318,15 @@ function renderPanel(container, ctx) {
     if (!Array.isArray(schema)) return [];
     if (String(pluginId || "").trim() === "agent_workflow_member") {
       schema = mergeAgentFlowSkillSchema(schema);
+      if (!schema.some((field) => String(field?.key || "").trim() === "tool_config")) {
+        schema.push({
+          key: "tool_config",
+          label: "Tool params JSON",
+          type: "json",
+          default: {},
+          help: "For tool nodes, this controls the exact bound skill and node-specific params/assets/settings passed to that skill.",
+        });
+      }
       return schema.filter((field) => {
         const key = String(field?.key || "").trim();
         return !key.startsWith("agent_workflow_member_");
@@ -6751,6 +8113,14 @@ function renderPanel(container, ctx) {
       obj = obj.agent_flow_settings;
     }
 
+    const metadata = obj.metadata && typeof obj.metadata === "object" ? obj.metadata : {};
+    const bundleManifest = metadata.bundle_manifest && typeof metadata.bundle_manifest === "object"
+      ? metadata.bundle_manifest
+      : {};
+    const manifestSettings = bundleManifest.agent_flow_settings && typeof bundleManifest.agent_flow_settings === "object"
+      ? bundleManifest.agent_flow_settings
+      : {};
+
     const flows =
       obj.flows && typeof obj.flows === "object"
         ? obj.flows
@@ -6773,20 +8143,24 @@ function renderPanel(container, ctx) {
 
     return {
       flows,
-      default_flow: String(obj.default_flow || obj.agent_flow_default_flow || Object.keys(flows)[0] || "").trim(),
-      active_flow: String(obj.active_flow || obj.agent_flow_active_flow || obj.default_flow || obj.agent_flow_default_flow || Object.keys(flows)[0] || "").trim(),
-      mode: String(obj.mode || obj.agent_flow_mode || "execute").trim(),
-      max_steps: Number(obj.max_steps || obj.agent_flow_max_steps || 32),
-      loop_max_passes: normalizeLoopMaxSetting(obj.loop_max_passes ?? obj.agent_flow_loop_max_passes, 16),
-      force_loop_max_passes: normalizeBoolSetting(obj.force_loop_max_passes ?? obj.agent_flow_force_loop_max_passes, false),
-      request_timeout_s: normalizeTimeoutSetting(obj.request_timeout_s ?? obj.agent_flow_request_timeout_s, 45),
-      autobuild_sandbox_profile: normalizeSandboxProfileSetting(obj.autobuild_sandbox_profile ?? obj.agent_flow_autobuild_sandbox_profile, "lightweight"),
-      autobuild_lightweight_max_requests: Math.max(1, Math.trunc(Number(obj.autobuild_lightweight_max_requests ?? obj.agent_flow_autobuild_lightweight_max_requests ?? 1) || 1)),
-      autobuild_lightweight_wait_s: normalizeTimeoutSetting(obj.autobuild_lightweight_wait_s ?? obj.agent_flow_autobuild_lightweight_wait_s, 120),
-      autobuild_lightweight_final_grace_s: normalizeTimeoutSetting(obj.autobuild_lightweight_final_grace_s ?? obj.agent_flow_autobuild_lightweight_final_grace_s, 10),
-      autobuild_independent_max_requests: Math.max(1, Math.trunc(Number(obj.autobuild_independent_max_requests ?? obj.agent_flow_autobuild_independent_max_requests ?? 3) || 3)),
-      autobuild_independent_wait_s: normalizeTimeoutSetting(obj.autobuild_independent_wait_s ?? obj.agent_flow_autobuild_independent_wait_s, 180),
-      autobuild_independent_final_grace_s: normalizeTimeoutSetting(obj.autobuild_independent_final_grace_s ?? obj.agent_flow_autobuild_independent_final_grace_s, 20),
+      flow_ids_by_name: normalizeFlowIdMap(obj.flow_ids_by_name || obj.agent_flow_flow_ids_by_name || {}),
+      default_flow_ids_by_name: normalizeFlowIdMap(obj.default_flow_ids_by_name || obj.agent_flow_default_flow_ids_by_name || {}),
+      root_flow: String(obj.root_flow || manifestSettings.root_flow || "").trim(),
+      exported_workflow_id: String(obj.exported_workflow_id || manifestSettings.exported_workflow_id || "").trim(),
+      default_flow: String(obj.default_flow || manifestSettings.default_flow || obj.agent_flow_default_flow || Object.keys(flows)[0] || "").trim(),
+      active_flow: String(obj.active_flow || manifestSettings.active_flow || obj.agent_flow_active_flow || obj.default_flow || manifestSettings.default_flow || obj.agent_flow_default_flow || Object.keys(flows)[0] || "").trim(),
+      mode: String(obj.mode || manifestSettings.mode || obj.agent_flow_mode || "execute").trim(),
+      max_steps: Number(obj.max_steps || manifestSettings.max_steps || obj.agent_flow_max_steps || 32),
+      loop_max_passes: normalizeLoopMaxSetting(obj.loop_max_passes ?? manifestSettings.loop_max_passes ?? obj.agent_flow_loop_max_passes, 16),
+      force_loop_max_passes: normalizeBoolSetting(obj.force_loop_max_passes ?? manifestSettings.force_loop_max_passes ?? obj.agent_flow_force_loop_max_passes, false),
+      request_timeout_s: normalizeTimeoutSetting(obj.request_timeout_s ?? manifestSettings.request_timeout_s ?? obj.agent_flow_request_timeout_s, 45),
+      autobuild_sandbox_profile: normalizeSandboxProfileSetting(obj.autobuild_sandbox_profile ?? manifestSettings.autobuild_sandbox_profile ?? obj.agent_flow_autobuild_sandbox_profile, "lightweight"),
+      autobuild_lightweight_max_requests: Math.max(1, Math.trunc(Number(obj.autobuild_lightweight_max_requests ?? manifestSettings.autobuild_lightweight_max_requests ?? obj.agent_flow_autobuild_lightweight_max_requests ?? 1) || 1)),
+      autobuild_lightweight_wait_s: normalizeTimeoutSetting(obj.autobuild_lightweight_wait_s ?? manifestSettings.autobuild_lightweight_wait_s ?? obj.agent_flow_autobuild_lightweight_wait_s, 120),
+      autobuild_lightweight_final_grace_s: normalizeTimeoutSetting(obj.autobuild_lightweight_final_grace_s ?? manifestSettings.autobuild_lightweight_final_grace_s ?? obj.agent_flow_autobuild_lightweight_final_grace_s, 10),
+      autobuild_independent_max_requests: Math.max(1, Math.trunc(Number(obj.autobuild_independent_max_requests ?? manifestSettings.autobuild_independent_max_requests ?? obj.agent_flow_autobuild_independent_max_requests ?? 3) || 3)),
+      autobuild_independent_wait_s: normalizeTimeoutSetting(obj.autobuild_independent_wait_s ?? manifestSettings.autobuild_independent_wait_s ?? obj.agent_flow_autobuild_independent_wait_s, 180),
+      autobuild_independent_final_grace_s: normalizeTimeoutSetting(obj.autobuild_independent_final_grace_s ?? manifestSettings.autobuild_independent_final_grace_s ?? obj.agent_flow_autobuild_independent_final_grace_s, 20),
       metadata: obj.metadata || {},
     };
 }
@@ -6824,6 +8198,18 @@ function renderPanel(container, ctx) {
       ? res.agent_flow_settings
       : {};
     const importedFlowIds = normalizeFlowIdMap(res?.flow_ids_by_name);
+    const payloadFlowIds = normalizeFlowIdMap(importPayload.flow_ids_by_name);
+    const payloadDefaultFlowIds = normalizeFlowIdMap(importPayload.default_flow_ids_by_name);
+    if (!Object.keys(payloadFlowIds).length && importPayload.exported_workflow_id) {
+      const rootFlow = String(importPayload.root_flow || importPayload.active_flow || importPayload.default_flow || "").trim();
+      if (rootFlow) payloadFlowIds[rootFlow] = String(importPayload.exported_workflow_id || "").trim();
+    }
+    const mergedFlowIds = mergeMode
+      ? { ...getFlowIdMap(existingSettings), ...payloadFlowIds, ...importedFlowIds }
+      : { ...payloadFlowIds, ...importedFlowIds };
+    const mergedDefaultFlowIds = mergeMode
+      ? { ...getDefaultFlowIdMap(existingSettings), ...payloadDefaultFlowIds }
+      : { ...payloadDefaultFlowIds };
     flows = mergeMode ? { ...existingFlows, ...deepClone(importedFlows) } : deepClone(importedFlows);
     // Prevent imported nodes from stacking at (80,80) when x/y are missing.
     Object.keys(flows || {}).forEach((fname) => {
@@ -6853,12 +8239,13 @@ function renderPanel(container, ctx) {
       agent_flow_autobuild_independent_final_grace_s: normalizeTimeoutSetting(importPayload.autobuild_independent_final_grace_s, normalizeTimeoutSetting(existingSettings.agent_flow_autobuild_independent_final_grace_s, 20)),
       ...(importedSettings || {}),
       agent_flow_flows: flows,
-      agent_flow_flow_ids_by_name: importedFlowIds,
+      agent_flow_flow_ids_by_name: mergedFlowIds,
+      agent_flow_default_flow_ids_by_name: mergedDefaultFlowIds,
     };
     const importedDefaultName = String(importPayload.default_flow || merged.agent_flow_default_flow || "").trim();
     const importedActiveName = String(importPayload.active_flow || merged.agent_flow_active_flow || "").trim();
-    if (importedDefaultName) merged.agent_flow_default_workflow_id = String(importedFlowIds[importedDefaultName] || merged.agent_flow_default_workflow_id || "").trim();
-    if (importedActiveName && importedActiveName !== NO_FLOW_VALUE) merged.agent_flow_active_workflow_id = String(importedFlowIds[importedActiveName] || merged.agent_flow_active_workflow_id || "").trim();
+    if (importedDefaultName) merged.agent_flow_default_workflow_id = String(mergedFlowIds[importedDefaultName] || merged.agent_flow_default_workflow_id || "").trim();
+    if (importedActiveName && importedActiveName !== NO_FLOW_VALUE) merged.agent_flow_active_workflow_id = String(mergedFlowIds[importedActiveName] || merged.agent_flow_active_workflow_id || "").trim();
     setRouterSettings(ctx, sid, "agent_flow", merged);
     const requestedDefault = String(merged.agent_flow_default_flow || "").trim();
     const requestedActive = String(merged.agent_flow_active_flow || "").trim();
@@ -7013,6 +8400,25 @@ function renderPanel(container, ctx) {
     if (!flowName) throw new Error("Select a flow first.");
     const flowDoc = flows && typeof flows === "object" ? flows[flowName] : null;
     if (!flowDoc || typeof flowDoc !== "object") throw new Error(`Flow not found: ${flowName}`);
+    const freshSettings = getAgentFlowSettings(ctx, sid) || {};
+    const rawActive = String(freshSettings.agent_flow_active_flow || "").trim();
+    const resolvedActive = rawActive === NO_FLOW_VALUE ? NO_FLOW_VALUE : (resolveActiveFlowName(freshSettings, flows) || "");
+    const exportSettings = {
+      default_flow: String(defaultFlow || freshSettings.agent_flow_default_flow || flowName).trim() || flowName,
+      active_flow: resolvedActive || flowName,
+      mode: String(freshSettings.agent_flow_mode || "execute").trim() || "execute",
+      max_steps: Number(freshSettings.agent_flow_max_steps || 32),
+      loop_max_passes: normalizeLoopMaxSetting(freshSettings.agent_flow_loop_max_passes, 16),
+      force_loop_max_passes: normalizeBoolSetting(freshSettings.agent_flow_force_loop_max_passes, false),
+      request_timeout_s: normalizeTimeoutSetting(freshSettings.agent_flow_request_timeout_s, 45),
+      autobuild_sandbox_profile: normalizeSandboxProfileSetting(freshSettings.agent_flow_autobuild_sandbox_profile, "lightweight"),
+      autobuild_lightweight_max_requests: Math.max(1, Math.trunc(Number(freshSettings.agent_flow_autobuild_lightweight_max_requests ?? 1) || 1)),
+      autobuild_lightweight_wait_s: normalizeTimeoutSetting(freshSettings.agent_flow_autobuild_lightweight_wait_s, 120),
+      autobuild_lightweight_final_grace_s: normalizeTimeoutSetting(freshSettings.agent_flow_autobuild_lightweight_final_grace_s, 10),
+      autobuild_independent_max_requests: Math.max(1, Math.trunc(Number(freshSettings.agent_flow_autobuild_independent_max_requests ?? 3) || 3)),
+      autobuild_independent_wait_s: normalizeTimeoutSetting(freshSettings.agent_flow_autobuild_independent_wait_s, 180),
+      autobuild_independent_final_grace_s: normalizeTimeoutSetting(freshSettings.agent_flow_autobuild_independent_final_grace_s, 20),
+    };
     const action = kind === "bundle" ? "export_bundle" : "export_workflow";
     const res = await ctx.apiJson(
       `/v1/projects/${encodeURIComponent(pid)}/sessions/${encodeURIComponent(sid)}/agent_flow/flows/${action}`,
@@ -7020,13 +8426,13 @@ function renderPanel(container, ctx) {
         method: "POST",
         headers: {
           ...buildHeaders(ctx, pid, sid),
-          "Content-Type": "application/json",
           "X-Gui-Enabled-Plugins": "collab_chat,agent_flow",
         },
-        body: JSON.stringify({
+        body: {
           flow_name: flowName,
           workflow_json: flowDoc,
-        }),
+          export_settings: exportSettings,
+        },
       }
     );
     const url = String(res?.download_url || res?.file?.download_url || res?.zip?.download_url || "").trim();
@@ -7616,13 +9022,13 @@ function renderPanel(container, ctx) {
       {
         id: "export-json",
         title: "Export JSON",
-        description: "Download the current flow library as Agent Flow JSON.",
+        description: "Download only the selected workflow as Agent Flow JSON.",
         render(node) {
           const row = document.createElement("div");
           row.className = "button-row";
           const btn = document.createElement("button");
           btn.className = "ghost";
-          btn.textContent = "Export JSON";
+          btn.textContent = "Export Selected JSON";
           btn.addEventListener("click", async () => {
             try {
               exportFlowsJson();
@@ -7993,6 +9399,28 @@ function renderPanel(container, ctx) {
   async function importDevelopmentPipeline() {
     try {
       const flowName = "workflow_dev_pipeline";
+      const sharedImplementationContract = [
+        "This workflow must create a coherent implementation bundle that matches the user request, not a narrow preset app shape.",
+        "Treat prior handoffs as the source of truth for the implementation contract.",
+        "The discovery/build/review chain must converge on one implementation contract with these fields:",
+        "- solution_type",
+        "- primary_stack",
+        "- bundle_root",
+        "- requested_deliverables",
+        "- required_files",
+        "- optional_support_files",
+        "- run_instructions",
+        "- acceptance_checks",
+        "required_files must include every file that the user explicitly asked for and every additional file required to make the bundle runnable.",
+        "Do not hardcode app.py, templates/index.html, requirements.txt, static/script.js, or any other specific filenames unless the user request or the agreed contract actually requires them.",
+        "If a later node needs to add a file that was not named earlier, it must treat that as a manifest update and explain why the file is required for coherence.",
+        "All implementation and review nodes must validate against the same manifest rather than inventing new expected files.",
+        "Do not switch stacks mid-workflow. If discovery chooses a stack, build and release must stay on that stack unless a reviewer explicitly proves the stack is unworkable.",
+        "The final result must describe the actual files created and how to run or inspect them.",
+        "The implementation is not complete unless every path in required_files exists in the bundle root and matches the agreed stack.",
+        "Missing smoke tests or runtime validation are release-blocking bugs, not informational notes.",
+        "Reviewers must compare actual created files against required_files and emit bugs for every missing or substituted file.",
+      ].join("\n");
       const taggedBuildProtocol = [
         "For create/build implementation tasks, prefer the TAGGED protocol instead of JSON tool_calls for large artifacts.",
         "Emit tagged sections exactly like this when writing a file:",
@@ -8018,24 +9446,64 @@ function renderPanel(container, ctx) {
       ].join("\n");
       const rolePrompt = (rid, label) => {
         const base = `You are the ${label} (${rid}). Do your role and handoff clearly.`;
-        if (["staff_engineer", "coder", "gui_designer"].includes(String(rid || ""))) {
-          return `${base}\n${taggedBuildProtocol}`;
+        const role = String(rid || "");
+        if (role === "product") {
+          return `${base}
+${sharedImplementationContract}
+Your job is to translate the user request into a strict implementation contract.
+Produce a concrete requested_deliverables list and a required_files manifest that fits the actual request.
+If the request is broad, define the smallest coherent runnable bundle that still satisfies it.
+Do not overfit to previous runs or preset web-app filenames.`;
         }
-        if (["qa", "security", "docs", "release", "architect"].includes(String(rid || ""))) {
-          return `${base}\nIf no artifact has been written yet, do not pretend to verify it. State that implementation must create it first.`;
+        if (role === "gui_designer") {
+          return `${base}
+${sharedImplementationContract}
+If the requested solution includes a user interface, refine the manifest and UX expectations without changing the chosen stack.
+If no interface is needed, explicitly say so and do not invent frontend files.
+Do not create placeholder files in this phase unless you are explicitly performing a repair pass on an existing frontend artifact.`;
         }
-        return base;
+        if (role === "architect") {
+          return `${base}
+${sharedImplementationContract}
+Consolidate the prior handoff into one stable implementation contract.
+Resolve ambiguity before build starts.
+If no artifact has been written yet, do not pretend to verify it. State that implementation must create it first.`;
+        }
+        if (["staff_engineer", "coder"].includes(role)) {
+          return `${base}
+${sharedImplementationContract}
+Implement exactly one coherent bundle that satisfies the agreed contract.
+Create the files in required_files plus any justified optional_support_files you explicitly add to the manifest.
+Do not create multiple competing versions of the same app shape.
+Do not silently swap frameworks, languages, or entrypoints.
+If the user asked for a bundle of code, ensure the created files form a runnable or inspectable bundle rather than isolated fragments.
+If you are the Staff Engineer and no implementation exists yet, do not write placeholder artifacts or artifact.txt files. Your job is to strengthen the contract and handoff so the Coding Engineer can create the real bundle.
+If you are the Coding Engineer, you must create every file in required_files before claiming readiness.
+Before handoff, list which required_files were created and which acceptance_checks still need execution.
+${taggedBuildProtocol}`;
+        }
+        if (["qa", "security", "docs", "release"].includes(role)) {
+          return `${base}
+${sharedImplementationContract}
+Review only against the agreed implementation contract and manifest.
+Do not invent generic expected files that were never required by the contract.
+If no artifact has been written yet, do not pretend to verify it. State that implementation must create it first.
+When implementation files exist, you must verify that every required_files path exists.
+If smoke tests or runtime validation were not executed, emit that as a bug requiring another pass.
+If required_files and actual files differ, emit that as a bug requiring another pass.`;
+        }
+        return `${base}\n${sharedImplementationContract}`;
       };
       const roleCfg = {
         product: { label: "Product", skills: ["auth.project_context", "repo.context", "repo.read", "learning.get_hints"] },
         gui_designer: { label: "GUI Designer", skills: ["repo.context", "repo.read", "rag.search", "learning.get_hints"] },
         architect: { label: "Architect", skills: ["repo.tree", "repo.context", "repo.read", "rag.search"] },
-        staff_engineer: { label: "Staff Engineer", skills: ["repo.tree", "repo.read", "repo.write", "rag.search", "code.generate_patch_candidates", "code.apply_patch", "tests.run_project"] },
+        staff_engineer: { label: "Staff Engineer", skills: ["repo.tree", "repo.read", "rag.search", "tests.run_project", "tests.smoke"] },
         coder: { label: "Coding Engineer", skills: ["repo.tree", "repo.read", "repo.write", "rag.search", "code.generate_patch_candidates", "code.apply_patch"] },
-        qa: { label: "QA Reviewer", skills: ["repo.read", "tests.run_project", "tests.smoke", "debug.fix_from_errors"] },
+        qa: { label: "QA Reviewer", skills: ["repo.tree", "repo.read", "tests.run_project", "tests.smoke", "debug.fix_from_errors"] },
         security: { label: "Security Reviewer", skills: ["repo.tree", "repo.read", "rag.search"] },
         docs: { label: "Docs Reviewer", skills: ["repo.context", "repo.read", "learning.get_hints"] },
-        release: { label: "Release Reviewer", skills: ["repo.read", "repo.write", "tests.run_project", "learning.list"] },
+        release: { label: "Release Reviewer", skills: ["repo.tree", "repo.read", "repo.write", "tests.run_project", "tests.smoke", "learning.list"] },
       };
       const teamSubflows = [
         { subflow: "workflow_team_discovery", label: "Discovery Team", members: ["product", "gui_designer", "architect"] },
@@ -8071,6 +9539,17 @@ function renderPanel(container, ctx) {
               target: "n2",
               loop_max_passes: 2,
               system_prompt: "Quality Team found bugs or test failures. Re-enter Build Team and repair the implementation before continuing.",
+            },
+            ...(nextTop ? [{ condition: { type: "always" }, target: nextTop }] : []),
+          ];
+        }
+        if (team.subflow === "workflow_team_release") {
+          return [
+            {
+              condition: { operator: "any", rules: [{ type: "bugs_present" }, { type: "test_failures_gte", value: "1" }] },
+              target: "n2",
+              loop_max_passes: 2,
+              system_prompt: "Release Team found blockers or missing validation. Re-enter Build Team, create every required file, repair the reported bugs, add any missing dependency manifest or test file, and return only after a fresh validation pass is possible.",
             },
             ...(nextTop ? [{ condition: { type: "always" }, target: nextTop }] : []),
           ];
@@ -8117,7 +9596,12 @@ function renderPanel(container, ctx) {
           label: t.label,
           plugin_id: "agent_flow_subflow",
           agent_kind: "subflow",
-          system_prompt: "",
+          system_prompt: [
+            sharedImplementationContract,
+            `This is the ${t.label}.`,
+            "Carry forward the current implementation contract and keep every member aligned to it.",
+            "Do not allow later members to invent a new stack or a new required file set unless they explicitly update the manifest with justification.",
+          ].join("\n"),
           x: 80 + (i % 3) * 290,
           y: 80 + Math.floor(i / 3) * 170,
           delay_ms: 0,

@@ -471,8 +471,18 @@ function renderResultTextMessage(msg, ctx) {
   if (!isResultTextMessage(msg)) return null;
   ensureStyles();
   const msgId = String(msg.msg_id || "");
-  const parsed = parseKeyedResultText(msg.content);
-  const answer = parsed.answer || String(msg.content || "").trim() || "Result ready.";
+  const meta = (msg && typeof msg.meta === "object") ? msg.meta : {};
+  const metaData = (meta && typeof meta.data === "object") ? meta.data : {};
+  const richText = String(
+    metaData.text ||
+    metaData.markdown ||
+    metaData.final_answer ||
+    metaData.finalized_text ||
+    ""
+  ).trim();
+  const rawText = richText || String(msg.content || "").trim();
+  const parsed = parseKeyedResultText(rawText);
+  const answer = parsed.answer || rawText || "Result ready.";
   const wrap = document.createElement("div");
   wrap.className = "message assistant";
   wrap.dataset.msgId = msgId;
@@ -498,7 +508,20 @@ function renderResultTextMessage(msg, ctx) {
   const body = document.createElement("div");
   body.className = "aw-result-body";
   const renderMarkdown = ctx?.renderMarkdown || (typeof window !== "undefined" ? window.renderMarkdown : null);
-  body.innerHTML = typeof renderMarkdown === "function" ? renderMarkdown(answer) : answer;
+  const renderGridMarkdownSections = (typeof window !== "undefined" && typeof window.renderGridMarkdownSections === "function")
+    ? window.renderGridMarkdownSections
+    : null;
+  if (renderGridMarkdownSections) {
+    const rendered = renderGridMarkdownSections(answer, renderMarkdown);
+    if (rendered) {
+      body.innerHTML = "";
+      body.appendChild(rendered);
+    } else {
+      body.innerHTML = typeof renderMarkdown === "function" ? renderMarkdown(answer) : answer;
+    }
+  } else {
+    body.innerHTML = typeof renderMarkdown === "function" ? renderMarkdown(answer) : answer;
+  }
   card.appendChild(body);
   const details = parsed.details || {};
   const detailKeys = Object.keys(details).filter((k) => String(details[k] || "").trim());
@@ -3060,6 +3083,28 @@ function renderPanel(container, ctx) {
 
 function buildDevPipelineImportPayload() {
   const flowName = "workflow_dev_pipeline";
+  const sharedImplementationContract = [
+    "This workflow must create a coherent implementation bundle that matches the user request, not a narrow preset app shape.",
+    "Treat prior handoffs as the source of truth for the implementation contract.",
+    "The discovery/build/review chain must converge on one implementation contract with these fields:",
+    "- solution_type",
+    "- primary_stack",
+    "- bundle_root",
+    "- requested_deliverables",
+    "- required_files",
+    "- optional_support_files",
+    "- run_instructions",
+    "- acceptance_checks",
+    "required_files must include every file that the user explicitly asked for and every additional file required to make the bundle runnable.",
+    "Do not hardcode app.py, templates/index.html, requirements.txt, static/script.js, or any other specific filenames unless the user request or the agreed contract actually requires them.",
+    "If a later node needs to add a file that was not named earlier, it must treat that as a manifest update and explain why the file is required for coherence.",
+    "All implementation and review nodes must validate against the same manifest rather than inventing new expected files.",
+    "Do not switch stacks mid-workflow. If discovery chooses a stack, build and release must stay on that stack unless a reviewer explicitly proves the stack is unworkable.",
+    "The final result must describe the actual files created and how to run or inspect them.",
+    "The implementation is not complete unless every path in required_files exists in the bundle root and matches the agreed stack.",
+    "Missing smoke tests or runtime validation are release-blocking bugs, not informational notes.",
+    "Reviewers must compare actual created files against required_files and emit bugs for every missing or substituted file.",
+  ].join("\n");
   const taggedBuildProtocol = [
     "For create/build implementation tasks, prefer the TAGGED protocol instead of JSON tool_calls for large artifacts.",
     "Emit tagged sections exactly like this when writing a file:",
@@ -3085,20 +3130,64 @@ function buildDevPipelineImportPayload() {
   ].join("\n");
   const rolePrompt = (rid, label) => {
     const base = `You are the ${label} (${rid}). Do your role and handoff clearly.`;
-    if (["staff_engineer", "coder", "gui_designer"].includes(String(rid || ""))) return `${base}\n${taggedBuildProtocol}`;
-    if (["qa", "security", "docs", "release", "architect"].includes(String(rid || ""))) return `${base}\nIf no artifact has been written yet, do not pretend to verify it. State that implementation must create it first.`;
-    return base;
+    const role = String(rid || "");
+    if (role === "product") {
+      return `${base}
+${sharedImplementationContract}
+Your job is to translate the user request into a strict implementation contract.
+Produce a concrete requested_deliverables list and a required_files manifest that fits the actual request.
+If the request is broad, define the smallest coherent runnable bundle that still satisfies it.
+Do not overfit to previous runs or preset web-app filenames.`;
+    }
+    if (role === "gui_designer") {
+      return `${base}
+${sharedImplementationContract}
+If the requested solution includes a user interface, refine the manifest and UX expectations without changing the chosen stack.
+If no interface is needed, explicitly say so and do not invent frontend files.
+Do not create placeholder files in this phase unless you are explicitly performing a repair pass on an existing frontend artifact.`;
+    }
+    if (role === "architect") {
+      return `${base}
+${sharedImplementationContract}
+Consolidate the prior handoff into one stable implementation contract.
+Resolve ambiguity before build starts.
+If no artifact has been written yet, do not pretend to verify it. State that implementation must create it first.`;
+    }
+    if (["staff_engineer", "coder"].includes(role)) {
+      return `${base}
+${sharedImplementationContract}
+Implement exactly one coherent bundle that satisfies the agreed contract.
+Create the files in required_files plus any justified optional_support_files you explicitly add to the manifest.
+Do not create multiple competing versions of the same app shape.
+Do not silently swap frameworks, languages, or entrypoints.
+If the user asked for a bundle of code, ensure the created files form a runnable or inspectable bundle rather than isolated fragments.
+If you are the Staff Engineer and no implementation exists yet, do not write placeholder artifacts or artifact.txt files. Your job is to strengthen the contract and handoff so the Coding Engineer can create the real bundle.
+If you are the Coding Engineer, you must create every file in required_files before claiming readiness.
+Before handoff, list which required_files were created and which acceptance_checks still need execution.
+${taggedBuildProtocol}`;
+    }
+    if (["qa", "security", "docs", "release"].includes(role)) {
+      return `${base}
+${sharedImplementationContract}
+Review only against the agreed implementation contract and manifest.
+Do not invent generic expected files that were never required by the contract.
+If no artifact has been written yet, do not pretend to verify it. State that implementation must create it first.
+When implementation files exist, you must verify that every required_files path exists.
+If smoke tests or runtime validation were not executed, emit that as a bug requiring another pass.
+If required_files and actual files differ, emit that as a bug requiring another pass.`;
+    }
+    return `${base}\n${sharedImplementationContract}`;
   };
   const roleCfg = {
     product: { label: "Product", skills: ["auth.project_context", "repo.context", "repo.read", "learning.get_hints"] },
     gui_designer: { label: "GUI Designer", skills: ["repo.context", "repo.read", "rag.search", "learning.get_hints"] },
     architect: { label: "Architect", skills: ["repo.tree", "repo.context", "repo.read", "rag.search"] },
-    staff_engineer: { label: "Staff Engineer", skills: ["repo.tree", "repo.read", "repo.write", "rag.search", "code.generate_patch_candidates", "code.apply_patch", "tests.run_project"] },
+    staff_engineer: { label: "Staff Engineer", skills: ["repo.tree", "repo.read", "rag.search", "tests.run_project", "tests.smoke"] },
     coder: { label: "Coding Engineer", skills: ["repo.tree", "repo.read", "repo.write", "rag.search", "code.generate_patch_candidates", "code.apply_patch"] },
-    qa: { label: "QA Reviewer", skills: ["repo.read", "tests.run_project", "tests.smoke", "debug.fix_from_errors"] },
+    qa: { label: "QA Reviewer", skills: ["repo.tree", "repo.read", "tests.run_project", "tests.smoke", "debug.fix_from_errors"] },
     security: { label: "Security Reviewer", skills: ["repo.tree", "repo.read", "rag.search"] },
     docs: { label: "Docs Reviewer", skills: ["repo.context", "repo.read", "learning.get_hints"] },
-    release: { label: "Release Reviewer", skills: ["repo.read", "repo.write", "tests.run_project", "learning.list"] },
+    release: { label: "Release Reviewer", skills: ["repo.tree", "repo.read", "repo.write", "tests.run_project", "tests.smoke", "learning.list"] },
   };
   const teamSubflows = [
     { subflow: "workflow_team_discovery", label: "Discovery Team", members: ["product", "gui_designer", "architect"] },
@@ -3138,6 +3227,17 @@ function buildDevPipelineImportPayload() {
         ...(nextTop ? [{ condition: { type: "always" }, target: nextTop }] : []),
       ];
     }
+    if (team.subflow === "workflow_team_release") {
+      return [
+        {
+          condition: { operator: "any", rules: [{ type: "bugs_present" }, { type: "test_failures_gte", value: "1" }] },
+          target: "n2",
+          loop_max_passes: 2,
+          system_prompt: "Release Team found blockers or missing validation. Re-enter Build Team, create every required file, repair the reported bugs, add any missing dependency manifest or test file, and return only after a fresh validation pass is possible.",
+        },
+        ...(nextTop ? [{ condition: { type: "always" }, target: nextTop }] : []),
+      ];
+    }
     return nextTop ? [{ condition: { type: "always" }, target: nextTop }] : [];
   };
   const topNodes = {};
@@ -3173,11 +3273,16 @@ function buildDevPipelineImportPayload() {
       };
     }
     allFlows[t.subflow] = { start: "n1", nodes: subNodes };
-      topNodes[topNodeId] = {
+        topNodes[topNodeId] = {
       label: t.label,
       plugin_id: "agent_flow_subflow",
       agent_kind: "subflow",
-      system_prompt: "",
+      system_prompt: [
+        sharedImplementationContract,
+        `This is the ${t.label}.`,
+        "Carry forward the current implementation contract and keep every member aligned to it.",
+        "Do not allow later members to invent a new stack or a new required file set unless they explicitly update the manifest with justification.",
+      ].join("\n"),
       x: 80 + (i % 3) * 290,
       y: 80 + Math.floor(i / 3) * 170,
       delay_ms: 0,
@@ -3343,6 +3448,80 @@ function mergeWithExistingAgentFlowImport(ctx, helpers, imp) {
   return base;
 }
 
+async function loadAgentWorkflowImportPreset(ctx, helpers, preset, fallbackPayload) {
+  try {
+    const res = await ctx.apiJson(
+      `/v1/agent_workflow/agent_flow_import_preset?preset=${encodeURIComponent(String(preset || "").trim())}`,
+      {
+        method: "GET",
+        headers: {
+          ...helpers.buildHeaders(ctx),
+          "X-Gui-Enabled-Plugins": "collab_chat,agent_flow,agent_workflow",
+        },
+      }
+    );
+    const payload = res && typeof res === "object" && res.agent_flow_import && typeof res.agent_flow_import === "object"
+      ? res.agent_flow_import
+      : null;
+    return payload || fallbackPayload;
+  } catch (err) {
+    ctx.log?.(`[agent_workflow] import preset fallback (${preset}): ${err?.message || err}`, "warn");
+    return fallbackPayload;
+  }
+}
+
+async function loadLiveAgentFlowPayload(ctx, helpers, flowNames, fallbackPayload) {
+  const wanted = Array.isArray(flowNames)
+    ? flowNames.map((name) => String(name || "").trim()).filter(Boolean)
+    : [];
+  if (!wanted.length) return fallbackPayload;
+  try {
+    const pid = String(helpers?.pid || ctx?.state?.ui?.activePid || "").trim();
+    const sid = String(helpers?.sid || ctx?.state?.ui?.activeSid || "").trim();
+    if (!pid || !sid) return fallbackPayload;
+    const res = await ctx.apiJson(
+      `/v1/projects/${encodeURIComponent(pid)}/sessions/${encodeURIComponent(sid)}/agent_flow/flows`,
+      {
+        method: "GET",
+        headers: {
+          ...helpers.buildHeaders(ctx),
+          "X-Gui-Enabled-Plugins": "collab_chat,agent_flow,agent_workflow",
+        },
+      }
+    );
+    const liveFlows = res && typeof res === "object" && res.flows && typeof res.flows === "object"
+      ? res.flows
+      : {};
+    const selected = {};
+    for (const name of wanted) {
+      const flow = liveFlows && typeof liveFlows[name] === "object" ? liveFlows[name] : null;
+      if (!flow) return fallbackPayload;
+      selected[name] = JSON.parse(JSON.stringify(flow));
+    }
+    const base = fallbackPayload && typeof fallbackPayload === "object"
+      ? JSON.parse(JSON.stringify(fallbackPayload))
+      : {};
+    base.flows = selected;
+    base.default_flow = selected[base.default_flow] ? base.default_flow : wanted[0];
+    base.active_flow = selected[base.active_flow] ? base.active_flow : (base.default_flow || wanted[0]);
+    return base;
+  } catch (err) {
+    ctx.log?.(`[agent_workflow] live flow import fallback: ${err?.message || err}`, "warn");
+    return fallbackPayload;
+  }
+}
+
+function importFlowNamesFromPayload(payload, fallbackNames = []) {
+  const flowMap = payload && typeof payload === "object" && payload.flows && typeof payload.flows === "object"
+    ? payload.flows
+    : {};
+  const fromPayload = Object.keys(flowMap).map((name) => String(name || "").trim()).filter(Boolean);
+  if (fromPayload.length) return fromPayload;
+  return Array.isArray(fallbackNames)
+    ? fallbackNames.map((name) => String(name || "").trim()).filter(Boolean)
+    : [];
+}
+
 function createAgentFlowImportSource() {
   return {
     id: "agent_workflow_agent_flow_imports",
@@ -3403,7 +3582,9 @@ function createAgentFlowImportSource() {
                   },
                   body: { pid: helpers.pid, sid: helpers.sid, team, flow_name: `workflow_${team}` },
                 });
-                const imp = mergeWithExistingAgentFlowImport(ctx, helpers, payload?.agent_flow_import || {});
+                const generated = payload?.agent_flow_import || {};
+                const live = await loadLiveAgentFlowPayload(ctx, helpers, [String(generated?.active_flow || generated?.default_flow || `workflow_${team}`).trim()], generated);
+                const imp = mergeWithExistingAgentFlowImport(ctx, helpers, live);
                 await helpers.importFlowsFromJsonText(JSON.stringify(imp), { merge: true, replace: false });
                 helpers.closePopover?.();
               } catch (err) {
@@ -3424,7 +3605,21 @@ function createAgentFlowImportSource() {
             btn.textContent = "Import Dev Pipeline";
             btn.addEventListener("click", async () => {
               try {
-                const imp = mergeWithExistingAgentFlowImport(ctx, helpers, buildDevPipelineImportPayload());
+                const fallback = buildDevPipelineImportPayload();
+                const preset = await loadAgentWorkflowImportPreset(ctx, helpers, "dev_pipeline", fallback);
+                const live = await loadLiveAgentFlowPayload(
+                  ctx,
+                  helpers,
+                  [
+                    "workflow_dev_pipeline",
+                    "workflow_team_discovery",
+                    "workflow_team_build",
+                    "workflow_team_quality",
+                    "workflow_team_release",
+                  ],
+                  preset
+                );
+                const imp = mergeWithExistingAgentFlowImport(ctx, helpers, live);
                 await helpers.importFlowsFromJsonText(JSON.stringify(imp), { merge: true, replace: false });
                 helpers.closePopover?.();
               } catch (err) {
@@ -3447,7 +3642,16 @@ function createAgentFlowImportSource() {
             btn.textContent = "Import Repo Flow";
             btn.addEventListener("click", async () => {
               try {
-                const imp = mergeWithExistingAgentFlowImport(ctx, helpers, buildRepoImprovementImportPayload());
+                const fallback = buildRepoImprovementImportPayload();
+                const preset = await loadAgentWorkflowImportPreset(ctx, helpers, "repo_improvement", fallback);
+                const repoFlowNames = importFlowNamesFromPayload(preset, [
+                  "workflow_repo_improvement",
+                  "workflow_repo_improvement_interactive",
+                  "workflow_repo_improvement_rag_git",
+                  "workflow_repo_improvement_system_debugger",
+                ]);
+                const live = await loadLiveAgentFlowPayload(ctx, helpers, repoFlowNames, preset);
+                const imp = mergeWithExistingAgentFlowImport(ctx, helpers, live);
                 await helpers.importFlowsFromJsonText(JSON.stringify(imp), { merge: true, replace: false });
                 helpers.closePopover?.();
               } catch (err) {

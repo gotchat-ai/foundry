@@ -140,38 +140,22 @@ function coerceBool(value, fallback = true) {
 }
 
 
-const LLM_SKILL_AUTOFLOW_FLOW_VALUE = "__llm_skill_autoflow__";
-
-function shouldUseLLMSkillAutoFlow(payload, ctx) {
-  try {
-    const sid = String(payload?.sid || payload?.ext?.sid || payload?.ext?.session_id || "").trim();
-    const extActive = String(payload?.ext?.agent_flow_active_flow || "").trim();
-    if (extActive === LLM_SKILL_AUTOFLOW_FLOW_VALUE) return true;
-    if (!sid || typeof ctx?.getRouterConfig !== "function") return false;
-    const cfg = ctx.getRouterConfig(sid, payload?.pid || payload?.ext?.project_id) || {};
-    const enabled = Array.isArray(cfg.enabled) ? cfg.enabled : [];
-    const settings = cfg.settings && typeof cfg.settings === "object" ? cfg.settings : {};
-    const llm = settings.llm_skill_autoflow && typeof settings.llm_skill_autoflow === "object" ? settings.llm_skill_autoflow : {};
-    const agent = settings.agent_flow && typeof settings.agent_flow === "object" ? settings.agent_flow : {};
-    const rawActive = String(agent.agent_flow_active_flow || "").trim();
-    return enabled.includes("llm_skill_autoflow") && llm.llm_skill_autoflow_enabled !== false && rawActive === LLM_SKILL_AUTOFLOW_FLOW_VALUE;
-  } catch (_err) {
-    return false;
-  }
-}
-
-function getLLMSkillAutoFlowState(ctx) {
+const NO_FLOW_VALUE = "__none__";
+function getAiRouterBridgeState(ctx, bridge) {
   ctx.state.auth_projects = ctx.state.auth_projects || {};
-  ctx.state.auth_projects.llm_skill_autoflow = ctx.state.auth_projects.llm_skill_autoflow || {
+  ctx.state.auth_projects.aiRouterBridgeState = ctx.state.auth_projects.aiRouterBridgeState || {};
+  const key = String(bridge?.id || bridge?.routeId || "").trim();
+  if (!key) return { pendingByClientMsgId: {} };
+  ctx.state.auth_projects.aiRouterBridgeState[key] = ctx.state.auth_projects.aiRouterBridgeState[key] || {
     pendingByClientMsgId: {},
   };
-  return ctx.state.auth_projects.llm_skill_autoflow;
+  return ctx.state.auth_projects.aiRouterBridgeState[key];
 }
 
-function markPendingLLMSkillAutoFlow(ctx, payload) {
+function markPendingAiRouterBridge(ctx, bridge, payload) {
   const clientMsgId = String(payload?.client_msg_id || "").trim();
   if (!clientMsgId) return;
-  const state = getLLMSkillAutoFlowState(ctx);
+  const state = getAiRouterBridgeState(ctx, bridge);
   state.pendingByClientMsgId[clientMsgId] = {
     pid: String(payload?.pid || "").trim(),
     sid: String(payload?.sid || "").trim(),
@@ -179,28 +163,38 @@ function markPendingLLMSkillAutoFlow(ctx, payload) {
   };
 }
 
-function consumePendingLLMSkillAutoFlow(ctx, clientMsgId) {
+function consumePendingAiRouterBridge(ctx, bridge, clientMsgId) {
   const key = String(clientMsgId || "").trim();
   if (!key) return null;
-  const state = getLLMSkillAutoFlowState(ctx);
+  const state = getAiRouterBridgeState(ctx, bridge);
   const entry = state.pendingByClientMsgId[key] || null;
   if (entry) delete state.pendingByClientMsgId[key];
+  const now = Date.now();
+  Object.keys(state.pendingByClientMsgId).forEach((id) => {
+    const item = state.pendingByClientMsgId[id];
+    if (!item || (now - Number(item.ts || 0)) > 120000) delete state.pendingByClientMsgId[id];
+  });
   return entry;
 }
 
-async function callLLMSkillAutoFlowTurn(payload, ctx) {
+function getAiRouterBridges(ctx) {
+  const list = typeof ctx?.getAiRouterBridges === "function" ? ctx.getAiRouterBridges() : [];
+  return Array.isArray(list) ? list : [];
+}
+
+async function callAiRouterBridgeTurn(payload, ctx, bridge) {
   const pid = String(payload?.pid || "").trim();
   const sid = String(payload?.sid || "").trim();
   const text = String(payload?.text || "").trim();
   const clientMsgId = String(payload?.client_msg_id || "").trim();
   if (!pid || !sid || !text) return { handled: false };
-  markPendingLLMSkillAutoFlow(ctx, payload);
+  markPendingAiRouterBridge(ctx, bridge, payload);
   if (typeof ctx.startCompletionStream === "function") {
     try {
       await ctx.startCompletionStream(pid, sid, text, clientMsgId);
       return { handled: true };
     } catch (err) {
-      consumePendingLLMSkillAutoFlow(ctx, clientMsgId);
+      consumePendingAiRouterBridge(ctx, bridge, clientMsgId);
       throw err;
     }
   }
@@ -208,7 +202,7 @@ async function callLLMSkillAutoFlowTurn(payload, ctx) {
     await ctx.startModelStream(pid, sid, text, clientMsgId);
     return { handled: true };
   }
-  throw new Error("llm_skill_autoflow_stream_unavailable");
+  throw new Error(`${String(bridge?.routeId || bridge?.id || "ai_router").trim() || "ai_router"}_stream_unavailable`);
 }
 
 function ensureStyles() {
@@ -2881,11 +2875,19 @@ const plugin = {
         return;
       }
 
-      if (effAi && shouldUseLLMSkillAutoFlow(payload, ctx2)) {
-        void callLLMSkillAutoFlowTurn(payload, ctx2).catch((err) => {
-          ctx2.log?.(`[llm_skill_autoflow] ${err?.message || err}`, "error");
-        });
-        return { handled: true };
+      if (effAi) {
+        for (const bridge of getAiRouterBridges(ctx2)) {
+          try {
+            if (typeof bridge?.shouldHandle === "function" && bridge.shouldHandle(payload, ctx2)) {
+              void callAiRouterBridgeTurn(payload, ctx2, bridge).catch((err) => {
+                ctx2.log?.(`[${String(bridge?.routeId || bridge?.id || "ai_router")}] ${err?.message || err}`, "error");
+              });
+              return { handled: true };
+            }
+          } catch (err) {
+            ctx2.log?.(`[${String(bridge?.routeId || bridge?.id || "ai_router")}] ${err?.message || err}`, "error");
+          }
+        }
       }
 
       if (!effAi) {
@@ -2913,16 +2915,32 @@ const plugin = {
 
       body.ext = body.ext || {};
       const clientMsgId = String(body?.client_msg_id || "").trim();
-      const pendingLLMSkillAutoFlow = consumePendingLLMSkillAutoFlow(ctx2, clientMsgId);
-      const forceLLMSkillAutoFlow = Boolean(pendingLLMSkillAutoFlow) || shouldUseLLMSkillAutoFlow({ pid, sid, client_msg_id: clientMsgId }, ctx2);
-      if (forceLLMSkillAutoFlow) {
-        body.route_id = "llm_skill_autoflow";
+      let forcedBridge = null;
+      for (const bridge of getAiRouterBridges(ctx2)) {
+        const pending = consumePendingAiRouterBridge(ctx2, bridge, clientMsgId);
+        let force = Boolean(pending);
+        if (!force) {
+          try {
+            force = Boolean(typeof bridge?.shouldHandle === "function" && bridge.shouldHandle({ pid, sid, client_msg_id: clientMsgId }, ctx2));
+          } catch (_err) {
+            force = false;
+          }
+        }
+        if (force) {
+          forcedBridge = bridge;
+          break;
+        }
+      }
+      if (forcedBridge) {
+        const routeId = String(forcedBridge.routeId || forcedBridge.id || "").trim();
+        const activeFlowValue = String(forcedBridge.activeFlowValue || "").trim();
+        body.route_id = routeId;
         const enabled = Array.isArray(body.router_enabled_plugins) ? body.router_enabled_plugins.slice() : [];
-        if (!enabled.includes("llm_skill_autoflow")) enabled.unshift("llm_skill_autoflow");
+        if (routeId && !enabled.includes(routeId)) enabled.unshift(routeId);
         body.router_enabled_plugins = enabled;
-        body.ext.agent_flow_active_flow = LLM_SKILL_AUTOFLOW_FLOW_VALUE;
+        if (activeFlowValue) body.ext.agent_flow_active_flow = activeFlowValue;
         body.ext.router_enabled_plugins = enabled.slice();
-        body.ext.__route_debug = { forced_route: "llm_skill_autoflow", active_flow: LLM_SKILL_AUTOFLOW_FLOW_VALUE };
+        body.ext.__route_debug = { forced_route: routeId, active_flow: activeFlowValue };
       }
       const st = getCollabState(ctx2);
       if (st.forceAiOnce) {

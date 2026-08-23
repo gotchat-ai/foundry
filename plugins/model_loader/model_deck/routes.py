@@ -37,7 +37,9 @@ _LOCAL_LOADERS = {
     os_agent_loader.LOADER_ID: os_agent_loader,
     retrieval_loader.LOADER_ID: retrieval_loader,
     safety_loader.LOADER_ID: safety_loader,
-    speech_loader.LOADER_ID: speech_loader,
+    speech_loader.LEGACY_LOADER_ID: speech_loader,
+    speech_loader.LOADER_ID_ASR: speech_loader,
+    speech_loader.LOADER_ID_TTS: speech_loader,
     image_gen_gguf_loader.LOADER_ID: image_gen_gguf_loader,
 }
 
@@ -201,6 +203,19 @@ def _runtime_scoped_schemas() -> Dict[str, Any]:
                     main_gpu["default"] = str(main_gpu.get("default", "0") or "0")
                     main_gpu["description"] = "Select the Intel GPU device id used by llama.cpp SYCL."
 
+    for speech_type_id in ("speech", "speech_asr", "speech_tts"):
+        speech_schema = schemas.get(speech_type_id)
+        if isinstance(speech_schema, dict):
+            fields = speech_schema.get("fields")
+            if isinstance(fields, list) and is_intel:
+                main_gpu = _find_field(fields, "main_gpu")
+                choices = _intel_gpu_choices()
+                if isinstance(main_gpu, dict) and choices:
+                    main_gpu["type"] = "enum"
+                    main_gpu["choices"] = choices
+                    main_gpu["default"] = str(main_gpu.get("default", "0") or "0")
+                    main_gpu["description"] = "Select the Intel GPU device id used by GGUF speech inference."
+
     for type_id in ("vlm",):
         schema = schemas.get(type_id)
         if not isinstance(schema, dict):
@@ -259,8 +274,66 @@ def _runtime_scoped_schemas() -> Dict[str, Any]:
                 if default_val not in ("vulkan", "cpu", "cuda"):
                     field["default"] = sd_cpp_device_choices[0]["value"]
                 field["description"] = "Valid stable-diffusion-cpp device backends for this runtime."
+            if is_intel:
+                main_gpu = _find_field(fields, "main_gpu")
+                choices = _intel_gpu_choices()
+                if isinstance(main_gpu, dict) and choices:
+                    main_gpu["type"] = "enum"
+                    main_gpu["choices"] = choices
+                    main_gpu["default"] = str(main_gpu.get("default", "0") or "0")
+                    main_gpu["description"] = "Used only for diffusers single-device selection on Intel XPU."
+
+    video_schema = schemas.get("video_gen")
+    if isinstance(video_schema, dict):
+        fields = video_schema.get("fields")
+        if isinstance(fields, list):
+            fields[:] = [
+                field for field in fields
+                if str((field or {}).get("key") or "").strip() != "gemma_text_encoding_device"
+            ]
+            if is_intel:
+                main_gpu = _find_field(fields, "main_gpu")
+                choices = _intel_gpu_choices()
+                if isinstance(main_gpu, dict) and choices:
+                    main_gpu["type"] = "enum"
+                    main_gpu["choices"] = choices
+                    main_gpu["default"] = str(main_gpu.get("default", "0") or "0")
+                    main_gpu["description"] = "Used only for diffusers single-device selection on Intel XPU."
 
     return schemas
+
+
+def _apply_single_device_selection(out: Dict[str, Any], runtime: str) -> Dict[str, Any]:
+    selection_mode = str(out.get("gpu_selection_mode") or "").strip().lower()
+    if selection_mode != "single":
+        return out
+    raw_device = str(out.get("device") or "").strip().lower()
+    main_gpu = out.get("main_gpu")
+    try:
+        gpu_index = int(main_gpu)
+    except Exception:
+        gpu_index = 0
+    if gpu_index < 0:
+        gpu_index = 0
+
+    if raw_device in ("cpu", "mps", "vulkan"):
+        return out
+
+    base_device = raw_device
+    if base_device in ("", "auto"):
+        if runtime == "cuda":
+            base_device = "cuda"
+        elif runtime in ("intel", "xpu", "sycl"):
+            base_device = "xpu"
+        else:
+            return out
+    elif base_device in ("intel", "sycl", "level_zero"):
+        base_device = "xpu"
+
+    if base_device not in ("cuda", "xpu"):
+        return out
+    out["device"] = f"{base_device}:{gpu_index}"
+    return out
 
 
 def _runtime_scoped_settings(type_id: str, settings: Dict[str, Any]) -> Dict[str, Any]:
@@ -281,6 +354,10 @@ def _runtime_scoped_settings(type_id: str, settings: Dict[str, Any]) -> Dict[str
                 out["device"] = "vulkan" if runtime in ("intel", "xpu", "sycl", "vulkan") else "cpu"
             elif device in ("xpu", "sycl", "level_zero", "intel") and runtime in ("intel", "xpu", "sycl", "vulkan"):
                 out["device"] = "vulkan"
+        else:
+            out = _apply_single_device_selection(out, runtime)
+    elif type_id == "video_gen":
+        out = _apply_single_device_selection(out, runtime)
     return out
 
 
@@ -356,6 +433,8 @@ def install(app) -> None:
             raise HTTPException(400, "deck model missing loader_id")
 
         settings = dict(m.get("settings") or {})
+        settings["__loader_id"] = loader_id
+        settings["__model_deck_type_id"] = req.type_id
         if req.pid is not None:
             settings.setdefault("pid", req.pid)
         if req.sid is not None:
@@ -392,7 +471,7 @@ def install(app) -> None:
             raise HTTPException(400, "loader_id required")
 
         if loader_id in _LOCAL_LOADERS:
-            res = _LOCAL_LOADERS[loader_id].unload(request, {"pid": req.pid, "sid": req.sid})
+            res = _LOCAL_LOADERS[loader_id].unload(request, {"pid": req.pid, "sid": req.sid, "__loader_id": loader_id})
             return {"ok": True, "delegated": True, "loader_id": loader_id, "result": res}
 
         reg = getattr(app.state, "model_loader_registry", None)

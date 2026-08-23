@@ -1,0 +1,6 @@
+{
+  "argv": [
+    "{python_bin}"
+  ],
+  "workflow": "native_graph"
+}

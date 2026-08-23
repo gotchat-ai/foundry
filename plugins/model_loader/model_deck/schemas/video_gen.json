@@ -4,16 +4,154 @@
     {
       "key": "backend",
       "type": "enum",
-      "choices": ["diffusers", "comfyui"],
+      "choices": ["diffusers"],
       "default": "diffusers",
       "label": "Backend"
     },
     {
+      "key": "model_backend",
+      "type": "enum",
+      "choices": [
+        { "value": "default", "label": "Default" },
+        { "value": "workflow", "label": "Workflow" }
+      ],
+      "default": "default",
+      "label": "Model Backend",
+      "description": "Default uses the normal built-in edit fields. Workflow uses the Agent Flow native staged graph for this model."
+    },
+    {
+      "key": "video_command_mode",
+      "type": "enum",
+      "choices": [
+        { "value": "standard", "label": "Built-in backend routing" },
+        { "value": "advanced", "label": "Custom command template" }
+      ],
+      "default": "standard",
+      "label": "Execution mode",
+      "description": "Use built-in video routing by default, or switch to a fully custom command template."
+    },
+    {
+      "key": "workflow_loader_mode",
+      "type": "enum",
+      "choices": [
+        { "value": "workflow_model_loader", "label": "Workflow model loader" },
+        { "value": "checkpoint_runner", "label": "Legacy checkpoint runner" }
+      ],
+      "default": "workflow_model_loader",
+      "label": "Model workflow mode",
+      "ui_hidden": true,
+      "description": "For tested workflow profiles, use the node-based workflow model loader by default. Legacy checkpoint runner keeps the older all-in-one path."
+    },
+    {
+      "key": "workflow_node_lifecycle_policy",
+      "type": "enum",
+      "choices": [
+        { "value": "lazy_unload", "label": "Lazy load, unload after node" },
+        { "value": "lazy_persist", "label": "Lazy load, persist until cleanup" },
+        { "value": "preload_persist", "label": "Preload and persist" }
+      ],
+      "default": "lazy_unload",
+      "label": "Workflow node lifecycle",
+      "description": "Controls resource behavior for workflow-model-loader nodes."
+    },
+    {
+      "key": "workflow_execution_backend",
+      "type": "enum",
+      "choices": [
+        { "value": "native_graph", "label": "Native staged graph execution" },
+        { "value": "native_comfyui_gguf", "label": "Native graph execution (ComfyUI-GGUF alias)" },
+        { "value": "ltx_checkpoint_runner", "label": "Legacy LTX checkpoint runner" }
+      ],
+      "default": "native_graph",
+      "label": "Workflow execution backend",
+      "ui_hidden": true,
+      "description": "Selects how workflow model nodes execute. Native graph runs each node stage; legacy checkpoint runner runs the older all-in-one process."
+    },
+    {
+      "key": "workflow_node_timeout_s",
+      "type": "number",
+      "default": 10800,
+      "label": "Workflow node timeout (seconds)",
+      "description": "Maximum time allowed for a terminal workflow execution node."
+    },
+    {
+      "key": "comfyui_runtime_root",
+      "type": "path",
+      "required": false,
+      "label": "ComfyUI runtime root",
+      "ui_hidden": true,
+      "description": "Optional path to a full ComfyUI checkout. Needed for the native ComfyUI-GGUF backend because the GGUF custom node imports comfy.*, nodes, and folder_paths."
+    },
+    {
+      "key": "comfyui_gguf_vendor_root",
+      "type": "path",
+      "required": false,
+      "default": "C:/Users/Tee/projects/llmloader2/vendor/ComfyUI-GGUF",
+      "label": "ComfyUI-GGUF vendor root",
+      "ui_hidden": true,
+      "description": "Path to the vendored ComfyUI-GGUF custom node code."
+    },
+    {
+      "key": "video_template_preset",
+      "type": "enum",
+      "choices": [
+        { "value": "generic_diffusers", "label": "Generic Diffusers Video" },
+        { "value": "wan_pipeline", "label": "Wan diffusers pipeline" }
+      ],
+      "default": "generic_diffusers",
+      "label": "Template preset",
+      "description": "Prefills example JSON for custom video generation commands."
+    },
+    {
+      "key": "video_runtime_template_json",
+      "type": "textarea",
+      "rows": 10,
+      "required": false,
+      "label": "Custom command template JSON",
+      "description": "Advanced mode only. Full argv template for your external video generator."
+    },
+    {
+      "key": "video_runtime_assets_json",
+      "type": "textarea",
+      "rows": 6,
+      "required": false,
+      "label": "Custom asset JSON",
+      "description": "Advanced mode only. Paths or static assets referenced by the template."
+    },
+    {
+      "key": "video_runtime_params_json",
+      "type": "textarea",
+      "rows": 6,
+      "required": false,
+      "label": "Custom parameter JSON",
+      "description": "Advanced mode only. Optional defaults merged into the runtime template placeholders."
+    },
+    {
+      "key": "video_runtime_extra_args",
+      "type": "str",
+      "required": false,
+      "label": "Custom extra args",
+      "description": "Advanced mode only. Extra args appended after the rendered command template."
+    },
+    {
       "key": "model_id",
       "type": "str",
-      "required": true,
-      "default": "genmo/mochi-1-preview",
-      "label": "Video model id/path (default: Mochi 1)"
+      "required": false,
+      "label": "Video model id/path"
+    },
+    {
+      "key": "diffusers_pipeline_class",
+      "type": "str",
+      "required": false,
+      "label": "Pipeline class name",
+      "description": "Auto-filled from the matched tested profile when known. Leave blank to use the profile default."
+    },
+    {
+      "key": "diffusers_transformer_class",
+      "type": "str",
+      "required": false,
+      "label": "Transformer class name",
+      "description": "Auto-filled from the matched tested profile when known. Leave blank to use the profile default."
     },
     {
       "key": "device",
@@ -29,6 +167,22 @@
       "label": "Device (diffusers)"
     },
     {
+      "key": "gpu_selection_mode",
+      "type": "enum",
+      "choices": [
+        { "value": "auto", "label": "Automatic device selection" },
+        { "value": "single", "label": "Single GPU/device index" }
+      ],
+      "default": "auto",
+      "label": "GPU selection mode (diffusers)"
+    },
+    {
+      "key": "main_gpu",
+      "type": "int",
+      "default": 0,
+      "label": "GPU device id (diffusers)"
+    },
+    {
       "key": "dtype",
       "type": "enum",
       "choices": [
@@ -41,22 +195,89 @@
       "label": "Dtype (diffusers)"
     },
     {
+      "key": "gemma_text_encoding_device",
+      "type": "enum",
+      "choices": [
+        { "value": "cpu", "label": "CPU" },
+        { "value": "gpu", "label": "GPU / main video device" }
+      ],
+      "default": "cpu",
+      "label": "Gemma text encoding device",
+      "description": "For native Unsloth LTX workflows, choose where the Gemma prompt encoder runs. CPU is the safer default for now."
+    },
+    {
+      "key": "gemma_max_tokens",
+      "type": "number",
+      "default": 512,
+      "label": "Gemma max prompt tokens",
+      "description": "Maximum tokens sent through the Gemma prompt encoder for native LTX workflows. Lower values reduce memory and speed up prompt encoding; use 1024 only for very long prompts."
+    },
+    {
+      "key": "allow_eager_gemma_gpu",
+      "type": "bool",
+      "default": false,
+      "label": "Allow legacy eager Gemma GPU load",
+      "description": "Diagnostic fallback only. Leave off for lazy GGUF module loading, which keeps packed GGUF weights compact and dequantizes per layer."
+    },
+    {
+      "key": "native_transformer_offload",
+      "type": "enum",
+      "choices": [
+        { "value": "none", "label": "Lazy quantized GGUF modules (Recommended)" },
+        { "value": "disk", "label": "Legacy LTX dense block streaming (disk slots)" },
+        { "value": "cpu", "label": "Legacy LTX dense block streaming (CPU slots)" }
+      ],
+      "default": "none",
+      "label": "Transformer offload mode",
+      "description": "For native workflow GGUF models, lazy quantized modules keep packed GGUF tensors compact and dequantize per layer. Legacy block streaming expands dense block slots and should only be used for diagnostics."
+    },
+    {
+      "key": "native_gguf_execution_mode",
+      "type": "enum",
+      "choices": [
+        { "value": "lazy_quantized", "label": "Lazy quantized GGUF execution" },
+        { "value": "eager_vram", "label": "Full VRAM eager GGUF execution" },
+        { "value": "ltx_block_streaming", "label": "Legacy LTX block streaming" }
+      ],
+      "default": "lazy_quantized",
+      "label": "Native GGUF execution mode",
+      "description": "Controls GGUF transformer residency. Lazy quantized keeps packed GGUF tensors compact and dequantizes per layer. Full VRAM eager dequantizes/materializes weights on the main device for speed, but can use much more VRAM. Legacy block streaming is a diagnostic fallback."
+    },
+    {
+      "key": "native_lazy_quantized_packed_device",
+      "type": "enum",
+      "choices": [
+        { "value": "gpu", "label": "Main GPU / XPU packed GGUF cache (Recommended)" },
+        { "value": "cpu", "label": "CPU / mmap packed GGUF cache" }
+      ],
+      "default": "gpu",
+      "label": "Lazy GGUF packed tensor residency",
+      "description": "For lazy quantized GGUF execution, choose where the compact packed GGUF tensors live. GPU/XPU keeps the same on-the-fly layer dequantization path but avoids repeatedly paging packed weights through system RAM. CPU is safer if VRAM is tight."
+    },
+    {
+      "key": "ltx_video_only",
+      "type": "bool",
+      "default": true,
+      "label": "Video-only sampling",
+      "description": "For MP4-only generation, skip the AVTransformer audio sampling branch to reduce RAM and runtime. Turn off only when you intentionally want full AV conditioning/audio-path testing."
+    },
+    {
       "key": "use_wan",
       "type": "bool",
       "required": false,
-      "label": "Force Wan pipeline (diffusers)"
+      "label": "Force pipeline (diffusers)"
     },
     {
       "key": "use_wan_vae",
       "type": "bool",
       "required": false,
-      "label": "Wan: load VAE subfolder"
+      "label": "Load VAE subfolder"
     },
     {
       "key": "wan_vae_subfolder",
       "type": "str",
       "default": "vae",
-      "label": "Wan VAE subfolder"
+      "label": "VAE subfolder"
     },
     {
       "key": "wan_vae_dtype",
@@ -85,7 +306,7 @@
       "key": "gguf_path",
       "type": "path",
       "required": false,
-      "label": "GGUF path (if ComfyUI workflows)"
+      "label": "GGUF path (diffusers gguf)"
     },
     {
       "key": "width",

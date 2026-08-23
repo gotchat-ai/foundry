@@ -5,7 +5,97 @@
       "key": "model_path",
       "type": "path",
       "required": true,
-      "label": "Whisper/ASR GGUF model path"
+      "label": "Speech / ASR model path"
+    },
+    {
+      "key": "speech_backend",
+      "type": "enum",
+      "default": "auto",
+      "choices": [
+        { "value": "auto", "label": "Auto-detect backend" },
+        { "value": "whisper", "label": "Whisper" },
+        { "value": "parakeet", "label": "Parakeet" },
+        { "value": "canary_qwen", "label": "Canary Qwen" },
+        { "value": "qwen3_asr", "label": "Qwen3 ASR" },
+        { "value": "generic_asr", "label": "Generic ASR" }
+      ],
+      "label": "Speech backend family"
+    },
+    {
+      "key": "device",
+      "type": "enum",
+      "default": "auto",
+      "choices": [
+        { "value": "auto", "label": "Auto device" },
+        { "value": "cpu", "label": "CPU" },
+        { "value": "cuda", "label": "CUDA" },
+        { "value": "xpu", "label": "Intel XPU" }
+      ],
+      "label": "Device"
+    },
+    {
+      "key": "managed_crispasr_install_id",
+      "type": "text",
+      "default": "",
+      "label": "Managed CrispASR install id (optional)"
+    },
+    {
+      "key": "crispasr_cli_path",
+      "type": "path",
+      "required": false,
+      "label": "CrispASR / speech runtime executable path"
+    },
+    {
+      "key": "speech_runtime_extra_args",
+      "type": "text",
+      "default": "",
+      "label": "Speech runtime extra args (space-separated)"
+    },
+    {
+      "key": "n_gpu_layers",
+      "type": "int",
+      "default": -1,
+      "label": "GPU layers (-1=auto)"
+    },
+    {
+      "key": "main_gpu",
+      "type": "int",
+      "default": 0,
+      "label": "Main GPU device id (0=default)"
+    },
+    {
+      "key": "gpu_selection_mode",
+      "type": "enum",
+      "default": "auto",
+      "choices": [
+        { "value": "auto", "label": "Auto GPU placement" },
+        { "value": "single", "label": "Single GPU only" },
+        { "value": "split", "label": "Split across GPUs" }
+      ],
+      "label": "GPU selection mode"
+    },
+    {
+      "key": "gpu_split_mode",
+      "type": "enum",
+      "default": "layer",
+      "choices": [
+        { "value": "layer", "label": "Layer split (recommended)" },
+        { "value": "row", "label": "Row split" },
+        { "value": "none", "label": "Disable split mode" }
+      ],
+      "label": "GPU split mode"
+    },
+    {
+      "key": "gpu_split_devices",
+      "type": "text",
+      "default": "",
+      "label": "Split GPU device ids (comma-separated)"
+    },
+    {
+      "key": "gpu_split_percent",
+      "type": "text",
+      "default": "",
+      "label": "Split GPU percentages (comma-separated)"
     },
     {
       "key": "task",
@@ -26,7 +116,7 @@
     {
       "key": "beam_size",
       "type": "int",
-      "default": 1,
+      "default": 8,
       "label": "Beam size"
     },
     {

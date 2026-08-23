@@ -17,9 +17,10 @@
     "/v1/agent_workflow/learning",
     "/v1/agent_workflow/tools",
     "/v1/agent_workflow/profiles",
-    "/v1/agent_workflow/profiles/reload"
-    ,"/v1/agent_workflow/profiles/files"
-    ,"/v1/agent_workflow/profiles/upsert"
-    ,"/v1/agent_workflow/agents/config"
-  ]
+    "/v1/agent_workflow/profiles/reload",
+    "/v1/agent_workflow/profiles/files",
+    "/v1/agent_workflow/profiles/upsert",
+    "/v1/agent_workflow/agents/config"
+  ],
+  "category": "Agent/Workflows"
 }

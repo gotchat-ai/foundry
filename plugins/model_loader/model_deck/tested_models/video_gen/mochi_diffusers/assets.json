@@ -1,0 +1,11 @@
+{
+  "python_bin": "python",
+  "script_path": "${LLMLOADER2_ROOT}/tools/run_mochi_video.py",
+  "_asset_sources": {
+    "model_path": {
+      "type": "huggingface",
+      "repo_id": "genmo/mochi-1-preview",
+      "url": "https://huggingface.co/genmo/mochi-1-preview"
+    }
+  }
+}

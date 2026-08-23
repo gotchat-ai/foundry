@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "id": "minimax_h3",
+  "name": "MiniMax H3",
+  "description": "Capabilities for MiniMax H3 REF2V/REF2VA workflows. This manifest does not launch a Comfy server or activate workflows.",
+  "model_types": ["video_gen"],
+  "aliases": ["minimax_h3_ref2va_gguf", "minimax-h3-ref2va-gguf", "minimax_h3", "minimax_ref2va"],
+  "families": ["minimax_h3_ref2va_gguf", "minimax_h3", "minimax_ref2va"],
+  "skills": {
+    "asset_resolver": "models.asset_resolver",
+    "ref_inputs": "models.minimax_ref_inputs",
+    "reference_inputs": "models.minimax_ref_inputs",
+    "prompt_encoder": "models.minimax_text_encoder",
+    "text_encoder": "models.minimax_text_encoder",
+    "transformer_loader": "models.minimax_ref2va_transformer_loader",
+    "gguf_transformer_loader": "models.minimax_ref2va_transformer_loader",
+    "conditioning": "models.minimax_ref2v_conditioning",
+    "ref2v_conditioning": "models.minimax_ref2v_conditioning",
+    "sampler": "models.minimax_sampler",
+    "video_vae_decode": "models.minimax_video_vae_decode",
+    "audio_vae_decode": "models.minimax_audio_vae_decode",
+    "vae_decode": "models.minimax_video_vae_decode",
+    "rtx_upscale": "models.minimax_rtx_upscale",
+    "video_encode": "models.minimax_media_encode",
+    "media_encode": "models.minimax_media_encode",
+    "cleanup": "models.cleanup"
+  },
+  "asset_keys": {
+    "transformer_gguf_path": {"label": "MiniMax H3 transformer GGUF", "kind": "local_or_hf_file", "required": true, "source": "https://huggingface.co/vantagewithai/MiniMax-H3-comfyUI-GGUF"},
+    "video_vae_path": {"label": "MiniMax H3 video VAE", "kind": "local_or_hf_file", "required": true, "source": "https://huggingface.co/Comfy-Org/MiniMax-H3"},
+    "first_image_path": {"label": "First reference image", "kind": "runtime_media", "required": true},
+    "last_image_path": {"label": "Last reference image", "kind": "runtime_media", "required": false}
+  },
+  "setting_schema_refs": {
+    "ref_inputs": "schemas/minimax_ref_inputs.json",
+    "sampler": "schemas/minimax_sampler.json"
+  },
+  "examples": []
+}

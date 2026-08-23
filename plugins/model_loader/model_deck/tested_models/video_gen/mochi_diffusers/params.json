@@ -1,0 +1,9 @@
+{
+  "model_id": "genmo/mochi-1-preview",
+  "width": 848,
+  "height": 480,
+  "frames": 31,
+  "fps": 16,
+  "steps": 28,
+  "guidance_scale": 3.5
+}

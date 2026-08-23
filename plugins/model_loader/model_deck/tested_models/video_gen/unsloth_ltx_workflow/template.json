@@ -1,0 +1,85 @@
+{
+  "argv": [
+    "{python_bin}",
+    "{workflow_runner_path}",
+    "--prompt",
+    "{prompt}",
+    "--output",
+    "{output_path}",
+    "--gguf",
+    "{gguf_path}",
+    "--embeddings-connectors",
+    "{embeddings_connectors_path}",
+    "--video-vae",
+    "{video_vae_path}",
+    "--audio-vae",
+    "{audio_vae_path}",
+    "--text-encoder",
+    "{text_encoder_gguf_path}",
+    "--mmproj",
+    "{text_encoder_mmproj_path}"
+  ],
+  "optional": [
+    {
+      "setting": "model_id",
+      "flag": "--model-id"
+    },
+    {
+      "setting": "negative_prompt",
+      "flag": "--negative-prompt"
+    },
+    {
+      "setting": "device",
+      "flag": "--device"
+    },
+    {
+      "setting": "dtype",
+      "flag": "--dtype"
+    },
+    {
+      "setting": "width",
+      "flag": "--width"
+    },
+    {
+      "setting": "height",
+      "flag": "--height"
+    },
+    {
+      "setting": "frames",
+      "flag": "--frames"
+    },
+    {
+      "setting": "fps",
+      "flag": "--fps"
+    },
+    {
+      "setting": "steps",
+      "flag": "--steps"
+    },
+    {
+      "setting": "guidance_scale",
+      "flag": "--guidance-scale"
+    },
+    {
+      "setting": "seed",
+      "flag": "--seed"
+    },
+    {
+      "setting": "distilled_lora_path",
+      "flag": "--distilled-lora"
+    },
+    {
+      "setting": "spatial_upscaler_path",
+      "flag": "--spatial-upscaler"
+    },
+    {
+      "setting": "gemma_text_encoding_device",
+      "flag": "--gemma-text-encoding-device"
+    },
+    {
+      "setting": "native_transformer_offload",
+      "flag": "--native-transformer-offload"
+    }
+  ],
+  "append_extra_args_setting": "video_runtime_extra_args"
+}

@@ -443,6 +443,13 @@ def get_plugin_access(summary: Dict[str, Any], plugin_id: str) -> Dict[str, bool
         access["view"] = bool(access["view"] or has_permission(summary, "plugin_repo.view") or has_permission(summary, "ui.plugins.view"))
         access["open"] = bool(access["open"] or has_permission(summary, "plugin_repo.view") or has_permission(summary, "ui.plugins.view"))
         access["settings"] = bool(access["settings"] or has_permission(summary, "plugins.manage.install"))
+    if plugin_key in {"voice_webrtc_stt", "voice_wespeaker_webrtc_stt"}:
+        # Browser-side STT variants are regular end-user plugins, not admin surfaces.
+        # If the user is signed in and the plugin is enabled in the client, allow it
+        # to open without requiring an explicit per-plugin policy row.
+        is_signed_in = bool(str(summary.get("username") or "").strip())
+        access["view"] = bool(access["view"] or is_signed_in)
+        access["open"] = bool(access["open"] or is_signed_in)
     if plugin_key == GUI_PLUGIN_ID:
         access["view"] = bool(access["view"] or has_permission(summary, "permissions.view"))
         access["open"] = bool(access["open"] or has_permission(summary, "permissions.view"))

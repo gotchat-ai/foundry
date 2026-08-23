@@ -1,0 +1,29 @@
+{
+  "command_path": "${LLMLOADER2_ROOT}/tools/stable-diffusion.exe",
+  "gguf_path": "${MODEL_DECK_MODELS_DIR}/flux/flux1-schnell-q4_k_m.gguf",
+  "vae_path": "${MODEL_DECK_MODELS_DIR}/flux/ae.safetensors",
+  "clip_l_path": "${MODEL_DECK_MODELS_DIR}/flux/clip_l.safetensors",
+  "clip_g_path": "${MODEL_DECK_MODELS_DIR}/flux/clip_g.safetensors",
+  "_asset_sources": {
+    "gguf_path": {
+      "type": "huggingface",
+      "repo_id": "unsloth/FLUX.1-dev-GGUF",
+      "url": "https://huggingface.co/unsloth/FLUX.1-dev-GGUF"
+    },
+    "clip_l_path": {
+      "type": "huggingface",
+      "repo_id": "comfyanonymous/flux_text_encoders",
+      "url": "https://huggingface.co/comfyanonymous/flux_text_encoders"
+    },
+    "clip_g_path": {
+      "type": "huggingface",
+      "repo_id": "comfyanonymous/flux_text_encoders",
+      "url": "https://huggingface.co/comfyanonymous/flux_text_encoders"
+    },
+    "vae_path": {
+      "type": "huggingface",
+      "repo_id": "black-forest-labs/FLUX.1-dev",
+      "url": "https://huggingface.co/black-forest-labs/FLUX.1-dev"
+    }
+  }
+}

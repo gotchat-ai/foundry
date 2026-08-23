@@ -162,6 +162,16 @@ class ModelSearchRequest(BaseModel):
     limit: int = 10
 
 
+class RepoSearchRequest(BaseModel):
+    query: str = ""
+    limit: int = 12
+    task: str = ""
+
+
+class RepoDownloadRequest(BaseModel):
+    repo_id: str
+
+
 class ModelDownloadRequest(BaseModel):
     repo_id: str
     filename: str
@@ -660,6 +670,30 @@ def _hf_api_client():
     return HfApi()
 
 
+def _hf_list_models(api: Any, *, search: str, limit: int, token: Optional[str] = None):
+    attempts = [
+        {"search": search, "sort": "downloads", "direction": -1, "limit": limit, "token": token},
+        {"search": search, "sort": "downloads", "limit": limit, "token": token},
+        {"search": search, "limit": limit, "token": token},
+        {"search": search, "sort": "downloads", "direction": -1, "limit": limit},
+        {"search": search, "sort": "downloads", "limit": limit},
+        {"search": search, "limit": limit},
+    ]
+    last_exc: Optional[Exception] = None
+    for kwargs in attempts:
+        try:
+            return api.list_models(**kwargs)
+        except TypeError as exc:
+            last_exc = exc
+            continue
+        except Exception as exc:
+            last_exc = exc
+            break
+    if last_exc is not None:
+        raise last_exc
+    return []
+
+
 def _is_single_file_gguf_name(name: str) -> bool:
     low = str(name or "").strip().lower()
     if not low.endswith(".gguf"):
@@ -745,9 +779,7 @@ def _search_hf_gguf_models(app: Any, query: str, *, limit: int = 10) -> List[Dic
     token = _resolve_hf_token(app) or None
     for candidate in _hf_query_candidates(q):
         try:
-            models_iter = api.list_models(search=candidate, sort="downloads", direction=-1, limit=search_limit, token=token)
-        except TypeError:
-            models_iter = api.list_models(search=candidate, sort="downloads", direction=-1, limit=search_limit)
+            models_iter = _hf_list_models(api, search=candidate, limit=search_limit, token=token)
         except Exception:
             continue
         for info in models_iter:
@@ -803,6 +835,148 @@ def _search_hf_gguf_models(app: Any, query: str, *, limit: int = 10) -> List[Dic
             if len(rows) >= limit:
                 return rows
     return rows
+
+
+def _matches_repo_task(detail: Any, task: str) -> bool:
+    task_value = str(task or "").strip().lower()
+    if not task_value:
+        return True
+    pipeline_tag = str(getattr(detail, "pipeline_tag", "") or "").strip().lower()
+    tags = [str(item or "").strip().lower() for item in (getattr(detail, "tags", None) or [])]
+    haystack = " ".join([pipeline_tag] + tags)
+    if task_value == "image":
+        return any(token in haystack for token in (
+            "text-to-image",
+            "image-to-image",
+            "diffusers",
+            "flux",
+            "stable-diffusion",
+            "sdxl",
+            "image-generation",
+        ))
+    if task_value == "video":
+        return any(token in haystack for token in (
+            "text-to-video",
+            "image-to-video",
+            "video-to-video",
+            "video-generation",
+            "wan",
+            "stable-video-diffusion",
+            "svd",
+        ))
+    return True
+
+
+def _query_terms_match_repo(detail: Any, query: str) -> bool:
+    q = str(query or "").strip().lower()
+    if not q:
+        return False
+    repo_id = str(getattr(detail, "id", "") or "").strip().lower()
+    pipeline_tag = str(getattr(detail, "pipeline_tag", "") or "").strip().lower()
+    tags = [str(item or "").strip().lower() for item in (getattr(detail, "tags", None) or [])]
+    haystack = " ".join([repo_id, pipeline_tag] + tags)
+    parts = [part for part in re.split(r"[^a-z0-9]+", q) if part and len(part) >= 2]
+    if not parts:
+        return False
+    matches = 0
+    for part in parts:
+        if part in haystack:
+            matches += 1
+    return matches >= max(1, min(2, len(parts)))
+
+
+def _repo_search_score(detail: Any, query: str, task: str) -> float:
+    repo_id = str(getattr(detail, "id", "") or "").strip().lower()
+    pipeline_tag = str(getattr(detail, "pipeline_tag", "") or "").strip().lower()
+    tags = [str(item or "").strip().lower() for item in (getattr(detail, "tags", None) or [])]
+    downloads = float(getattr(detail, "downloads", 0) or 0)
+    likes = float(getattr(detail, "likes", 0) or 0)
+    score = downloads + (likes * 25.0)
+    q = str(query or "").strip().lower()
+    if q and q in repo_id:
+        score += 50000.0
+    if q:
+        parts = [part for part in re.split(r"[^a-z0-9]+", q) if part]
+        for part in parts:
+            if part in repo_id:
+                score += 4000.0
+            if any(part in tag for tag in tags):
+                score += 1500.0
+            if part in pipeline_tag:
+                score += 1500.0
+    task_value = str(task or "").strip().lower()
+    if task_value and _matches_repo_task(detail, task_value):
+        score += 20000.0
+    elif task_value and _query_terms_match_repo(detail, q):
+        score += 8000.0
+    return score
+
+
+def _search_hf_repos(app: Any, query: str, *, limit: int = 12, task: str = "") -> List[Dict[str, Any]]:
+    api = _hf_api_client()
+    q = _sanitize_model_search_query(query)
+    if not q:
+        raise HTTPException(status_code=400, detail="search query required")
+    rows: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    search_limit = max(limit * 5, 30)
+    token = _resolve_hf_token(app) or None
+    for candidate in _hf_query_candidates(q):
+        try:
+            models_iter = list(_hf_list_models(api, search=candidate, limit=search_limit, token=token))
+        except Exception:
+            continue
+        for info in models_iter:
+            repo_id = str(getattr(info, "id", "") or "").strip()
+            if not repo_id or repo_id in seen:
+                continue
+            seen.add(repo_id)
+            detail = info
+            tags = [str(item or "").strip() for item in (getattr(detail, "tags", None) or []) if str(item or "").strip()]
+            rows.append({
+                "repo_id": repo_id,
+                "downloads": getattr(detail, "downloads", None),
+                "likes": getattr(detail, "likes", None),
+                "last_modified": str(getattr(detail, "last_modified", "") or ""),
+                "pipeline_tag": getattr(detail, "pipeline_tag", None),
+                "tags": tags[:12],
+                "repo_url": f"https://huggingface.co/{repo_id}",
+                "_score": _repo_search_score(detail, q, task),
+            })
+    rows.sort(key=lambda item: float(item.get("_score") or 0), reverse=True)
+    trimmed: List[Dict[str, Any]] = []
+    for item in rows[:limit]:
+        row = dict(item)
+        row.pop("_score", None)
+        trimmed.append(row)
+    return trimmed
+
+
+def _snapshot_hf_repo(app: Any, repo_id: str) -> Dict[str, Any]:
+    repo_value = str(repo_id or "").strip()
+    if not repo_value:
+        raise HTTPException(status_code=400, detail="repo_id required")
+    token = _resolve_hf_token(app)
+    cache_dir = _resolve_hf_cache_dir(app)
+    try:
+        from huggingface_hub import snapshot_download
+    except Exception as exc:
+        raise HTTPException(500, f"huggingface_hub not available: {exc}") from exc
+    kwargs: Dict[str, Any] = {"repo_id": repo_value}
+    if token:
+        kwargs["token"] = token
+    if cache_dir:
+        kwargs["cache_dir"] = cache_dir
+    try:
+        cache_path = snapshot_download(**kwargs)
+    except Exception as exc:
+        raise HTTPException(500, f"failed to download Hugging Face repo: {exc}") from exc
+    return {
+        "repo_id": repo_value,
+        "cache_path": cache_path,
+        "model_source": repo_value,
+        "storage": "hf_cache_repo",
+    }
 
 
 def _wizard_models_dir() -> Path:
@@ -1197,9 +1371,38 @@ def install(app: Any) -> None:
     def setup_wizard_model_search(request: Request, body: ModelSearchRequest):
         require_gui_plugin_enabled(request, gui_plugin_id=GUI_PLUGIN_ID)
         _require_admin(request)
-        q = _sanitize_model_search_query(body.query)
-        rows = _search_hf_gguf_models(request.app, q, limit=max(1, min(int(body.limit or 10), 20)))
-        return {"ok": True, "query": q, "results": rows}
+        try:
+            q = _sanitize_model_search_query(body.query)
+            rows = _search_hf_gguf_models(request.app, q, limit=max(1, min(int(body.limit or 10), 20)))
+            return {"ok": True, "query": q, "results": rows}
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(500, f"hf_gguf_search_failed: {exc}") from exc
+
+    @r.post("/v1/setup_wizard/model/repo_search")
+    def setup_wizard_model_repo_search(request: Request, body: RepoSearchRequest):
+        require_gui_plugin_enabled(request, gui_plugin_id=GUI_PLUGIN_ID)
+        _require_admin(request)
+        try:
+            q = _sanitize_model_search_query(body.query)
+            rows = _search_hf_repos(
+                request.app,
+                q,
+                limit=max(1, min(int(body.limit or 12), 30)),
+                task=str(body.task or "").strip().lower(),
+            )
+            return {"ok": True, "query": q, "task": str(body.task or "").strip().lower(), "results": rows}
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(500, f"hf_repo_search_failed: {exc}") from exc
+
+    @r.post("/v1/setup_wizard/model/repo_download")
+    def setup_wizard_model_repo_download(request: Request, body: RepoDownloadRequest):
+        require_gui_plugin_enabled(request, gui_plugin_id=GUI_PLUGIN_ID)
+        _require_admin(request)
+        return {"ok": True, **_snapshot_hf_repo(request.app, body.repo_id)}
 
     @r.post("/v1/setup_wizard/model/download")
     def setup_wizard_model_download(request: Request, body: ModelDownloadRequest):

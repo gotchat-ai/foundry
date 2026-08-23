@@ -1,0 +1,179 @@
+{
+  "recommended_loader_id": "model_loader.model_deck.speech_asr",
+  "fields": [
+    {
+      "key": "model_path",
+      "type": "path",
+      "required": true,
+      "label": "Speech / ASR model path"
+    },
+    {
+      "key": "speech_backend",
+      "type": "enum",
+      "default": "auto",
+      "choices": [
+        { "value": "auto", "label": "Auto-detect backend" },
+        { "value": "whisper", "label": "Whisper" },
+        { "value": "parakeet", "label": "Parakeet" },
+        { "value": "canary_qwen", "label": "Canary Qwen" },
+        { "value": "qwen3_asr", "label": "Qwen3 ASR" },
+        { "value": "generic_asr", "label": "Generic ASR" }
+      ],
+      "label": "Speech backend family"
+    },
+    {
+      "key": "speech_command_mode",
+      "type": "enum",
+      "default": "standard",
+      "choices": [
+        { "value": "standard", "label": "Built-in backend routing" },
+        { "value": "advanced", "label": "Custom command template" }
+      ],
+      "label": "Execution mode",
+      "description": "Built-in backend routing auto-detects the ASR family and uses the loader's built-in command builder. Custom command template uses the JSON template below so you can define the CrispASR arguments yourself."
+    },
+    {
+      "key": "speech_template_preset",
+      "type": "enum",
+      "default": "generic_asr",
+      "choices": [
+        { "value": "generic_asr", "label": "Generic ASR preset" }
+      ],
+      "label": "Template preset"
+    },
+    {
+      "key": "speech_runtime_template_json",
+      "type": "textarea",
+      "default": "",
+      "rows": 8,
+      "label": "Custom command template JSON",
+      "description": "Optional JSON object that overrides the preset. Supported keys: argv[], optional[], append_extra_args_setting, append_args[]. Used when Execution mode is Custom command template."
+    },
+    {
+      "key": "speech_runtime_assets_json",
+      "type": "textarea",
+      "default": "",
+      "rows": 5,
+      "label": "Custom asset JSON",
+      "description": "Optional JSON object for extra file paths or named assets used by the template. Used when Execution mode is Custom command template."
+    },
+    {
+      "key": "speech_runtime_params_json",
+      "type": "textarea",
+      "default": "",
+      "rows": 5,
+      "label": "Custom parameter JSON",
+      "description": "Optional JSON object for default template parameters. Used when Execution mode is Custom command template."
+    },
+    {
+      "key": "device",
+      "type": "enum",
+      "default": "auto",
+      "choices": [
+        { "value": "auto", "label": "Auto device" },
+        { "value": "cpu", "label": "CPU" },
+        { "value": "cuda", "label": "CUDA" },
+        { "value": "xpu", "label": "Intel XPU" }
+      ],
+      "label": "Device"
+    },
+    {
+      "key": "managed_crispasr_install_id",
+      "type": "text",
+      "default": "",
+      "label": "Managed CrispASR install id (optional)"
+    },
+    {
+      "key": "crispasr_cli_path",
+      "type": "path",
+      "required": false,
+      "label": "CrispASR / speech runtime executable path"
+    },
+    {
+      "key": "speech_runtime_extra_args",
+      "type": "text",
+      "default": "",
+      "label": "Speech runtime extra args (space-separated)"
+    },
+    {
+      "key": "n_gpu_layers",
+      "type": "int",
+      "default": -1,
+      "label": "GPU layers (-1=auto)"
+    },
+    {
+      "key": "main_gpu",
+      "type": "int",
+      "default": 0,
+      "label": "Main GPU device id (0=default)"
+    },
+    {
+      "key": "gpu_selection_mode",
+      "type": "enum",
+      "default": "auto",
+      "choices": [
+        { "value": "auto", "label": "Auto GPU placement" },
+        { "value": "single", "label": "Single GPU only" },
+        { "value": "split", "label": "Split across GPUs" }
+      ],
+      "label": "GPU selection mode"
+    },
+    {
+      "key": "gpu_split_mode",
+      "type": "enum",
+      "default": "layer",
+      "choices": [
+        { "value": "layer", "label": "Layer split (recommended)" },
+        { "value": "row", "label": "Row split" },
+        { "value": "none", "label": "Disable split mode" }
+      ],
+      "label": "GPU split mode"
+    },
+    {
+      "key": "gpu_split_devices",
+      "type": "text",
+      "default": "",
+      "label": "Split GPU device ids (comma-separated)"
+    },
+    {
+      "key": "gpu_split_percent",
+      "type": "text",
+      "default": "",
+      "label": "Split GPU percentages (comma-separated)"
+    },
+    {
+      "key": "task",
+      "type": "enum",
+      "choices": [
+        "transcribe",
+        "translate"
+      ],
+      "default": "transcribe",
+      "label": "Task"
+    },
+    {
+      "key": "language",
+      "type": "str",
+      "default": "",
+      "label": "Language (optional)"
+    },
+    {
+      "key": "beam_size",
+      "type": "int",
+      "default": 8,
+      "label": "Beam size"
+    },
+    {
+      "key": "vad",
+      "type": "bool",
+      "default": true,
+      "label": "VAD"
+    },
+    {
+      "key": "word_timestamps",
+      "type": "bool",
+      "default": false,
+      "label": "Word timestamps"
+    }
+  ]
+}

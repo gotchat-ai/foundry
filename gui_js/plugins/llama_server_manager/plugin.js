@@ -1289,8 +1289,8 @@ function createSharedApi(host) {
     id: "llama_server_api",
     type: "api_provider",
     service: "llama_server",
-    async getStatus() {
-      return clientJson(sharedCtx, "/v1/llama_server/status");
+    async getStatus({ lightweight = true } = {}) {
+      return clientJson(sharedCtx, `/v1/llama_server/status?lightweight=${lightweight ? 1 : 0}`);
     },
     async getDevices({ installId = "", runtimeId = "" } = {}) {
       const qs = installId

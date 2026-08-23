@@ -157,6 +157,30 @@ def _sdcpp_normalize_image(out: Any) -> Any:
 
 
 def load(request: Request, settings: Dict[str, Any]) -> Dict[str, Any]:
+    if str(settings.get("image_command_mode") or "standard").strip().lower() == "advanced":
+        model_ref = str(settings.get("model_path") or settings.get("gguf_path") or settings.get("model_id") or "").strip()
+        _STATE.update({
+            "loaded": True,
+            "model_path": model_ref or None,
+            "settings": settings,
+            "ts": int(time.time()),
+        })
+        if callable(publish_gui_event):
+            try:
+                publish_gui_event(
+                    "processes.changed",
+                    {"kind": "image_gen", "action": "load", "loader_id": LOADER_ID, "model_path": model_ref},
+                )
+            except Exception:
+                pass
+        return {
+            "ok": True,
+            "loader_id": LOADER_ID,
+            "loaded": True,
+            "model_path": model_ref,
+            "mode": "advanced",
+        }
+
     if _backend(settings) == "sd_cpp":
         _sdcpp_load(settings)
         _STATE.update({

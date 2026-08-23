@@ -3,5 +3,6 @@
   "name": "Auth/Projects",
   "kind": "auth",
   "description": "Remote login, projects/sessions, collab sync",
-  "entry": "plugin.js"
+  "entry": "plugin.js",
+  "category": "Auth/Projects"
 }

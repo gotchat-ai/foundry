@@ -10,6 +10,6 @@
     "/v1/browser_relay/result",
     "/v1/browser_relay/result/{command_id}",
     "/v1/browser_relay/status"
-  ]
+  ],
+  "category": "Tools/Extensions"
 }
-

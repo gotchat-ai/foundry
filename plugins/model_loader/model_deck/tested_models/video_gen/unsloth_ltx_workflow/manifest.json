@@ -1,0 +1,417 @@
+{
+  "id": "unsloth_ltx_workflow",
+  "label": "Unsloth LTX GGUF Workflow",
+  "description": "Tested built-in workflow profile for Unsloth LTX-2.3 GGUF repos with companion connectors, video/audio VAEs, and Gemma text-encoder assets.",
+  "workflow_file": "workflow.json",
+  "aliases": [
+    "unsloth/ltx-2.3-gguf",
+    "unsloth/ltx-2.3",
+    "distilled-1.1/ltx-2.3",
+    "ltx-2.3-22b",
+    "ltx-2.3-22b-distilled-1.1",
+    "ltx-2.3-22b-dev",
+    "ltx-2.3-22b-distilled",
+    "ltx-2.3-22b-distilled-1.1-ud-q4_k_m.gguf",
+    "ltx-2.3-22b-dev-q4_k_m.gguf"
+  ],
+  "backends": [
+    "diffusers"
+  ],
+  "runtime_profile": {
+    "kind": "internal_workflow",
+    "workflow_id": "unsloth_ltx23_gguf",
+    "workflow_model_loader_id": "models.unsloth_ltx23_gguf",
+    "workflow_model_loader_file": "workflow.json",
+    "supports_workflow_model_loader": true,
+    "family": "unsloth_ltx23_multi_asset",
+    "scenario": "video_gguf_multi_asset",
+    "asset_slots": [
+      {
+        "key": "workflow_runner_path",
+        "role": "workflow_runner_script",
+        "required": true,
+        "source": "local_file"
+      },
+      {
+        "key": "gguf_path",
+        "role": "video_transformer_gguf",
+        "required": true,
+        "source": "local_or_hf_file"
+      },
+      {
+        "key": "embeddings_connectors_path",
+        "role": "embeddings_connectors",
+        "required": true,
+        "source": "local_or_hf_file"
+      },
+      {
+        "key": "video_vae_path",
+        "role": "video_vae",
+        "required": true,
+        "source": "local_or_hf_file"
+      },
+      {
+        "key": "audio_vae_path",
+        "role": "audio_vae",
+        "required": true,
+        "source": "local_or_hf_file"
+      },
+      {
+        "key": "text_encoder_safetensors_path",
+        "role": "text_encoder_safetensors",
+        "required": false,
+        "source": "local_or_hf_file"
+      },
+      {
+        "key": "text_encoder_tokenizer_gguf_path",
+        "role": "text_encoder_tokenizer_gguf",
+        "required": false,
+        "source": "local_or_hf_file"
+      },
+      {
+        "key": "text_encoder_gguf_path",
+        "role": "text_encoder_gguf",
+        "required": true,
+        "source": "local_or_hf_file"
+      },
+      {
+        "key": "workflow_loader_mode",
+        "role": "workflow_loader_mode",
+        "required": false,
+        "source": "setting"
+      },
+      {
+        "key": "workflow_node_lifecycle_policy",
+        "role": "node_lifecycle_policy",
+        "required": false,
+        "source": "setting"
+      },
+      {
+        "key": "workflow_execution_backend",
+        "role": "workflow_execution_backend",
+        "required": false,
+        "source": "setting"
+      },
+      {
+        "key": "gemma_text_encoding_device",
+        "role": "text_encoder_runtime_device",
+        "required": false,
+        "source": "setting"
+      },
+      {
+        "key": "native_transformer_offload",
+        "role": "transformer_offload_mode",
+        "required": false,
+        "source": "setting"
+      },
+      {
+        "key": "ltx_stage1_sampler",
+        "role": "ltx_stage1_sampler",
+        "required": false,
+        "source": "setting",
+        "default": "euler_ancestral"
+      },
+      {
+        "key": "ltx_stage1_sigmas",
+        "role": "ltx_stage1_manual_sigmas",
+        "required": false,
+        "source": "setting",
+        "default": "1., 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"
+      },
+      {
+        "key": "ltx_stage1_cfg",
+        "role": "ltx_stage1_cfg",
+        "required": false,
+        "source": "setting",
+        "default": 1.0
+      },
+      {
+        "key": "ltx_stage2_sampler",
+        "role": "ltx_stage2_sampler",
+        "required": false,
+        "source": "setting",
+        "default": "euler"
+      },
+      {
+        "key": "ltx_stage2_sigmas",
+        "role": "ltx_stage2_manual_sigmas",
+        "required": false,
+        "source": "setting",
+        "default": "0.85, 0.7250, 0.4219, 0.0"
+      },
+      {
+        "key": "ltx_stage2_cfg",
+        "role": "ltx_stage2_cfg",
+        "required": false,
+        "source": "setting",
+        "default": 1.0
+      },
+      {
+        "key": "ltx_crop_guides_enabled",
+        "role": "ltx_crop_guides_enabled",
+        "required": false,
+        "source": "setting",
+        "default": true
+      },
+      {
+        "key": "ltx_chunk_feedforward_chunks",
+        "role": "ltx_chunk_feedforward_chunks",
+        "required": false,
+        "source": "setting",
+        "default": 2
+      },
+      {
+        "key": "ltx_chunk_feedforward_dim_threshold",
+        "role": "ltx_chunk_feedforward_dim_threshold",
+        "required": false,
+        "source": "setting",
+        "default": 2048
+      },
+      {
+        "key": "ltx_distilled_lora_strength",
+        "role": "ltx_distilled_lora_strength",
+        "required": false,
+        "source": "setting",
+        "default": 0.6
+      },
+      {
+        "key": "ltx_detailer_lora_path",
+        "role": "optional_detailer_lora",
+        "required": false,
+        "source": "local_or_hf_file"
+      },
+      {
+        "key": "ltx_detailer_lora_strength",
+        "role": "ltx_detailer_lora_strength",
+        "required": false,
+        "source": "setting",
+        "default": 0.5
+      },
+      {
+        "key": "ltx_vae_decode_tiling_mode",
+        "role": "ltx_vae_decode_tiling_mode",
+        "required": false,
+        "source": "setting",
+        "default": "native_default"
+      },
+      {
+        "key": "ltx_vae_decode_tile_size",
+        "role": "ltx_vae_decode_tile_size",
+        "required": false,
+        "source": "setting",
+        "default": 768
+      },
+      {
+        "key": "ltx_vae_decode_overlap",
+        "role": "ltx_vae_decode_overlap",
+        "required": false,
+        "source": "setting",
+        "default": 64
+      },
+      {
+        "key": "ltx_vae_decode_temporal_size",
+        "role": "ltx_vae_decode_temporal_size",
+        "required": false,
+        "source": "setting",
+        "default": 80
+      },
+      {
+        "key": "ltx_vae_decode_temporal_overlap",
+        "role": "ltx_vae_decode_temporal_overlap",
+        "required": false,
+        "source": "setting",
+        "default": 24
+      },
+      {
+        "key": "text_encoder_mmproj_path",
+        "role": "text_encoder_mmproj",
+        "required": true,
+        "source": "local_or_hf_file"
+      },
+      {
+        "key": "distilled_lora_path",
+        "role": "optional_distilled_lora",
+        "required": true,
+        "source": "local_or_hf_file"
+      },
+      {
+        "key": "spatial_upscaler_path",
+        "role": "optional_spatial_upscaler",
+        "required": true,
+        "source": "local_or_hf_file"
+      }
+    ],
+    "pipeline_defaults": {
+      "base_pipeline_class": "LTX2Pipeline",
+      "base_pipeline_module": "diffusers",
+      "pipeline_source_default": "Lightricks/LTX-2",
+      "variant_sources": {
+        "distilled": "Lightricks/LTX-2"
+      }
+    },
+    "loader_steps": [
+      {
+        "id": "video_transformer",
+        "kind": "gguf_transformer",
+        "role": "video_transformer_gguf",
+        "source_setting": "gguf_path",
+        "target_arg": "transformer",
+        "class_name": "LTX2VideoTransformer3DModel",
+        "class_module": "diffusers",
+        "load_method": "from_single_file",
+        "config_subfolder": "transformer",
+        "quantization_class": "GGUFQuantizationConfig",
+        "quantization_module": "diffusers"
+      },
+      {
+        "id": "video_vae",
+        "kind": "support_asset",
+        "role": "video_vae",
+        "source_setting": "video_vae_path",
+        "target_component": "vae",
+        "class_name": "AutoencoderKLLTX2Video",
+        "class_module": "diffusers"
+      },
+      {
+        "id": "audio_vae",
+        "kind": "support_asset",
+        "role": "audio_vae",
+        "source_setting": "audio_vae_path",
+        "target_component": "audio_vae",
+        "class_name": "AutoencoderKLLTX2Audio",
+        "class_module": "diffusers"
+      },
+      {
+        "id": "embeddings_connectors",
+        "kind": "support_asset",
+        "role": "embeddings_connectors",
+        "source_setting": "embeddings_connectors_path",
+        "target_component": "connectors",
+        "class_name": "LTX2TextConnectors",
+        "class_module": "diffusers.pipelines.ltx2.connectors"
+      },
+      {
+        "id": "text_encoder",
+        "kind": "gguf_text_encoder",
+        "role": "text_encoder_gguf",
+        "source_setting": "text_encoder_gguf_path",
+        "aux_source_setting": "text_encoder_mmproj_path",
+        "aux_role": "text_encoder_mmproj",
+        "target_component": "text_encoder"
+      },
+      {
+        "id": "distilled_lora",
+        "kind": "optional_adapter",
+        "role": "optional_distilled_lora",
+        "source_setting": "distilled_lora_path"
+      },
+      {
+        "id": "spatial_upscaler",
+        "kind": "optional_support_asset",
+        "role": "optional_spatial_upscaler",
+        "source_setting": "spatial_upscaler_path"
+      },
+      {
+        "id": "pipeline_assembly",
+        "kind": "pipeline_assembly",
+        "pipeline_class_setting": "diffusers_pipeline_class",
+        "pipeline_class_default": "LTX2Pipeline",
+        "pipeline_module_setting": "diffusers_pipeline_module",
+        "pipeline_module_default": "diffusers",
+        "pipeline_source_setting": "model_id",
+        "inject_steps": [
+          "video_transformer"
+        ]
+      }
+    ]
+  },
+  "requirements": [
+    {
+      "id": "gguf",
+      "label": "gguf",
+      "kind": "python_package",
+      "package": "gguf",
+      "import_name": "gguf",
+      "install": [
+        "gguf"
+      ],
+      "uninstall": [
+        "gguf"
+      ]
+    },
+    {
+      "id": "torch",
+      "label": "PyTorch",
+      "kind": "python_package",
+      "package": "torch",
+      "import_name": "torch",
+      "install": [
+        "torch"
+      ],
+      "uninstall": [
+        "torch"
+      ]
+    },
+    {
+      "id": "diffusers",
+      "label": "diffusers",
+      "kind": "python_package",
+      "package": "diffusers",
+      "import_name": "diffusers",
+      "install": [
+        "diffusers"
+      ],
+      "uninstall": [
+        "diffusers"
+      ]
+    },
+    {
+      "id": "transformers",
+      "label": "transformers",
+      "kind": "python_package",
+      "package": "transformers",
+      "import_name": "transformers",
+      "install": [
+        "transformers"
+      ],
+      "uninstall": [
+        "transformers"
+      ]
+    },
+    {
+      "id": "accelerate",
+      "label": "accelerate",
+      "kind": "python_package",
+      "package": "accelerate",
+      "import_name": "accelerate",
+      "install": [
+        "accelerate"
+      ],
+      "uninstall": [
+        "accelerate"
+      ]
+    },
+    {
+      "id": "huggingface_hub",
+      "label": "huggingface_hub",
+      "kind": "python_package",
+      "package": "huggingface-hub",
+      "import_name": "huggingface_hub",
+      "install": [
+        "huggingface-hub"
+      ],
+      "uninstall": [
+        "huggingface-hub"
+      ]
+    },
+    {
+      "id": "ltx_2_source_checkout",
+      "label": "LTX-2 source checkout",
+      "kind": "git_source",
+      "url": "https://github.com/Lightricks/LTX-2.git",
+      "target_path": "vendor/LTX-2",
+      "detail": "Required for native ltx_core / ltx_pipelines imports. LTX-2 carries its own license, so install it as a user-managed source checkout instead of bundling it in the app package.",
+      "install_hint": "From the llmloader2 folder: git clone https://github.com/Lightricks/LTX-2.git vendor/LTX-2"
+    }
+  ]
+}

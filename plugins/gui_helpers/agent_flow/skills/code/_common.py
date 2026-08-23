@@ -41,7 +41,11 @@ def resolve_base_dir(ctx: Dict[str, Any], params: Dict[str, Any]) -> Path:
         os.getcwd(),
     ]
     candidates: List[str] = list(explicit_candidates)
-    if repo_aware:
+    # If the caller supplied a repo root explicitly, honor it even when repo_aware
+    # was not set. Agent Flow repo skills often pass target_repo_root through
+    # runtime context without toggling repo_aware, and falling back to workdir
+    # causes false "empty folder" reads.
+    if repo_aware or any(repo_candidates):
         candidates.extend(repo_candidates)
     candidates.extend(fallback_candidates)
     for raw in candidates:

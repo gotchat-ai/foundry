@@ -1,0 +1,187 @@
+{
+  "recommended_loader_id": "model_loader.model_deck.speech_tts",
+  "fields": [
+    {
+      "key": "model_path",
+      "type": "path",
+      "required": true,
+      "label": "Speech / TTS model path"
+    },
+    {
+      "key": "speech_backend",
+      "type": "enum",
+      "default": "auto",
+      "choices": [
+        { "value": "auto", "label": "Auto-detect backend" },
+        { "value": "chatterbox", "label": "Chatterbox" },
+        { "value": "kokoro", "label": "Kokoro" },
+        { "value": "vibevoice-tts", "label": "VibeVoice Realtime" },
+        { "value": "vibevoice-1.5b", "label": "VibeVoice 1.5B" },
+        { "value": "generic_tts", "label": "Generic TTS" }
+      ],
+      "label": "Speech backend family"
+    },
+    {
+      "key": "speech_command_mode",
+      "type": "enum",
+      "default": "standard",
+      "choices": [
+        { "value": "standard", "label": "Built-in backend routing" },
+        { "value": "advanced", "label": "Custom command template" }
+      ],
+      "label": "Execution mode",
+      "description": "Built-in backend routing uses the loader's built-in model-family detection and default command builder. Custom command template uses the JSON template below so you can define the CrispASR arguments, companion files, and optional flags yourself."
+    },
+    {
+      "key": "speech_template_preset",
+      "type": "enum",
+      "default": "chatterbox",
+      "choices": [
+        { "value": "chatterbox", "label": "Chatterbox preset" },
+        { "value": "kokoro", "label": "Kokoro preset" },
+        { "value": "vibevoice_custom", "label": "VibeVoice custom preset" }
+      ],
+      "label": "Template preset",
+      "description": "These presets map to real CrispASR CLI patterns: Kokoro uses --voice voice.gguf, Chatterbox supports --codec-model for the companion S3Gen file, and VibeVoice custom uses --voice for your reference or voice asset."
+    },
+    {
+      "key": "speech_runtime_template_json",
+      "type": "textarea",
+      "default": "",
+      "rows": 9,
+      "label": "Custom command template JSON",
+      "description": "Optional JSON object that overrides the preset. Supported keys: argv[], optional[], append_extra_args_setting, append_args[]. Used when Execution mode is Custom command template."
+    },
+    {
+      "key": "speech_runtime_assets_json",
+      "type": "textarea",
+      "default": "",
+      "rows": 6,
+      "label": "Custom asset JSON",
+      "description": "Optional JSON object for extra files. Common keys: companion_model_path, voice_path, ref_text, instruct_text. Blank values are ignored and not added to the command. Used when Execution mode is Custom command template."
+    },
+    {
+      "key": "speech_runtime_params_json",
+      "type": "textarea",
+      "default": "",
+      "rows": 6,
+      "label": "Custom parameter JSON",
+      "description": "Optional JSON object for default parameters such as language or temperature. Used when Execution mode is Custom command template."
+    },
+    {
+      "key": "voice_path",
+      "type": "path",
+      "default": "",
+      "label": "Voice / reference path (optional)",
+      "description": "Optional file used by backends that clone or condition on a voice. Common formats are GGUF voice packs for Kokoro or WAV reference audio for some VibeVoice/Chatterbox setups. If left blank, --voice is omitted."
+    },
+    {
+      "key": "companion_model_path",
+      "type": "path",
+      "default": "",
+      "label": "Companion model path (optional)",
+      "description": "Optional extra model file for multi-file backends. For Chatterbox this maps to CrispASR --codec-model and is typically the S3Gen companion GGUF. If left blank, --codec-model is omitted."
+    },
+    {
+      "key": "ref_text",
+      "type": "text",
+      "default": "",
+      "label": "Reference text (optional)",
+      "description": "Optional transcript for a reference voice sample when the backend supports paired reference audio plus text."
+    },
+    {
+      "key": "instruct_text",
+      "type": "text",
+      "default": "",
+      "label": "Instruction / style text (optional)"
+    },
+    {
+      "key": "language",
+      "type": "str",
+      "default": "",
+      "label": "Language (optional)"
+    },
+    {
+      "key": "temperature",
+      "type": "number",
+      "default": "",
+      "label": "Temperature (optional)"
+    },
+    {
+      "key": "device",
+      "type": "enum",
+      "default": "auto",
+      "choices": [
+        { "value": "auto", "label": "Auto device" },
+        { "value": "cpu", "label": "CPU" },
+        { "value": "cuda", "label": "CUDA" },
+        { "value": "xpu", "label": "Intel XPU" }
+      ],
+      "label": "Device"
+    },
+    {
+      "key": "managed_crispasr_install_id",
+      "type": "text",
+      "default": "",
+      "label": "Managed CrispASR install id (optional)"
+    },
+    {
+      "key": "crispasr_cli_path",
+      "type": "path",
+      "required": false,
+      "label": "CrispASR / speech runtime executable path"
+    },
+    {
+      "key": "speech_runtime_extra_args",
+      "type": "text",
+      "default": "",
+      "label": "Speech runtime extra args (space-separated)"
+    },
+    {
+      "key": "n_gpu_layers",
+      "type": "int",
+      "default": -1,
+      "label": "GPU layers (-1=auto)"
+    },
+    {
+      "key": "main_gpu",
+      "type": "int",
+      "default": 0,
+      "label": "Main GPU device id (0=default)"
+    },
+    {
+      "key": "gpu_selection_mode",
+      "type": "enum",
+      "default": "auto",
+      "choices": [
+        { "value": "auto", "label": "Auto GPU placement" },
+        { "value": "single", "label": "Single GPU only" },
+        { "value": "split", "label": "Split across GPUs" }
+      ],
+      "label": "GPU selection mode"
+    },
+    {
+      "key": "gpu_split_mode",
+      "type": "enum",
+      "default": "layer",
+      "choices": [
+        { "value": "layer", "label": "Layer split (recommended)" },
+        { "value": "row", "label": "Row split" },
+        { "value": "none", "label": "Disable split mode" }
+      ],
+      "label": "GPU split mode"
+    },
+    {
+      "key": "gpu_split_devices",
+      "type": "text",
+      "default": "",
+      "label": "Split GPU device ids (comma-separated)"
+    },
+    {
+      "key": "gpu_split_percent",
+      "type": "text",
+      "default": "",
+      "label": "Split GPU percentages (comma-separated)"
+    }
+  ]
+}

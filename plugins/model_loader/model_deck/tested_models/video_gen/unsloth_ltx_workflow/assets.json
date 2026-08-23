@@ -1,0 +1,57 @@
+{
+  "python_bin": "python",
+  "workflow_runner_path": "${LLMLOADER2_ROOT}/tools/run_unsloth_ltx_workflow.py",
+  "gguf_path": "",
+  "embeddings_connectors_path": "",
+  "video_vae_path": "",
+  "audio_vae_path": "",
+  "text_encoder_gguf_path": "",
+  "text_encoder_mmproj_path": "",
+  "distilled_lora_path": "",
+  "spatial_upscaler_path": "",
+  "_asset_sources": {
+    "gguf_path": {
+      "type": "huggingface",
+      "repo_id": "unsloth/LTX-2.3-GGUF",
+      "url": "https://huggingface.co/unsloth/LTX-2.3-GGUF"
+    },
+    "embeddings_connectors_path": {
+      "type": "huggingface",
+      "repo_id": "unsloth/LTX-2.3-GGUF",
+      "filename": "text_encoders/ltx-2.3-22b-distilled_embeddings_connectors.safetensors",
+      "url": "https://huggingface.co/unsloth/LTX-2.3-GGUF/blob/main/text_encoders/ltx-2.3-22b-distilled_embeddings_connectors.safetensors"
+    },
+    "video_vae_path": {
+      "type": "huggingface",
+      "repo_id": "unsloth/LTX-2.3-GGUF",
+      "filename": "vae/ltx-2.3-22b-distilled_video_vae.safetensors",
+      "url": "https://huggingface.co/unsloth/LTX-2.3-GGUF/blob/main/vae/ltx-2.3-22b-distilled_video_vae.safetensors"
+    },
+    "audio_vae_path": {
+      "type": "huggingface",
+      "repo_id": "unsloth/LTX-2.3-GGUF",
+      "filename": "vae/ltx-2.3-22b-distilled_audio_vae.safetensors",
+      "url": "https://huggingface.co/unsloth/LTX-2.3-GGUF/blob/main/vae/ltx-2.3-22b-distilled_audio_vae.safetensors"
+    },
+    "text_encoder_gguf_path": {
+      "type": "huggingface",
+      "repo_id": "unsloth/gemma-3-12b-it-qat-GGUF",
+      "url": "https://huggingface.co/unsloth/gemma-3-12b-it-qat-GGUF"
+    },
+    "text_encoder_mmproj_path": {
+      "type": "huggingface",
+      "repo_id": "unsloth/gemma-3-12b-it-qat-GGUF",
+      "url": "https://huggingface.co/unsloth/gemma-3-12b-it-qat-GGUF"
+    },
+    "distilled_lora_path": {
+      "type": "huggingface",
+      "repo_id": "Lightricks/LTX-2.3",
+      "url": "https://huggingface.co/Lightricks/LTX-2.3"
+    },
+    "spatial_upscaler_path": {
+      "type": "huggingface",
+      "repo_id": "Lightricks/LTX-2.3",
+      "url": "https://huggingface.co/Lightricks/LTX-2.3"
+    }
+  }
+}

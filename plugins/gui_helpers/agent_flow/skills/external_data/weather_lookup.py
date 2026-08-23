@@ -43,6 +43,36 @@ def _trim_location_suffix(text: str) -> str:
     return cleaned
 
 
+def _looks_like_non_location(text: str) -> bool:
+    low = str(text or "").strip().lower().strip(" ,.?!")
+    if not low:
+        return True
+    exact_noise = {
+        "today",
+        "tonight",
+        "tomorrow",
+        "right now",
+        "currently",
+        "current",
+        "temperature",
+        "forecast",
+        "weather",
+        "the weather",
+        "the temperature",
+    }
+    if low in exact_noise:
+        return True
+    if re.fullmatch(r"(what|whats|what's|tell me|show me|give me)(?: the)?", low):
+        return True
+    if re.match(r"^(will|would|should|do|does|did|can|could|is|are)\b", low):
+        return True
+    if any(tok in low for tok in (" rain", "umbrella", "jacket", "coat", "snow", "storm", "windy")) and not re.search(r"\b(in|for|at|near)\b", low):
+        return True
+    if re.search(r"\b(today|tonight|tomorrow|right now|currently)\b", low) and not re.search(r"\b(in|for|at)\b", low):
+        return True
+    return False
+
+
 def _extract_location_from_query(query: str) -> str:
     text = str(query or "").strip()
     if not text:
@@ -57,15 +87,20 @@ def _extract_location_from_query(query: str) -> str:
     for pattern in patterns:
         match = re.search(pattern, normalized)
         if match:
-            return _trim_location_suffix(match.group("loc"))
-    return _trim_location_suffix(normalized)
+            candidate = _trim_location_suffix(match.group("loc"))
+            return "" if _looks_like_non_location(candidate) else candidate
+    candidate = _trim_location_suffix(normalized)
+    return "" if _looks_like_non_location(candidate) else candidate
 
 
 def _clean_location(query: str, location: str) -> str:
     cleaned = str(location or "").strip() or _extract_location_from_query(query)
     cleaned = re.sub(r"(?i)\b(?:the\s+)?weather\b", "", cleaned)
     cleaned = re.sub(r"(?i)\bforecast\b", "", cleaned)
+    cleaned = re.sub(r"(?i)\btemperature\b", "", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,.-")
+    if _looks_like_non_location(cleaned):
+        cleaned = ""
     if re.search(r"(?i)\bsan jose(?:,?\s+ca|,?\s+california)\b", cleaned):
         cleaned = "San Jose, California"
     elif re.search(r"(?i),\s*ca\b", cleaned):

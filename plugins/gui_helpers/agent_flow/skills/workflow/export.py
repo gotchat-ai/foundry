@@ -142,12 +142,17 @@ def _resolve_subflow_export_source(ctx: Dict[str, Any], flow_name: str) -> Dict[
     wanted = str(flow_name or "").strip()
     if not wanted:
         return None
-    project_flows = load_project_flows(ctx, "project2")
+    pid = str((ctx or {}).get("pid") or "project2").strip() or "project2"
+    project_flows = load_project_flows(ctx, pid)
     if isinstance(project_flows.get(wanted), dict):
         return {"flow_name": wanted, "workflow_json": dict(project_flows[wanted]), "bundle_dir": "", "workflow_file": ""}
     default_flows = load_default_flows(ctx)
     if isinstance(default_flows.get(wanted), dict):
         return {"flow_name": wanted, "workflow_json": dict(default_flows[wanted]), "bundle_dir": "", "workflow_file": ""}
+    if pid != "project2":
+        fallback_project_flows = load_project_flows(ctx, "project2")
+        if isinstance(fallback_project_flows.get(wanted), dict):
+            return {"flow_name": wanted, "workflow_json": dict(fallback_project_flows[wanted]), "bundle_dir": "", "workflow_file": ""}
     return _resolve_temp_flow_from_filesystem(ctx, wanted)
 
 
@@ -256,6 +261,48 @@ def _list_bundle_files(root: Path) -> List[str]:
             continue
         out.append(str(child))
     return out
+
+
+def _portable_export_settings(params: Dict[str, Any], root_flow_name: str) -> Dict[str, Any]:
+    raw = params.get("export_settings") if isinstance(params.get("export_settings"), dict) else {}
+    default_flow = str(raw.get("default_flow") or raw.get("agent_flow_default_flow") or root_flow_name or "").strip() or root_flow_name
+    active_flow = str(raw.get("active_flow") or raw.get("agent_flow_active_flow") or default_flow or "").strip() or default_flow
+    mode = str(raw.get("mode") or raw.get("agent_flow_mode") or "execute").strip() or "execute"
+    try:
+        max_steps = max(1, min(128, int(raw.get("max_steps") or raw.get("agent_flow_max_steps") or 32)))
+    except Exception:
+        max_steps = 32
+    out = {
+        "default_flow": default_flow,
+        "active_flow": active_flow,
+        "mode": mode,
+        "max_steps": max_steps,
+        "loop_max_passes": raw.get("loop_max_passes", raw.get("agent_flow_loop_max_passes", 16)),
+        "force_loop_max_passes": bool(raw.get("force_loop_max_passes", raw.get("agent_flow_force_loop_max_passes", False))),
+        "request_timeout_s": raw.get("request_timeout_s", raw.get("agent_flow_request_timeout_s", 45)),
+        "autobuild_sandbox_profile": str(raw.get("autobuild_sandbox_profile") or raw.get("agent_flow_autobuild_sandbox_profile") or "lightweight").strip() or "lightweight",
+        "autobuild_lightweight_max_requests": raw.get("autobuild_lightweight_max_requests", raw.get("agent_flow_autobuild_lightweight_max_requests", 1)),
+        "autobuild_lightweight_wait_s": raw.get("autobuild_lightweight_wait_s", raw.get("agent_flow_autobuild_lightweight_wait_s", 120)),
+        "autobuild_lightweight_final_grace_s": raw.get("autobuild_lightweight_final_grace_s", raw.get("agent_flow_autobuild_lightweight_final_grace_s", 10)),
+        "autobuild_independent_max_requests": raw.get("autobuild_independent_max_requests", raw.get("agent_flow_autobuild_independent_max_requests", 3)),
+        "autobuild_independent_wait_s": raw.get("autobuild_independent_wait_s", raw.get("agent_flow_autobuild_independent_wait_s", 180)),
+        "autobuild_independent_final_grace_s": raw.get("autobuild_independent_final_grace_s", raw.get("agent_flow_autobuild_independent_final_grace_s", 20)),
+    }
+    return out
+
+
+def _write_bundle_manifest(out_dir: Path, *, root_flow_name: str, workflow_json_filename: str, flow_names: List[str], params: Dict[str, Any]) -> Path:
+    settings = _portable_export_settings(params or {}, root_flow_name)
+    manifest = {
+        "agent_flow_manifest_version": 1,
+        "root_flow": root_flow_name,
+        "workflow_file": workflow_json_filename,
+        "flow_names": [str(x or "").strip() for x in flow_names if str(x or "").strip()],
+        "agent_flow_settings": settings,
+    }
+    manifest_path = out_dir / "agent_flow_manifest.json"
+    manifest_path.write_text(to_pretty_json(manifest), encoding="utf-8")
+    return manifest_path
 
 
 def _ensure_tool_action_skills(flow: Dict[str, Any]) -> Dict[str, Any]:
@@ -434,7 +481,10 @@ def _reserve_generated_flow_name(ctx: Dict[str, Any], flow: Dict[str, Any], requ
     is_generated = "generated" in low_desc or "fallback workflow" in low_desc
     if not is_generated:
         return candidate
-    existing = set(load_default_flows(ctx).keys()) | set(load_project_flows(ctx, "project2").keys())
+    pid = str((ctx or {}).get("pid") or "project2").strip() or "project2"
+    existing = set(load_default_flows(ctx).keys()) | set(load_project_flows(ctx, pid).keys())
+    if pid != "project2":
+        existing |= set(load_project_flows(ctx, "project2").keys())
     if candidate not in existing:
         return candidate
     base = slugify(candidate, "generated_workflow")
@@ -498,6 +548,13 @@ def run(ctx: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
     workflow_import = export_payload.get("payload") if isinstance(export_payload.get("payload"), dict) else {"flows": {final_flow_name: flow}}
     workflow_json_path = out_dir / f"{slug}.json"
     workflow_json_path.write_text(to_pretty_json(workflow_import), encoding="utf-8")
+    manifest_path = _write_bundle_manifest(
+        out_dir,
+        root_flow_name=final_flow_name,
+        workflow_json_filename=workflow_json_path.name,
+        flow_names=sorted((workflow_import.get("flows") or {}).keys()),
+        params=params,
+    )
 
     referenced: List[str] = []
     for subflow in (workflow_import.get("flows") or {}).values():
@@ -551,6 +608,7 @@ def run(ctx: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
         "",
         "Artifacts:",
         f"- Workflow import JSON: {workflow_json_path.name}",
+        f"- Bundle manifest: {manifest_path.name}",
     ]
     flow_count = len((workflow_import.get("flows") or {}))
     if flow_count > 1:
@@ -583,6 +641,7 @@ def run(ctx: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
         "bundle_dir": str(out_dir),
         "workflow_file": str(workflow_json_path),
         "readme_file": str(readme_path),
+        "manifest_file": str(manifest_path),
         "stub_files": stub_paths,
         "bundle_files": bundle_files,
         "missing_skill_ids": [str(row.get("id") or "") for row in missing_specs],
@@ -595,6 +654,7 @@ def run(ctx: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
             "bundle_dir": str(out_dir),
             "workflow_file": str(workflow_json_path),
             "readme_file": str(readme_path),
+            "manifest_file": str(manifest_path),
             "stub_files": stub_paths,
             "bundle_files": bundle_files,
             "missing_skill_ids": [str(row.get("id") or "") for row in missing_specs],

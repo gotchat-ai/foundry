@@ -2,5 +2,6 @@
   "id": "model_deck",
   "name": "Model Deck",
   "version": "0.1.0",
-  "description": "Server GUI helper that stores a model inventory (deck) and exposes endpoints for other plugins to query default models and load/unload intents."
+  "description": "Server GUI helper that stores a model inventory (deck) and exposes endpoints for other plugins to query default models and load/unload intents.",
+  "category": "Models/Inference"
 }

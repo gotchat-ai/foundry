@@ -1,0 +1,427 @@
+{
+  "name": "Models / MiniMax H3 REF2VA GGUF",
+  "description": "MiniMax H3 REF2VA GGUF graph translated from the attached ComfyUI REF2V workflow. This graph exposes MiniMax-specific model nodes and assets and is intended to execute through llmloader2's in-process native MiniMax adapter using vendored ComfyUI and ComfyUI-GGUF modules as libraries.",
+  "start": "resolve_assets",
+  "nodes": {
+    "resolve_assets": {
+      "label": "Resolve MiniMax H3 assets",
+      "plugin_id": "agent_workflow_member",
+      "agent_kind": "model",
+      "x": 80,
+      "y": 80,
+      "transitions": [
+        {
+          "target": "reference_inputs",
+          "condition": {
+            "type": "always"
+          }
+        }
+      ],
+      "plugin_settings": {
+        "node_type": "tool_node",
+        "action_skills": [
+          "models.asset_resolver"
+        ],
+        "tool_config": {
+          "tool": "models.asset_resolver",
+          "model_node_type": "asset_resolver",
+          "model_asset_type": "asset_resolver",
+          "params": {
+            "node_id": "resolve_assets"
+          }
+        }
+      }
+    },
+    "reference_inputs": {
+      "label": "Load reference inputs",
+      "plugin_id": "agent_workflow_member",
+      "agent_kind": "model",
+      "x": 330,
+      "y": 80,
+      "transitions": [
+        {
+          "target": "encode_prompt",
+          "condition": {
+            "type": "always"
+          }
+        }
+      ],
+      "plugin_settings": {
+        "node_type": "tool_node",
+        "action_skills": [
+          "models.minimax_ref_inputs"
+        ],
+        "tool_config": {
+          "tool": "models.minimax_ref_inputs",
+          "model_node_type": "minimax_ref_inputs",
+          "model_asset_type": "reference_inputs",
+          "params": {
+            "node_id": "reference_inputs",
+            "reference_image_1_path": "",
+            "reference_image_2_path": "",
+            "reference_video_path": "",
+            "reference_audio_path": "",
+            "minimax_conditioning_mode": "ref2va",
+            "minimax_ref_image_size": "match",
+            "minimax_resize_references": true,
+            "minimax_ref1_width": 512,
+            "minimax_ref1_height": 512,
+            "minimax_ref2_width": 1024,
+            "minimax_ref2_height": 576,
+            "minimax_reference_tags": "<Picture 1>, <Picture 2>, <Video 1>, <Audio 1>"
+          }
+        }
+      }
+    },
+    "encode_prompt": {
+      "label": "Encode prompt with Qwen3VL",
+      "plugin_id": "agent_workflow_member",
+      "agent_kind": "model",
+      "x": 580,
+      "y": 80,
+      "transitions": [
+        {
+          "target": "load_ref2va_gguf",
+          "condition": {
+            "type": "always"
+          }
+        }
+      ],
+      "plugin_settings": {
+        "node_type": "tool_node",
+        "action_skills": [
+          "models.minimax_text_encoder"
+        ],
+        "tool_config": {
+          "tool": "models.minimax_text_encoder",
+          "model_node_type": "minimax_text_encoder",
+          "model_asset_type": "text_encoder",
+          "params_from_input": [
+            "prompt"
+          ],
+          "params": {
+            "node_id": "encode_prompt",
+            "text_encoder_path": "${MODEL_DECK_MODELS_DIR}/minimax_h3/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+            "text_encoder_safetensors_path": "${MODEL_DECK_MODELS_DIR}/minimax_h3/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+            "text_encoder_gguf_path": "${MODEL_DECK_MODELS_DIR}/minimax_h3/text_encoders/qwen3vl-32B-MiniMax-H3-Q4_K_M.gguf",
+            "minimax_text_encoder_device": "gpu",
+            "clip_type": "minimax"
+          }
+        }
+      }
+    },
+    "load_ref2va_gguf": {
+      "label": "Load REF2VA GGUF",
+      "plugin_id": "agent_workflow_member",
+      "agent_kind": "model",
+      "x": 830,
+      "y": 80,
+      "transitions": [
+        {
+          "target": "ref2v_conditioning",
+          "condition": {
+            "type": "always"
+          }
+        }
+      ],
+      "plugin_settings": {
+        "node_type": "tool_node",
+        "action_skills": [
+          "models.minimax_ref2va_transformer_loader"
+        ],
+        "tool_config": {
+          "tool": "models.minimax_ref2va_transformer_loader",
+          "model_node_type": "minimax_ref2va_transformer_loader",
+          "model_asset_type": "video_transformer_gguf",
+          "params": {
+            "node_id": "load_ref2va_gguf",
+            "ref2va_gguf_path": "${MODEL_DECK_MODELS_DIR}/minimax_h3/diffusion_models/ref2va/minimax_h3_ref2va-Q4_K_M.gguf",
+            "fl2va_gguf_path": "${MODEL_DECK_MODELS_DIR}/minimax_h3/diffusion_models/MiniMax-H3-FL2VA-Q4_K_M.gguf",
+            "minimax_conditioning_mode": "ref2va",
+            "minimax_unet_loader": "basic",
+            "minimax_gguf_dequant_dtype": "default",
+            "minimax_gguf_patch_dtype": "default",
+            "minimax_gguf_patch_on_device": false,
+            "native_gguf_execution_mode": "comfy_gguf_lazy",
+            "native_lazy_quantized_packed_device": "gpu",
+            "native_transformer_offload": "cpu_slots"
+          }
+        }
+      }
+    },
+    "ref2v_conditioning": {
+      "label": "Build REF2V conditioning",
+      "plugin_id": "agent_workflow_member",
+      "agent_kind": "model",
+      "x": 1080,
+      "y": 80,
+      "transitions": [
+        {
+          "target": "sample_latents",
+          "condition": {
+            "type": "always"
+          }
+        }
+      ],
+      "plugin_settings": {
+        "node_type": "tool_node",
+        "action_skills": [
+          "models.minimax_ref2v_conditioning"
+        ],
+        "tool_config": {
+          "tool": "models.minimax_ref2v_conditioning",
+          "model_node_type": "minimax_ref2v_conditioning",
+          "model_asset_type": "conditioning",
+          "params": {
+            "node_id": "ref2v_conditioning",
+            "width": 864,
+            "height": 480,
+            "frames": 22,
+            "minimax_conditioning_mode": "ref2va",
+            "minimax_ref_image_size": "match"
+          }
+        }
+      }
+    },
+    "sample_latents": {
+      "label": "Sample video/audio latents",
+      "plugin_id": "agent_workflow_member",
+      "agent_kind": "model",
+      "x": 1080,
+      "y": 270,
+      "transitions": [
+        {
+          "target": "decode_video_vae",
+          "condition": {
+            "type": "always"
+          }
+        }
+      ],
+      "plugin_settings": {
+        "node_type": "tool_node",
+        "action_skills": [
+          "models.minimax_sampler"
+        ],
+        "tool_config": {
+          "tool": "models.minimax_sampler",
+          "model_node_type": "minimax_sampler",
+          "model_asset_type": "sampler",
+          "params": {
+            "node_id": "sample_latents",
+            "sampler_name": "res_multistep",
+            "scheduler": "simple",
+            "steps": 20,
+            "guidance_scale": 1,
+            "minimax_shift_video": 12,
+            "minimax_shift_audio": 3
+          }
+        }
+      }
+    },
+    "decode_video_vae": {
+      "label": "Decode video VAE",
+      "plugin_id": "agent_workflow_member",
+      "agent_kind": "model",
+      "x": 830,
+      "y": 460,
+      "transitions": [
+        {
+          "target": "decode_audio_vae",
+          "condition": {
+            "type": "always"
+          }
+        }
+      ],
+      "plugin_settings": {
+        "node_type": "tool_node",
+        "action_skills": [
+          "models.minimax_video_vae_decode"
+        ],
+        "tool_config": {
+          "tool": "models.minimax_video_vae_decode",
+          "model_node_type": "minimax_video_vae_decode",
+          "model_asset_type": "video_vae",
+          "params": {
+            "node_id": "decode_video_vae",
+            "video_vae_path": "${MODEL_DECK_MODELS_DIR}/minimax_h3/vae/minimax_h3_video_vae_fp16.safetensors",
+            "minimax_video_vae_device": "gpu"
+          }
+        }
+      }
+    },
+    "decode_audio_vae": {
+      "label": "Decode audio VAE",
+      "plugin_id": "agent_workflow_member",
+      "agent_kind": "model",
+      "x": 580,
+      "y": 460,
+      "transitions": [
+        {
+          "target": "rtx_upscale",
+          "condition": {
+            "type": "always"
+          }
+        }
+      ],
+      "plugin_settings": {
+        "node_type": "tool_node",
+        "action_skills": [
+          "models.minimax_audio_vae_decode"
+        ],
+        "tool_config": {
+          "tool": "models.minimax_audio_vae_decode",
+          "model_node_type": "minimax_audio_vae_decode",
+          "model_asset_type": "audio_vae",
+          "params": {
+            "node_id": "decode_audio_vae",
+            "audio_vae_path": "${MODEL_DECK_MODELS_DIR}/minimax_h3/vae/minimax_h3_audio_vae_fp32.safetensors",
+            "minimax_audio_vae_device": "cpu",
+            "minimax_enable_audio": false
+          }
+        }
+      }
+    },
+    "rtx_upscale": {
+      "label": "Optional RTX upscale",
+      "plugin_id": "agent_workflow_member",
+      "agent_kind": "model",
+      "x": 330,
+      "y": 460,
+      "transitions": [
+        {
+          "target": "encode_mp4",
+          "condition": {
+            "type": "always"
+          }
+        }
+      ],
+      "plugin_settings": {
+        "node_type": "tool_node",
+        "action_skills": [
+          "models.minimax_rtx_upscale"
+        ],
+        "tool_config": {
+          "tool": "models.minimax_rtx_upscale",
+          "model_node_type": "minimax_rtx_upscale",
+          "model_asset_type": "postprocess",
+          "params": {
+            "node_id": "rtx_upscale",
+            "minimax_rtx_upscale_enabled": false,
+            "minimax_rtx_upscale_mode": "scale by multiplier",
+            "minimax_rtx_upscale_multiplier": 2,
+            "minimax_rtx_upscale_quality": "ULTRA"
+          }
+        }
+      }
+    },
+    "encode_mp4": {
+      "label": "Mux MP4",
+      "plugin_id": "agent_workflow_member",
+      "agent_kind": "model",
+      "x": 80,
+      "y": 460,
+      "transitions": [
+        {
+          "target": "cleanup",
+          "condition": {
+            "type": "always"
+          }
+        }
+      ],
+      "plugin_settings": {
+        "node_type": "tool_node",
+        "action_skills": [
+          "models.minimax_media_encode"
+        ],
+        "tool_config": {
+          "tool": "models.minimax_media_encode",
+          "model_node_type": "minimax_media_encode",
+          "model_asset_type": "video_output",
+          "params": {
+            "node_id": "encode_mp4",
+            "fps": 24,
+            "video_codec": "libx264",
+            "audio_codec": "aac",
+            "minimax_enable_audio": false,
+            "output_ext": "mp4"
+          }
+        }
+      }
+    },
+    "cleanup": {
+      "label": "Release workflow resources",
+      "plugin_id": "agent_workflow_member",
+      "agent_kind": "model",
+      "x": 80,
+      "y": 650,
+      "transitions": [],
+      "plugin_settings": {
+        "node_type": "tool_node",
+        "action_skills": [
+          "models.cleanup"
+        ],
+        "tool_config": {
+          "tool": "models.cleanup",
+          "model_node_type": "cleanup",
+          "model_asset_type": "cleanup",
+          "params": {
+            "node_id": "cleanup"
+          }
+        }
+      }
+    }
+  },
+  "settings": {
+    "model_id": "MiniMax-H3-REF2VA-GGUF",
+    "model_family": "minimax_h3_ref2va_gguf",
+    "model_deck_compat_manifest_id": "minimax_h3_ref2va_gguf",
+    "workflow_variant": "ref2va_gguf",
+    "runtime_adapter": "minimax_h3",
+    "workflow_adapter": "minimax_h3",
+    "workflow_loader_mode": "workflow_model_loader",
+    "workflow_execution_backend": "native_graph",
+    "workflow_node_lifecycle_policy": "lazy_unload",
+    "device": "xpu",
+    "dtype": "bfloat16",
+    "width": 864,
+    "height": 480,
+    "duration_seconds": 5,
+    "fps": 24,
+    "frames": 22,
+    "steps": 20,
+    "guidance_scale": 1,
+    "sampler_name": "res_multistep",
+    "scheduler": "simple",
+    "minimax_ref_image_size": "match",
+    "minimax_conditioning_mode": "ref2va",
+    "minimax_unet_loader": "basic",
+    "minimax_gguf_dequant_dtype": "default",
+    "minimax_gguf_patch_dtype": "default",
+    "minimax_gguf_patch_on_device": false,
+    "minimax_resize_references": true,
+    "minimax_ref1_width": 512,
+    "minimax_ref1_height": 512,
+    "minimax_ref2_width": 1024,
+    "minimax_ref2_height": 576,
+    "minimax_shift_video": 12,
+    "minimax_shift_audio": 3,
+    "minimax_reference_tags": "<Picture 1>, <Picture 2>, <Video 1>, <Audio 1>",
+    "minimax_text_encoder_device": "gpu",
+    "minimax_text_encoder_cache_mode": "off",
+    "minimax_video_vae_device": "gpu",
+    "minimax_audio_vae_device": "cpu",
+    "minimax_enable_audio": false,
+    "video_codec": "libx264",
+    "audio_codec": "aac",
+    "output_ext": "mp4",
+    "gguf_path": "${MODEL_DECK_MODELS_DIR}/minimax_h3/diffusion_models/ref2va/minimax_h3_ref2va-Q4_K_M.gguf",
+    "ref2va_gguf_path": "${MODEL_DECK_MODELS_DIR}/minimax_h3/diffusion_models/ref2va/minimax_h3_ref2va-Q4_K_M.gguf",
+    "fl2va_gguf_path": "${MODEL_DECK_MODELS_DIR}/minimax_h3/diffusion_models/MiniMax-H3-FL2VA-Q4_K_M.gguf",
+    "clip_type": "minimax",
+    "text_encoder_path": "${MODEL_DECK_MODELS_DIR}/minimax_h3/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+    "text_encoder_safetensors_path": "${MODEL_DECK_MODELS_DIR}/minimax_h3/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+    "text_encoder_gguf_path": "${MODEL_DECK_MODELS_DIR}/minimax_h3/text_encoders/qwen3vl-32B-MiniMax-H3-Q4_K_M.gguf",
+    "video_vae_path": "${MODEL_DECK_MODELS_DIR}/minimax_h3/vae/minimax_h3_video_vae_fp16.safetensors",
+    "audio_vae_path": "${MODEL_DECK_MODELS_DIR}/minimax_h3/vae/minimax_h3_audio_vae_fp32.safetensors"
+  }
+}

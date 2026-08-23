@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "id": "hunyuan15",
+  "name": "HunyuanVideo 1.5",
+  "description": "Capabilities for HunyuanVideo 1.5 T2V/I2V GGUF workflows. This manifest declares node skills only.",
+  "model_types": ["video_gen"],
+  "aliases": ["hunyuan15_t2v_gguf", "hunyuan15_i2v_gguf", "hunyuan_video_1_5_t2v_gguf", "hunyuan_video_1_5_i2v_gguf", "hunyuanvideo-1.5_t2v_720p-gguf", "hunyuanvideo-1.5_i2v_720p-gguf"],
+  "families": ["hunyuan15_t2v_gguf", "hunyuan15_i2v_gguf", "hunyuan_video_15"],
+  "skills": {
+    "asset_resolver": "models.hunyuan15_assets",
+    "assets": "models.hunyuan15_assets",
+    "prompt_encoder": "models.hunyuan15_text_encoder",
+    "text_encoder": "models.hunyuan15_text_encoder",
+    "transformer_loader": "models.hunyuan15_transformer_loader",
+    "gguf_transformer_loader": "models.hunyuan15_transformer_loader",
+    "conditioning": "models.hunyuan15_conditioning",
+    "t2v_conditioning": "models.hunyuan15_conditioning",
+    "i2v_conditioning": "models.hunyuan15_conditioning",
+    "latent_video_init": "models.hunyuan15_conditioning",
+    "i2v_latent_init": "models.hunyuan15_conditioning",
+    "sampler": "models.hunyuan15_sampler",
+    "latent_upscale": "models.hunyuan15_latent_upscale",
+    "upscale": "models.hunyuan15_latent_upscale",
+    "vae_decode": "models.hunyuan15_vae_decode",
+    "video_vae_decode": "models.hunyuan15_vae_decode",
+    "video_encode": "models.hunyuan15_media_encode",
+    "media_encode": "models.hunyuan15_media_encode",
+    "cleanup": "models.hunyuan15_cleanup"
+  },
+  "asset_keys": {
+    "transformer_gguf_path": {"label": "HunyuanVideo transformer GGUF", "kind": "local_or_hf_file", "required": true, "source": "https://huggingface.co/jayn7/HunyuanVideo-1.5_T2V_720p-GGUF"},
+    "i2v_transformer_gguf_path": {"label": "HunyuanVideo I2V transformer GGUF", "kind": "local_or_hf_file", "required": false, "source": "https://huggingface.co/jayn7/HunyuanVideo-1.5_I2V_720p-GGUF"},
+    "video_vae_path": {"label": "HunyuanVideo VAE", "kind": "local_or_hf_file", "required": true, "source": "https://huggingface.co/tencent/HunyuanVideo-1.5"},
+    "upscaler_path": {"label": "Optional upscaler", "kind": "local_or_hf_file", "required": false, "source": "https://huggingface.co/tencent/HunyuanVideo-1.5"}
+  },
+  "setting_schema_refs": {
+    "sampler": "schemas/hunyuan15_sampler.json",
+    "vae_decode": "schemas/hunyuan15_vae_decode.json",
+    "latent_upscale": "schemas/hunyuan15_latent_upscale.json"
+  },
+  "examples": []
+}

@@ -4,36 +4,15 @@ import os
 import re
 from typing import Any, Dict, List
 
+from . import _common
+
 
 NAME = "repo.search"
 PERMISSIONS = ["repo.search", "repo.*"]
 
 
 def _resolve_root(ctx: Dict[str, Any], params: Dict[str, Any]) -> str:
-    root = str(params.get("target_repo_root") or ctx.get("target_repo_root") or "").strip()
-    if root:
-        abs_root = os.path.abspath(root)
-        if os.path.isdir(abs_root):
-            return abs_root
-    app = ctx.get("app") if isinstance(ctx, dict) else None
-    raw = str(root or "").replace("\\", "/").lower().strip("/")
-    data_dir = getattr(getattr(app, "state", None), "data_dir", None) if app is not None else None
-    workdir = getattr(getattr(app, "state", None), "workdir", None) if app is not None else None
-    for base_raw in (workdir, data_dir, os.getcwd()):
-        if not base_raw:
-            continue
-        base = os.path.abspath(str(base_raw))
-        if "data/agent_workflow/repo" in raw:
-            for candidate in (
-                os.path.join(base, "data", "agent_workflow", "repo"),
-                os.path.join(base, "agent_workflow", "repo"),
-            ):
-                if os.path.isdir(candidate):
-                    return os.path.abspath(candidate)
-    for raw in (data_dir, workdir, os.getcwd()):
-        if raw:
-            return os.path.abspath(str(raw))
-    return os.getcwd()
+    return _common.resolve_root(ctx or {}, params or {})
 
 
 def _strip_repo_virtual_prefixes(rel: str) -> str:

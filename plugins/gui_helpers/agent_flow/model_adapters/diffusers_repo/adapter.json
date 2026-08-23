@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "id": "diffusers_repo",
+  "name": "Generic Diffusers Repo",
+  "description": "Generic repository-backed image/video model capabilities for workflows that use diffusers-style pipeline loading. The manifest declares skills only.",
+  "model_types": ["image_gen", "video_gen"],
+  "aliases": ["diffusers_repo", "repo_diffusers_video", "repo_diffusers_image", "wan21_t2v_diffusers_repo", "flux_diffusers_repo", "flux_gguf_diffusers_repo", "zimage_diffusers_repo", "zimage_gguf_diffusers_repo", "sdxl_diffusers_repo", "sdxl_lightning_diffusers_repo"],
+  "families": ["diffusers_repo", "repo_diffusers_video", "repo_diffusers_image", "wan21_t2v_diffusers_repo", "flux_diffusers_repo", "zimage_diffusers_repo", "sdxl_diffusers_repo"],
+  "skills": {
+    "asset_resolver": "models.asset_resolver",
+    "prompt_encoder": "models.diffusers_repo_prompt_encoder",
+    "text_encoder_loader": "models.diffusers_repo_prompt_encoder",
+    "pipeline_loader": "models.diffusers_repo_pipeline_loader",
+    "transformer_loader": "models.diffusers_repo_pipeline_loader",
+    "sampler": "models.diffusers_repo_sampler",
+    "vae_loader": "models.diffusers_repo_vae_decode",
+    "vae_decode": "models.diffusers_repo_vae_decode",
+    "image_encode": "models.diffusers_repo_media_encode",
+    "video_encode": "models.diffusers_repo_media_encode",
+    "media_encode": "models.diffusers_repo_media_encode",
+    "cleanup": "models.diffusers_repo_cleanup"
+  },
+  "asset_keys": {
+    "repo_id": {"label": "Diffusers repo id/path", "kind": "repo_or_local_dir", "required": true},
+    "pipeline_class": {"label": "Pipeline class", "kind": "setting", "required": false},
+    "transformer_path": {"label": "Optional transformer path", "kind": "local_or_hf_file", "required": false},
+    "vae_path": {"label": "Optional VAE path", "kind": "local_or_hf_file", "required": false},
+    "lora_path": {"label": "Optional LoRA path", "kind": "local_or_hf_file", "required": false}
+  },
+  "setting_schema_refs": {
+    "pipeline_loader": "schemas/diffusers_pipeline_loader.json",
+    "sampler": "schemas/diffusers_sampler.json"
+  },
+  "examples": []
+}

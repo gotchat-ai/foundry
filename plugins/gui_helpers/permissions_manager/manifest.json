@@ -6,5 +6,6 @@
   "dependencies": [
     "collab_chat",
     "agent_flow"
-  ]
+  ],
+  "category": "Permissions"
 }

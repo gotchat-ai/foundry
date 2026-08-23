@@ -1,0 +1,13 @@
+{
+  "ok": true,
+  "restartedAt": "2026-08-01T20:33:48.458484Z",
+  "request": {
+    "id": "restart-1785616427444",
+    "plugin_id": null,
+    "reason": "plugin_repo_restart",
+    "requested_by": "admin",
+    "queuedAt": "2026-08-01T20:33:47.444840Z"
+  },
+  "mode": "docker",
+  "handledAt": "2026-08-01T20:33:48.458503Z"
+}

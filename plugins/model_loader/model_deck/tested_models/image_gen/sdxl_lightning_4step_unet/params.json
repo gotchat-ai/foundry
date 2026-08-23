@@ -1,0 +1,21 @@
+{
+  "model_backend": "workflow",
+  "workflow_loader_mode": "workflow_model_loader",
+  "workflow_execution_backend": "native_graph",
+  "workflow_node_lifecycle_policy": "lazy_unload_after_node",
+  "model_workflow_flow_name": "Models / Image / sdxl_lightning_4step_unet.safetensors Workflow",
+  "model_workflow_template_flow_name": "Models / Image / sdxl_lightning_4step_unet.safetensors Workflow",
+  "model_deck_compat_manifest_id": "sdxl_lightning_4step_unet",
+  "model_id": "stabilityai/stable-diffusion-xl-base-1.0",
+  "sdxl_base_model": "stabilityai/stable-diffusion-xl-base-1.0",
+  "sdxl_unet_repo": "ByteDance/SDXL-Lightning",
+  "sdxl_unet_filename": "sdxl_lightning_4step_unet.safetensors",
+  "sdxl_unet_path": "ByteDance/SDXL-Lightning/sdxl_lightning_4step_unet.safetensors",
+  "sdxl_variant": "fp16",
+  "sdxl_timestep_spacing": "trailing",
+  "steps": 4,
+  "cfg_scale": 0,
+  "width": 1024,
+  "height": 1024,
+  "sampler": "euler"
+}

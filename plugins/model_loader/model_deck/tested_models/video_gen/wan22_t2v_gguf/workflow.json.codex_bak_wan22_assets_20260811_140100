@@ -1,0 +1,728 @@
+{
+  "name": "Models / Wan2.2 T2V GGUF",
+  "description": "Wan2.2 T2V GGUF staged native workflow skeleton based on the provided ComfyUI graph.",
+  "start": "resolve_assets",
+  "nodes": {
+    "resolve_assets": {
+      "label": "Resolve Wan assets",
+      "plugin_id": "agent_workflow_member",
+      "agent_kind": "model",
+      "system_prompt": "Run model workflow node Resolve Wan assets.",
+      "return_only_text": false,
+      "delay_ms": 0,
+      "x": 80,
+      "y": 80,
+      "transitions": [
+        {
+          "target": "encode_prompt",
+          "condition": {
+            "type": "always"
+          }
+        }
+      ],
+      "plugin_settings": {
+        "role": "Model workflow node",
+        "node_type": "tool_node",
+        "action_skill_categories": [],
+        "action_skills": [
+          "models.asset_resolver"
+        ],
+        "tool_config": {
+          "tool": "models.asset_resolver",
+          "model_node_type": "asset_resolver",
+          "model_asset_type": "asset_resolver",
+          "params_from_input": [],
+          "params": {
+            "node_id": "resolve_wan_assets",
+            "model_node_type": "asset_resolver",
+            "model_asset_type": "asset_resolver",
+            "settings": {
+              "model_deck_compat_manifest_id": "wan22_t2v_gguf",
+              "model_family": "wan22_t2v_gguf",
+              "workflow_loader_mode": "workflow_model_loader",
+              "workflow_execution_backend": "native_graph",
+              "workflow_node_lifecycle_policy": "lazy_unload",
+              "device": "xpu",
+              "dtype": "bfloat16",
+              "width": 640,
+              "height": 960,
+              "duration_seconds": 5,
+              "fps": 16,
+              "target_fps": 60,
+              "frames": 81,
+              "steps": 10,
+              "high_noise_steps": 4,
+              "low_noise_steps": 6,
+              "guidance_scale": 3.0,
+              "high_noise_cfg": 3.0,
+              "low_noise_cfg": 2.5,
+              "sampler_name": "euler",
+              "scheduler": "simple",
+              "shift": 8,
+              "latent_format": "hunyuan_video",
+              "batch_size": 1
+            },
+            "assets": {
+              "high_noise_gguf_path": "",
+              "low_noise_gguf_path": "",
+              "text_encoder_gguf_path": "",
+              "video_vae_path": "",
+              "high_noise_lora_path": "",
+              "low_noise_lora_path": "",
+              "frame_interpolator_model_path": ""
+            },
+            "asset_keys": [
+              "high_noise_gguf_path",
+              "low_noise_gguf_path",
+              "text_encoder_gguf_path",
+              "video_vae_path"
+            ]
+          }
+        }
+      }
+    },
+    "encode_prompt": {
+      "label": "Encode prompt with UMT5",
+      "plugin_id": "agent_workflow_member",
+      "agent_kind": "model",
+      "system_prompt": "Run model workflow node Encode prompt with UMT5.",
+      "return_only_text": false,
+      "delay_ms": 0,
+      "x": 330,
+      "y": 80,
+      "transitions": [
+        {
+          "target": "load_transformers",
+          "condition": {
+            "type": "always"
+          }
+        }
+      ],
+      "plugin_settings": {
+        "role": "Model workflow node",
+        "node_type": "tool_node",
+        "action_skill_categories": [],
+        "action_skills": [
+          "models.prompt_encoder"
+        ],
+        "tool_config": {
+          "tool": "models.prompt_encoder",
+          "model_node_type": "prompt_encoder",
+          "model_asset_type": "prompt_encoder",
+          "params_from_input": [
+            "prompt"
+          ],
+          "params": {
+            "node_id": "encode_prompt_with_umt5",
+            "model_node_type": "prompt_encoder",
+            "model_asset_type": "prompt_encoder",
+            "settings": {
+              "model_deck_compat_manifest_id": "wan22_t2v_gguf",
+              "model_family": "wan22_t2v_gguf",
+              "workflow_loader_mode": "workflow_model_loader",
+              "workflow_execution_backend": "native_graph",
+              "workflow_node_lifecycle_policy": "lazy_unload",
+              "device": "xpu",
+              "dtype": "bfloat16",
+              "width": 640,
+              "height": 960,
+              "duration_seconds": 5,
+              "fps": 16,
+              "target_fps": 60,
+              "frames": 81,
+              "steps": 10,
+              "high_noise_steps": 4,
+              "low_noise_steps": 6,
+              "guidance_scale": 3.0,
+              "high_noise_cfg": 3.0,
+              "low_noise_cfg": 2.5,
+              "sampler_name": "euler",
+              "scheduler": "simple",
+              "shift": 8,
+              "latent_format": "hunyuan_video",
+              "batch_size": 1
+            },
+            "assets": {
+              "high_noise_gguf_path": "",
+              "low_noise_gguf_path": "",
+              "text_encoder_gguf_path": "",
+              "video_vae_path": "",
+              "high_noise_lora_path": "",
+              "low_noise_lora_path": "",
+              "frame_interpolator_model_path": ""
+            }
+          }
+        }
+      }
+    },
+    "load_transformers": {
+      "label": "Load Wan High/Low GGUF transformers",
+      "plugin_id": "agent_workflow_member",
+      "agent_kind": "model",
+      "system_prompt": "Run model workflow node Load Wan High/Low GGUF transformers.",
+      "return_only_text": false,
+      "delay_ms": 0,
+      "x": 580,
+      "y": 80,
+      "transitions": [
+        {
+          "target": "attach_loras",
+          "condition": {
+            "type": "always"
+          }
+        }
+      ],
+      "plugin_settings": {
+        "role": "Model workflow node",
+        "node_type": "tool_node",
+        "action_skill_categories": [],
+        "action_skills": [
+          "models.dual_transformer_loader"
+        ],
+        "tool_config": {
+          "tool": "models.dual_transformer_loader",
+          "model_node_type": "dual_transformer_loader",
+          "model_asset_type": "dual_transformer_loader",
+          "params_from_input": [],
+          "params": {
+            "node_id": "load_wan_high_low_gguf_transformers",
+            "model_node_type": "dual_transformer_loader",
+            "model_asset_type": "dual_transformer_loader",
+            "settings": {
+              "model_deck_compat_manifest_id": "wan22_t2v_gguf",
+              "model_family": "wan22_t2v_gguf",
+              "workflow_loader_mode": "workflow_model_loader",
+              "workflow_execution_backend": "native_graph",
+              "workflow_node_lifecycle_policy": "lazy_unload",
+              "device": "xpu",
+              "dtype": "bfloat16",
+              "width": 640,
+              "height": 960,
+              "duration_seconds": 5,
+              "fps": 16,
+              "target_fps": 60,
+              "frames": 81,
+              "steps": 10,
+              "high_noise_steps": 4,
+              "low_noise_steps": 6,
+              "guidance_scale": 3.0,
+              "high_noise_cfg": 3.0,
+              "low_noise_cfg": 2.5,
+              "sampler_name": "euler",
+              "scheduler": "simple",
+              "shift": 8,
+              "latent_format": "hunyuan_video",
+              "batch_size": 1
+            },
+            "assets": {
+              "high_noise_gguf_path": "",
+              "low_noise_gguf_path": "",
+              "text_encoder_gguf_path": "",
+              "video_vae_path": "",
+              "high_noise_lora_path": "",
+              "low_noise_lora_path": "",
+              "frame_interpolator_model_path": ""
+            }
+          }
+        }
+      }
+    },
+    "attach_loras": {
+      "label": "Attach optional Wan LoRAs",
+      "plugin_id": "agent_workflow_member",
+      "agent_kind": "model",
+      "system_prompt": "Run model workflow node Attach optional Wan LoRAs.",
+      "return_only_text": false,
+      "delay_ms": 0,
+      "x": 830,
+      "y": 80,
+      "transitions": [
+        {
+          "target": "init_latent",
+          "condition": {
+            "type": "always"
+          }
+        }
+      ],
+      "plugin_settings": {
+        "role": "Model workflow node",
+        "node_type": "tool_node",
+        "action_skill_categories": [],
+        "action_skills": [
+          "models.lora_loader"
+        ],
+        "tool_config": {
+          "tool": "models.lora_loader",
+          "model_node_type": "lora_loader",
+          "model_asset_type": "lora_loader",
+          "params_from_input": [],
+          "params": {
+            "node_id": "attach_optional_wan_loras",
+            "model_node_type": "lora_loader",
+            "model_asset_type": "lora_loader",
+            "settings": {
+              "model_deck_compat_manifest_id": "wan22_t2v_gguf",
+              "model_family": "wan22_t2v_gguf",
+              "workflow_loader_mode": "workflow_model_loader",
+              "workflow_execution_backend": "native_graph",
+              "workflow_node_lifecycle_policy": "lazy_unload",
+              "device": "xpu",
+              "dtype": "bfloat16",
+              "width": 640,
+              "height": 960,
+              "duration_seconds": 5,
+              "fps": 16,
+              "target_fps": 60,
+              "frames": 81,
+              "steps": 10,
+              "high_noise_steps": 4,
+              "low_noise_steps": 6,
+              "guidance_scale": 3.0,
+              "high_noise_cfg": 3.0,
+              "low_noise_cfg": 2.5,
+              "sampler_name": "euler",
+              "scheduler": "simple",
+              "shift": 8,
+              "latent_format": "hunyuan_video",
+              "batch_size": 1
+            },
+            "assets": {
+              "high_noise_gguf_path": "",
+              "low_noise_gguf_path": "",
+              "text_encoder_gguf_path": "",
+              "video_vae_path": "",
+              "high_noise_lora_path": "",
+              "low_noise_lora_path": "",
+              "frame_interpolator_model_path": ""
+            }
+          }
+        }
+      }
+    },
+    "init_latent": {
+      "label": "Initialize Hunyuan latent video",
+      "plugin_id": "agent_workflow_member",
+      "agent_kind": "model",
+      "system_prompt": "Run model workflow node Initialize Hunyuan latent video.",
+      "return_only_text": false,
+      "delay_ms": 0,
+      "x": 1080,
+      "y": 80,
+      "transitions": [
+        {
+          "target": "sample_stages",
+          "condition": {
+            "type": "always"
+          }
+        }
+      ],
+      "plugin_settings": {
+        "role": "Model workflow node",
+        "node_type": "tool_node",
+        "action_skill_categories": [],
+        "action_skills": [
+          "models.latent_video_init"
+        ],
+        "tool_config": {
+          "tool": "models.latent_video_init",
+          "model_node_type": "latent_video_init",
+          "model_asset_type": "latent_video_init",
+          "params_from_input": [],
+          "params": {
+            "node_id": "initialize_hunyuan_latent_video",
+            "model_node_type": "latent_video_init",
+            "model_asset_type": "latent_video_init",
+            "settings": {
+              "model_deck_compat_manifest_id": "wan22_t2v_gguf",
+              "model_family": "wan22_t2v_gguf",
+              "workflow_loader_mode": "workflow_model_loader",
+              "workflow_execution_backend": "native_graph",
+              "workflow_node_lifecycle_policy": "lazy_unload",
+              "device": "xpu",
+              "dtype": "bfloat16",
+              "width": 640,
+              "height": 960,
+              "duration_seconds": 5,
+              "fps": 16,
+              "target_fps": 60,
+              "frames": 81,
+              "steps": 10,
+              "high_noise_steps": 4,
+              "low_noise_steps": 6,
+              "guidance_scale": 3.0,
+              "high_noise_cfg": 3.0,
+              "low_noise_cfg": 2.5,
+              "sampler_name": "euler",
+              "scheduler": "simple",
+              "shift": 8,
+              "latent_format": "hunyuan_video",
+              "batch_size": 1
+            },
+            "assets": {
+              "high_noise_gguf_path": "",
+              "low_noise_gguf_path": "",
+              "text_encoder_gguf_path": "",
+              "video_vae_path": "",
+              "high_noise_lora_path": "",
+              "low_noise_lora_path": "",
+              "frame_interpolator_model_path": ""
+            }
+          }
+        }
+      }
+    },
+    "sample_stages": {
+      "label": "Sample HighNoise then LowNoise",
+      "plugin_id": "agent_workflow_member",
+      "agent_kind": "model",
+      "system_prompt": "Run model workflow node Sample HighNoise then LowNoise.",
+      "return_only_text": false,
+      "delay_ms": 0,
+      "x": 1330,
+      "y": 80,
+      "transitions": [
+        {
+          "target": "decode_video",
+          "condition": {
+            "type": "always"
+          }
+        }
+      ],
+      "plugin_settings": {
+        "role": "Model workflow node",
+        "node_type": "tool_node",
+        "action_skill_categories": [],
+        "action_skills": [
+          "models.staged_sampler"
+        ],
+        "tool_config": {
+          "tool": "models.staged_sampler",
+          "model_node_type": "staged_sampler",
+          "model_asset_type": "staged_sampler",
+          "params_from_input": [],
+          "params": {
+            "node_id": "sample_highnoise_then_lownoise",
+            "model_node_type": "staged_sampler",
+            "model_asset_type": "staged_sampler",
+            "settings": {
+              "model_deck_compat_manifest_id": "wan22_t2v_gguf",
+              "model_family": "wan22_t2v_gguf",
+              "workflow_loader_mode": "workflow_model_loader",
+              "workflow_execution_backend": "native_graph",
+              "workflow_node_lifecycle_policy": "lazy_unload",
+              "device": "xpu",
+              "dtype": "bfloat16",
+              "width": 640,
+              "height": 960,
+              "duration_seconds": 5,
+              "fps": 16,
+              "target_fps": 60,
+              "frames": 81,
+              "steps": 10,
+              "high_noise_steps": 4,
+              "low_noise_steps": 6,
+              "guidance_scale": 3.0,
+              "high_noise_cfg": 3.0,
+              "low_noise_cfg": 2.5,
+              "sampler_name": "euler",
+              "scheduler": "simple",
+              "shift": 8,
+              "latent_format": "hunyuan_video",
+              "batch_size": 1
+            },
+            "assets": {
+              "high_noise_gguf_path": "",
+              "low_noise_gguf_path": "",
+              "text_encoder_gguf_path": "",
+              "video_vae_path": "",
+              "high_noise_lora_path": "",
+              "low_noise_lora_path": "",
+              "frame_interpolator_model_path": ""
+            }
+          }
+        }
+      }
+    },
+    "decode_video": {
+      "label": "Decode Wan VAE",
+      "plugin_id": "agent_workflow_member",
+      "agent_kind": "model",
+      "system_prompt": "Run model workflow node Decode Wan VAE.",
+      "return_only_text": false,
+      "delay_ms": 0,
+      "x": 1580,
+      "y": 80,
+      "transitions": [
+        {
+          "target": "interpolate_frames",
+          "condition": {
+            "type": "always"
+          }
+        }
+      ],
+      "plugin_settings": {
+        "role": "Model workflow node",
+        "node_type": "tool_node",
+        "action_skill_categories": [],
+        "action_skills": [
+          "models.vae_decode"
+        ],
+        "tool_config": {
+          "tool": "models.vae_decode",
+          "model_node_type": "vae_decode",
+          "model_asset_type": "vae_decode",
+          "params_from_input": [],
+          "params": {
+            "node_id": "decode_wan_vae",
+            "model_node_type": "vae_decode",
+            "model_asset_type": "vae_decode",
+            "settings": {
+              "model_deck_compat_manifest_id": "wan22_t2v_gguf",
+              "model_family": "wan22_t2v_gguf",
+              "workflow_loader_mode": "workflow_model_loader",
+              "workflow_execution_backend": "native_graph",
+              "workflow_node_lifecycle_policy": "lazy_unload",
+              "device": "xpu",
+              "dtype": "bfloat16",
+              "width": 640,
+              "height": 960,
+              "duration_seconds": 5,
+              "fps": 16,
+              "target_fps": 60,
+              "frames": 81,
+              "steps": 10,
+              "high_noise_steps": 4,
+              "low_noise_steps": 6,
+              "guidance_scale": 3.0,
+              "high_noise_cfg": 3.0,
+              "low_noise_cfg": 2.5,
+              "sampler_name": "euler",
+              "scheduler": "simple",
+              "shift": 8,
+              "latent_format": "hunyuan_video",
+              "batch_size": 1
+            },
+            "assets": {
+              "high_noise_gguf_path": "",
+              "low_noise_gguf_path": "",
+              "text_encoder_gguf_path": "",
+              "video_vae_path": "",
+              "high_noise_lora_path": "",
+              "low_noise_lora_path": "",
+              "frame_interpolator_model_path": ""
+            }
+          }
+        }
+      }
+    },
+    "interpolate_frames": {
+      "label": "Optional RIFE interpolation",
+      "plugin_id": "agent_workflow_member",
+      "agent_kind": "model",
+      "system_prompt": "Run model workflow node Optional RIFE interpolation.",
+      "return_only_text": false,
+      "delay_ms": 0,
+      "x": 1830,
+      "y": 80,
+      "transitions": [
+        {
+          "target": "encode_mp4",
+          "condition": {
+            "type": "always"
+          }
+        }
+      ],
+      "plugin_settings": {
+        "role": "Model workflow node",
+        "node_type": "tool_node",
+        "action_skill_categories": [],
+        "action_skills": [
+          "models.frame_interpolator"
+        ],
+        "tool_config": {
+          "tool": "models.frame_interpolator",
+          "model_node_type": "frame_interpolator",
+          "model_asset_type": "frame_interpolator",
+          "params_from_input": [],
+          "params": {
+            "node_id": "optional_rife_interpolation",
+            "model_node_type": "frame_interpolator",
+            "model_asset_type": "frame_interpolator",
+            "settings": {
+              "model_deck_compat_manifest_id": "wan22_t2v_gguf",
+              "model_family": "wan22_t2v_gguf",
+              "workflow_loader_mode": "workflow_model_loader",
+              "workflow_execution_backend": "native_graph",
+              "workflow_node_lifecycle_policy": "lazy_unload",
+              "device": "xpu",
+              "dtype": "bfloat16",
+              "width": 640,
+              "height": 960,
+              "duration_seconds": 5,
+              "fps": 16,
+              "target_fps": 60,
+              "frames": 81,
+              "steps": 10,
+              "high_noise_steps": 4,
+              "low_noise_steps": 6,
+              "guidance_scale": 3.0,
+              "high_noise_cfg": 3.0,
+              "low_noise_cfg": 2.5,
+              "sampler_name": "euler",
+              "scheduler": "simple",
+              "shift": 8,
+              "latent_format": "hunyuan_video",
+              "batch_size": 1
+            },
+            "assets": {
+              "high_noise_gguf_path": "",
+              "low_noise_gguf_path": "",
+              "text_encoder_gguf_path": "",
+              "video_vae_path": "",
+              "high_noise_lora_path": "",
+              "low_noise_lora_path": "",
+              "frame_interpolator_model_path": ""
+            }
+          }
+        }
+      }
+    },
+    "encode_mp4": {
+      "label": "Encode MP4",
+      "plugin_id": "agent_workflow_member",
+      "agent_kind": "model",
+      "system_prompt": "Run model workflow node Encode MP4.",
+      "return_only_text": false,
+      "delay_ms": 0,
+      "x": 2080,
+      "y": 80,
+      "transitions": [
+        {
+          "target": "cleanup",
+          "condition": {
+            "type": "always"
+          }
+        }
+      ],
+      "plugin_settings": {
+        "role": "Model workflow node",
+        "node_type": "tool_node",
+        "action_skill_categories": [],
+        "action_skills": [
+          "models.media_encode"
+        ],
+        "tool_config": {
+          "tool": "models.media_encode",
+          "model_node_type": "video_encode",
+          "model_asset_type": "video_encode",
+          "params_from_input": [],
+          "params": {
+            "node_id": "encode_mp4",
+            "model_node_type": "video_encode",
+            "model_asset_type": "video_encode",
+            "settings": {
+              "model_deck_compat_manifest_id": "wan22_t2v_gguf",
+              "model_family": "wan22_t2v_gguf",
+              "workflow_loader_mode": "workflow_model_loader",
+              "workflow_execution_backend": "native_graph",
+              "workflow_node_lifecycle_policy": "lazy_unload",
+              "device": "xpu",
+              "dtype": "bfloat16",
+              "width": 640,
+              "height": 960,
+              "duration_seconds": 5,
+              "fps": 16,
+              "target_fps": 60,
+              "frames": 81,
+              "steps": 10,
+              "high_noise_steps": 4,
+              "low_noise_steps": 6,
+              "guidance_scale": 3.0,
+              "high_noise_cfg": 3.0,
+              "low_noise_cfg": 2.5,
+              "sampler_name": "euler",
+              "scheduler": "simple",
+              "shift": 8,
+              "latent_format": "hunyuan_video",
+              "batch_size": 1
+            },
+            "assets": {
+              "high_noise_gguf_path": "",
+              "low_noise_gguf_path": "",
+              "text_encoder_gguf_path": "",
+              "video_vae_path": "",
+              "high_noise_lora_path": "",
+              "low_noise_lora_path": "",
+              "frame_interpolator_model_path": ""
+            }
+          }
+        }
+      }
+    },
+    "cleanup": {
+      "label": "Release workflow resources",
+      "plugin_id": "agent_workflow_member",
+      "agent_kind": "model",
+      "system_prompt": "Run model workflow node Release workflow resources.",
+      "return_only_text": false,
+      "delay_ms": 0,
+      "x": 2330,
+      "y": 80,
+      "transitions": [],
+      "plugin_settings": {
+        "role": "Model workflow node",
+        "node_type": "tool_node",
+        "action_skill_categories": [],
+        "action_skills": [
+          "models.cleanup"
+        ],
+        "tool_config": {
+          "tool": "models.cleanup",
+          "model_node_type": "cleanup",
+          "model_asset_type": "cleanup",
+          "params_from_input": [],
+          "params": {
+            "node_id": "release_workflow_resources",
+            "model_node_type": "cleanup",
+            "model_asset_type": "cleanup",
+            "settings": {
+              "model_deck_compat_manifest_id": "wan22_t2v_gguf",
+              "model_family": "wan22_t2v_gguf",
+              "workflow_loader_mode": "workflow_model_loader",
+              "workflow_execution_backend": "native_graph",
+              "workflow_node_lifecycle_policy": "lazy_unload",
+              "device": "xpu",
+              "dtype": "bfloat16",
+              "width": 640,
+              "height": 960,
+              "duration_seconds": 5,
+              "fps": 16,
+              "target_fps": 60,
+              "frames": 81,
+              "steps": 10,
+              "high_noise_steps": 4,
+              "low_noise_steps": 6,
+              "guidance_scale": 3.0,
+              "high_noise_cfg": 3.0,
+              "low_noise_cfg": 2.5,
+              "sampler_name": "euler",
+              "scheduler": "simple",
+              "shift": 8,
+              "latent_format": "hunyuan_video",
+              "batch_size": 1
+            },
+            "assets": {
+              "high_noise_gguf_path": "",
+              "low_noise_gguf_path": "",
+              "text_encoder_gguf_path": "",
+              "video_vae_path": "",
+              "high_noise_lora_path": "",
+              "low_noise_lora_path": "",
+              "frame_interpolator_model_path": ""
+            }
+          }
+        }
+      }
+    }
+  }
+}

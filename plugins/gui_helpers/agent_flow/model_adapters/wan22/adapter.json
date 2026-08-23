@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "id": "wan22",
+  "name": "Wan 2.2",
+  "description": "Capabilities for Wan 2.2 T2V/I2V high-noise + low-noise native staged graph workflows. This adapter declares model node skills and settings only; workflows must call them explicitly.",
+  "model_types": ["video_gen"],
+  "aliases": ["wan22_t2v_gguf", "wan22_i2v_gguf", "wan2.2_t2v_gguf", "wan2.2_i2v_gguf", "wan2_2_t2v_gguf", "wan2_2_i2v_gguf"],
+  "families": ["wan22_t2v_gguf", "wan22_i2v_gguf", "wan_video_dual_transformer"],
+  "skills": {
+    "asset_resolver": "models.asset_resolver",
+    "optional_prompt": "models.wan22_optional_prompt",
+    "prompt_encoder": "models.wan22_prompt_encoder",
+    "text_encoder_loader": "models.wan22_prompt_encoder",
+    "dual_transformer_loader": "models.wan22_dual_transformer_loader",
+    "stage_transformer_loader": "models.wan22_stage_transformer_loader",
+    "high_noise_transformer_loader": "models.wan22_stage_transformer_loader",
+    "low_noise_transformer_loader": "models.wan22_stage_transformer_loader",
+    "transformer_loader": "models.wan22_dual_transformer_loader",
+    "gguf_transformer_loader": "models.wan22_dual_transformer_loader",
+    "lora_loader": "models.wan22_lora_attach",
+    "i2v_source_prepare": "models.wan22_i2v_source_prepare",
+    "i2v_source_vae_encode": "models.wan22_i2v_source_vae_encode",
+    "i2v_conditioning_inject": "models.wan22_i2v_conditioning_inject",
+    "latent_video_init": "models.wan22_latent_video_init",
+    "i2v_latent_init": "models.wan22_i2v_latent_init",
+    "stage_sampler": "models.wan22_stage_sampler",
+    "high_noise_sampler": "models.wan22_stage_sampler",
+    "low_noise_sampler": "models.wan22_stage_sampler",
+    "release_transformer": "models.wan22_release_transformer",
+    "sampler": "models.wan22_staged_sampler",
+    "vae_decode": "models.wan22_vae_decode",
+    "frame_interpolator": "models.wan22_frame_interpolator",
+    "video_encode": "models.wan22_media_encode",
+    "media_encode": "models.wan22_media_encode",
+    "cleanup": "models.cleanup"
+  },
+  "asset_keys": {
+    "high_noise_gguf_path": {"label": "High-noise GGUF", "kind": "local_or_hf_file", "required": true, "source": "https://huggingface.co/QuantStack/Wan2.2-I2V-A14B-GGUF"},
+    "low_noise_gguf_path": {"label": "Low-noise GGUF", "kind": "local_or_hf_file", "required": true, "source": "https://huggingface.co/QuantStack/Wan2.2-I2V-A14B-GGUF"},
+    "text_encoder_gguf_path": {"label": "UMT5 text encoder GGUF", "kind": "local_or_hf_file", "required": true, "source": "https://huggingface.co/QuantStack/Wan2.2-I2V-A14B-GGUF"},
+    "video_vae_path": {"label": "Wan VAE", "kind": "local_or_hf_file", "required": true, "source": "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged"},
+    "source_image_path": {"label": "I2V source image", "kind": "runtime_media", "required": false},
+    "high_noise_lora_path": {"label": "High-noise LoRA", "kind": "local_or_hf_file", "required": false, "source": "https://huggingface.co/lightx2v/Wan2.2-Distill-Loras"},
+    "low_noise_lora_path": {"label": "Low-noise LoRA", "kind": "local_or_hf_file", "required": false, "source": "https://huggingface.co/lightx2v/Wan2.2-Distill-Loras"}
+  },
+  "setting_schema_refs": {
+    "prompt_encoder": "schemas/wan22_prompt_encoder.json",
+    "i2v_source_vae_encode": "schemas/wan22_i2v_source_vae_encode.json",
+    "stage_sampler": "schemas/wan22_stage_sampler.json",
+    "vae_decode": "schemas/wan22_vae_decode.json"
+  },
+  "examples": [
+    {
+      "name": "Wan 2.2 I2V split source",
+      "note": "Example workflows are optional/importable. They are not activated by this manifest."
+    }
+  ]
+}

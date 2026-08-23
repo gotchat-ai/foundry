@@ -20,11 +20,26 @@ def run(ctx: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
     root = _common.resolve_root(ctx or {}, params or {})
     if not (root / ".git").is_dir():
         return {"ok": False, "data": {"root": str(root), "is_git_repo": False}, "warnings": ["not_git_repo"]}
+    head_res = _common.run_git(root, ["rev-parse", "--verify", "HEAD"])
+    head_present = bool(head_res.get("ok")) and bool(str(head_res.get("stdout") or "").strip())
+    if not head_present:
+        return {
+            "ok": False,
+            "data": {
+                "root": str(root),
+                "is_git_repo": True,
+                "head_present": False,
+                "status": "",
+                "changed": [],
+                "deleted": [],
+            },
+            "warnings": ["empty_git_repo_no_commits"],
+        }
     res = _common.run_git(root, ["status", "--porcelain"])
     delta = _common.changed_deleted_from_status(res.get("stdout", ""))
     return {
         "ok": bool(res.get("ok")),
-        "data": {"root": str(root), "is_git_repo": True, "status": res.get("stdout", ""), **delta},
+        "data": {"root": str(root), "is_git_repo": True, "head_present": True, "status": res.get("stdout", ""), **delta},
         "warnings": [] if res.get("ok") else [str(res.get("stderr") or "git_status_failed")],
     }
 

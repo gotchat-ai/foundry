@@ -1,0 +1,481 @@
+{
+  "id": "wan22_i2v_gguf",
+  "label": "Wan2.2 I2V GGUF Workflow",
+  "description": "Tested-profile skeleton for ComfyUI-style Wan2.2 image-to-video GGUF workflows with source image conditioning, paired HighNoise/LowNoise UNets, UMT5 GGUF text encoder, Wan VAE, optional LoRA stages, optional RIFE interpolation, and staged one-at-a-time sampling.",
+  "workflow_file": "workflow.json",
+  "aliases": [
+    "wan2.2 i2v",
+    "wan2.2-i2v-a14b",
+    "wan2.2-i2v-a14b-gguf",
+    "quantstack/wan2.2-i2v-a14b-gguf"
+  ],
+  "backends": [
+    "native_graph",
+    "diffusers"
+  ],
+  "runtime_profile": {
+    "kind": "internal_workflow",
+    "workflow_id": "wan22_i2v_gguf",
+    "workflow_model_loader_id": "models.wan22_i2v_gguf",
+    "workflow_model_loader_file": "workflow.json",
+    "supports_workflow_model_loader": true,
+    "family": "wan22_i2v_gguf",
+    "scenario": "video_i2v_gguf_dual_transformer_staged_sampler",
+    "asset_slots": [
+      {
+        "key": "source_image_path",
+        "role": "source_image",
+        "required": true,
+        "source": "local_file",
+        "patterns": [
+          "*.png",
+          "*.jpg",
+          "*.jpeg",
+          "*.webp"
+        ]
+      },
+      {
+        "key": "high_noise_gguf_path",
+        "role": "video_transformer_gguf_high_noise",
+        "required": true,
+        "source": "local_or_hf_file",
+        "patterns": [
+          "*I2V*HighNoise*.gguf",
+          "*HighNoise*.gguf",
+          "*high*noise*.gguf"
+        ]
+      },
+      {
+        "key": "low_noise_gguf_path",
+        "role": "video_transformer_gguf_low_noise",
+        "required": true,
+        "source": "local_or_hf_file",
+        "patterns": [
+          "*I2V*LowNoise*.gguf",
+          "*LowNoise*.gguf",
+          "*low*noise*.gguf"
+        ]
+      },
+      {
+        "key": "text_encoder_gguf_path",
+        "role": "text_encoder_gguf",
+        "required": true,
+        "source": "local_or_hf_file",
+        "patterns": [
+          "umt5*.gguf",
+          "*umt5*encoder*.gguf"
+        ]
+      },
+      {
+        "key": "video_vae_path",
+        "role": "video_vae",
+        "required": true,
+        "source": "local_or_hf_file",
+        "patterns": [
+          "wan*vae*.safetensors",
+          "wan_2.1_vae.safetensors"
+        ]
+      },
+      {
+        "key": "high_noise_lora_path",
+        "role": "optional_high_noise_lora",
+        "required": false,
+        "source": "local_or_hf_file",
+        "patterns": [
+          "*high*noise*lora*.safetensors",
+          "*wan*lora*.safetensors"
+        ]
+      },
+      {
+        "key": "low_noise_lora_path",
+        "role": "optional_low_noise_lora",
+        "required": false,
+        "source": "local_or_hf_file",
+        "patterns": [
+          "*low*noise*lora*.safetensors",
+          "*wan*lora*.safetensors"
+        ]
+      },
+      {
+        "key": "frame_interpolator_model_path",
+        "role": "optional_frame_interpolator",
+        "required": false,
+        "source": "local_or_hf_file",
+        "patterns": [
+          "rife*.pth",
+          "rife*.pt"
+        ]
+      },
+      {
+        "key": "workflow_loader_mode",
+        "role": "workflow_loader_mode",
+        "required": false,
+        "source": "setting",
+        "default": "workflow_model_loader"
+      },
+      {
+        "key": "workflow_execution_backend",
+        "role": "workflow_execution_backend",
+        "required": false,
+        "source": "setting",
+        "default": "native_graph"
+      },
+      {
+        "key": "workflow_node_lifecycle_policy",
+        "role": "node_lifecycle_policy",
+        "required": false,
+        "source": "setting",
+        "default": "lazy_unload"
+      },
+      {
+        "key": "latent_format",
+        "role": "latent_video_format",
+        "required": false,
+        "source": "setting",
+        "default": "hunyuan_video"
+      },
+      {
+        "key": "high_noise_steps",
+        "role": "high_noise_steps",
+        "required": false,
+        "source": "setting",
+        "default": 4
+      },
+      {
+        "key": "low_noise_steps",
+        "role": "low_noise_steps",
+        "required": false,
+        "source": "setting",
+        "default": 6
+      },
+      {
+        "key": "shift",
+        "role": "model_sampling_shift",
+        "required": false,
+        "source": "setting",
+        "default": 8
+      },
+      {
+        "key": "sampler_name",
+        "role": "sampler_name",
+        "required": false,
+        "source": "setting",
+        "default": "euler"
+      },
+      {
+        "key": "scheduler",
+        "role": "scheduler",
+        "required": false,
+        "source": "setting",
+        "default": "simple"
+      },
+      {
+        "key": "target_fps",
+        "role": "interpolated_output_fps",
+        "required": false,
+        "source": "setting",
+        "default": 60
+      },
+      {
+        "key": "wan_vae_decode_mode",
+        "role": "wan_vae_decode_mode",
+        "required": false,
+        "source": "setting",
+        "default": "gpu_chunked_safe",
+        "options": [
+          {
+            "value": "cpu_safe",
+            "label": "CPU safe VAE decode"
+          },
+          {
+            "value": "gpu_full",
+            "label": "GPU full VAE decode"
+          },
+          {
+            "value": "gpu_chunked_safe",
+            "label": "GPU chunked safe VAE decode"
+          }
+        ]
+      },
+      {
+        "key": "wan_vae_chunk_latent_frames",
+        "role": "wan_vae_chunk_latent_frames",
+        "required": false,
+        "source": "setting",
+        "default": 1
+      },
+      {
+        "key": "wan_vae_decode_device",
+        "role": "wan_vae_decode_device",
+        "required": false,
+        "source": "setting",
+        "default": "gpu",
+        "options": [
+          {
+            "value": "cpu",
+            "label": "CPU"
+          },
+          {
+            "value": "gpu",
+            "label": "GPU / main video device"
+          }
+        ]
+      },
+      {
+        "key": "wan_vae_dtype",
+        "role": "wan_vae_dtype",
+        "required": false,
+        "source": "setting",
+        "default": "bfloat16",
+        "options": [
+          {
+            "value": "bfloat16",
+            "label": "bfloat16"
+          },
+          {
+            "value": "float32",
+            "label": "float32"
+          },
+          {
+            "value": "float16",
+            "label": "float16"
+          }
+        ]
+      }
+    ],
+    "loader_steps": [
+      {
+        "id": "text_encoder",
+        "kind": "gguf_text_encoder",
+        "role": "text_encoder_gguf",
+        "source_setting": "text_encoder_gguf_path",
+        "class_name": "CLIPLoaderGGUF",
+        "clip_type": "wan"
+      },
+      {
+        "id": "high_noise_transformer",
+        "kind": "gguf_transformer_stage",
+        "role": "video_transformer_gguf_high_noise",
+        "source_setting": "high_noise_gguf_path",
+        "stage": "high_noise",
+        "handler": "wan22_stage_transformer_loader"
+      },
+      {
+        "id": "high_noise_sampler",
+        "kind": "sampler_stage",
+        "model_stage": "high_noise",
+        "steps_setting": "high_noise_steps",
+        "handler": "wan22_stage_sampler"
+      },
+      {
+        "id": "release_high_noise_transformer",
+        "kind": "release_model",
+        "model_stage": "high_noise",
+        "handler": "wan22_release_transformer"
+      },
+      {
+        "id": "low_noise_transformer",
+        "kind": "gguf_transformer_stage",
+        "role": "video_transformer_gguf_low_noise",
+        "source_setting": "low_noise_gguf_path",
+        "stage": "low_noise",
+        "handler": "wan22_stage_transformer_loader"
+      },
+      {
+        "id": "low_noise_sampler",
+        "kind": "sampler_stage",
+        "model_stage": "low_noise",
+        "steps_setting": "low_noise_steps",
+        "handler": "wan22_stage_sampler"
+      },
+      {
+        "id": "release_low_noise_transformer",
+        "kind": "release_model",
+        "model_stage": "low_noise",
+        "handler": "wan22_release_transformer"
+      },
+      {
+        "id": "vae",
+        "kind": "support_asset",
+        "role": "video_vae",
+        "source_setting": "video_vae_path",
+        "class_name": "AutoencoderKLWan",
+        "class_module": "diffusers"
+      },
+      {
+        "id": "rife_interpolator",
+        "kind": "optional_postprocess",
+        "role": "optional_frame_interpolator",
+        "source_setting": "frame_interpolator_model_path"
+      }
+    ]
+  },
+  "requirements": [
+    {
+      "id": "torch",
+      "label": "PyTorch",
+      "kind": "python_package",
+      "package": "torch",
+      "import_name": "torch",
+      "install": [
+        "torch"
+      ],
+      "uninstall": [
+        "torch"
+      ]
+    },
+    {
+      "id": "gguf",
+      "label": "gguf",
+      "kind": "python_package",
+      "package": "gguf",
+      "import_name": "gguf",
+      "install": [
+        "gguf"
+      ],
+      "uninstall": [
+        "gguf"
+      ]
+    },
+    {
+      "id": "diffusers",
+      "label": "diffusers",
+      "kind": "python_package",
+      "package": "diffusers",
+      "import_name": "diffusers",
+      "install": [
+        "diffusers"
+      ],
+      "uninstall": [
+        "diffusers"
+      ]
+    },
+    {
+      "id": "transformers",
+      "label": "transformers",
+      "kind": "python_package",
+      "package": "transformers",
+      "import_name": "transformers",
+      "install": [
+        "transformers"
+      ],
+      "uninstall": [
+        "transformers"
+      ]
+    },
+    {
+      "id": "imageio_ffmpeg",
+      "label": "imageio-ffmpeg",
+      "kind": "python_package",
+      "package": "imageio-ffmpeg",
+      "import_name": "imageio_ffmpeg",
+      "install": [
+        "imageio-ffmpeg"
+      ],
+      "uninstall": [
+        "imageio-ffmpeg"
+      ]
+    }
+  ],
+  "workflow_defaults": {
+    "model_id": "QuantStack/Wan2.2-I2V-A14B-GGUF",
+    "model_family": "wan22_i2v_gguf",
+    "workflow_variant": "i2v_high_low_noise",
+    "workflow_loader_mode": "workflow_model_loader",
+    "workflow_execution_backend": "native_graph",
+    "workflow_node_lifecycle_policy": "lazy_unload",
+    "device": "xpu",
+    "dtype": "bfloat16",
+    "width": 832,
+    "height": 480,
+    "duration_seconds": 5,
+    "fps": 16,
+    "target_fps": 16,
+    "frames": 81,
+    "steps": 6,
+    "high_noise_steps": 2,
+    "low_noise_steps": 4,
+    "guidance_scale": 1.0,
+    "high_noise_cfg": 1.0,
+    "low_noise_cfg": 1.0,
+    "sampler_name": "euler",
+    "scheduler": "simple",
+    "shift": 8,
+    "latent_format": "wan_i2v",
+    "batch_size": 1,
+    "negative_prompt": "overexposed, blurry details, subtitles, watermark, low quality, jpeg artifacts, ugly, bad anatomy, malformed limbs, deformed, bad hands, bad face, mosaic, cartoon errors, static, grey haze",
+    "wan_vae_decode_tiled": false,
+    "wan_vae_tile_size": 256,
+    "wan_vae_overlap": 64,
+    "wan_vae_temporal_size": 8,
+    "wan_vae_temporal_overlap": 2,
+    "wan_persist_transformers_until_cleanup": false,
+    "wan_vae_decode_device": "gpu",
+    "wan_vae_dtype": "bfloat16",
+    "wan_vae_decode_mode": "gpu_chunked_safe",
+    "wan_vae_chunk_latent_frames": 1,
+    "source_image_path": "",
+    "high_noise_gguf_path": "${MODEL_DECK_MODELS_DIR}/wan2_2/I2V/HighNoise/Wan2.2-I2V-A14B-HighNoise-Q5_K_M.gguf",
+    "low_noise_gguf_path": "${MODEL_DECK_MODELS_DIR}/wan2_2/I2V/LowNoise/Wan2.2-I2V-A14B-LowNoise-Q5_K_M.gguf",
+    "text_encoder_gguf_path": "${MODEL_DECK_MODELS_DIR}/wan2_2/text_encoders/umt5-xxl-encoder-Q8_0.gguf",
+    "video_vae_path": "${MODEL_DECK_MODELS_DIR}/wan2_2/vae/wan_2.1_vae.safetensors",
+    "high_noise_lora_path": "",
+    "low_noise_lora_path": "",
+    "frame_interpolator_model_path": "${MODEL_DECK_MODELS_DIR}/wan2_2/rife/rife49.pth",
+    "model_deck_compat_manifest_id": "wan22_i2v_gguf",
+    "model_workflow_flow_name": "Models / Wan2.2 I2V GGUF",
+    "model_workflow_template_flow_name": "Models / Wan2.2 I2V GGUF",
+    "model_workflow_owned": false,
+    "model_workflow_use_model_deck_default_assets": false
+  },
+  "loader_steps": [
+    {
+      "id": "resolve_assets",
+      "label": "Resolve I2V assets"
+    },
+    {
+      "id": "encode_prompt",
+      "label": "Encode prompt with UMT5"
+    },
+    {
+      "id": "init_i2v_latent",
+      "label": "Initialize source image latent/conditioning"
+    },
+    {
+      "id": "load_high_noise_transformer",
+      "label": "Load HighNoise GGUF only"
+    },
+    {
+      "id": "sample_high_noise",
+      "label": "Sample HighNoise stage"
+    },
+    {
+      "id": "release_high_noise_transformer",
+      "label": "Release HighNoise GGUF"
+    },
+    {
+      "id": "load_low_noise_transformer",
+      "label": "Load LowNoise GGUF only"
+    },
+    {
+      "id": "sample_low_noise",
+      "label": "Sample LowNoise stage"
+    },
+    {
+      "id": "release_low_noise_transformer",
+      "label": "Release LowNoise GGUF"
+    },
+    {
+      "id": "decode_video",
+      "label": "Decode video VAE"
+    },
+    {
+      "id": "encode_mp4",
+      "label": "Encode MP4"
+    },
+    {
+      "id": "cleanup",
+      "label": "Release workflow resources"
+    }
+  ]
+}

@@ -1,0 +1,305 @@
+{
+  "schema_version": "1.0",
+  "workflow_id": "models.unsloth_ltx23_gguf",
+  "flow_name": "Models / Unsloth LTX 2.3 GGUF",
+  "category": "models",
+  "description": "Workflow-model-loader graph for Unsloth LTX 2.3 GGUF. Current checkpoint-runner mode declares nodes 2-6 and performs the heavy runtime inside the final video execution node; future native graph mode can replace these declarations with true staged lazy loading.",
+  "runtime": {
+    "engine": "model_deck.workflow_model_loader",
+    "default_lifecycle_policy": "lazy_unload",
+    "checkpoint_runner": "run_unsloth_ltx_workflow.py",
+    "quantized_loader": {
+      "style": "comfyui_gguf",
+      "vendor_root": "${LLMLOADER2_ROOT}/vendor/ComfyUI-GGUF",
+      "state_dict_loader": "loader.gguf_sd_loader",
+      "ops": "ops.GGMLOps",
+      "tensor_wrapper": "ops.GGMLTensor",
+      "patcher": "nodes.GGUFModelPatcher",
+      "behavior": "Keep quantized GGUF tensors wrapped and dequantize per layer forward instead of eagerly materializing a dense state dict."
+    }
+  },
+  "inputs": {
+    "prompt": {
+      "type": "text",
+      "required": true
+    },
+    "negative_prompt": {
+      "type": "text",
+      "required": false
+    },
+    "width": {
+      "type": "int",
+      "default": 848
+    },
+    "height": {
+      "type": "int",
+      "default": 480
+    },
+    "frames": {
+      "type": "int",
+      "default": 31
+    },
+    "fps": {
+      "type": "int",
+      "default": 30
+    },
+    "steps": {
+      "type": "int",
+      "default": 8
+    },
+    "guidance_scale": {
+      "type": "float",
+      "default": 1.0
+    },
+    "seed": {
+      "type": "int",
+      "default": -1
+    }
+  },
+  "artifacts": {
+    "assets": "Resolved local asset paths and static runtime settings.",
+    "text_encoder": "Gemma text encoder runtime handle.",
+    "prompt_context": "LTX video/audio prompt embeddings and attention masks.",
+    "video_transformer": "Quant-aware LTX video transformer handle.",
+    "latent_video": "Generated video latents.",
+    "decoded_video": "Decoded video frames/chunks.",
+    "output_video": "Final encoded video path."
+  },
+  "nodes": [
+    {
+      "id": "resolve_assets",
+      "label": "Resolve LTX assets",
+      "type": "models.asset_resolver",
+      "category": "models",
+      "lifecycle": "persist",
+      "inputs": {
+        "asset_keys": [
+          "gguf_path",
+          "embeddings_connectors_path",
+          "video_vae_path",
+          "audio_vae_path",
+          "text_encoder_safetensors_path",
+          "text_encoder_tokenizer_gguf_path",
+          "text_encoder_gguf_path",
+          "text_encoder_mmproj_path",
+          "distilled_lora_path",
+          "spatial_upscaler_path"
+        ]
+      },
+      "outputs": {
+        "assets": "assets"
+      },
+      "transitions": [
+        {
+          "target": "encode_prompt",
+          "condition": {
+            "type": "always"
+          }
+        }
+      ]
+    },
+    {
+      "id": "encode_prompt",
+      "label": "Encode prompt with Gemma",
+      "type": "models.ltx_prompt_encoder",
+      "category": "models",
+      "lifecycle": "lazy_unload",
+      "loader": "gguf_text_encoder",
+      "device_setting": "gemma_text_encoding_device",
+      "inputs": {
+        "assets": "resolve_assets.assets",
+        "prompt": "$input.prompt",
+        "negative_prompt": "$input.negative_prompt"
+      },
+      "outputs": {
+        "prompt_context": "prompt_context"
+      },
+      "cleanup": [
+        "text_encoder"
+      ],
+      "transitions": [
+        {
+          "target": "load_transformer",
+          "condition": {
+            "type": "always"
+          }
+        }
+      ]
+    },
+    {
+      "id": "load_transformer",
+      "label": "Load LTX GGUF transformer",
+      "type": "models.gguf_transformer_loader",
+      "category": "models",
+      "lifecycle": "lazy_persist",
+      "loader": "comfyui_gguf",
+      "device_setting": "device",
+      "memory_policy_setting": "workflow_node_lifecycle_policy",
+      "inputs": {
+        "assets": "resolve_assets.assets",
+        "gguf_path": "resolve_assets.assets.gguf_path"
+      },
+      "outputs": {
+        "video_transformer": "video_transformer"
+      },
+      "transitions": [
+        {
+          "target": "attach_ltx_assets",
+          "condition": {
+            "type": "always"
+          }
+        }
+      ]
+    },
+    {
+      "id": "attach_ltx_assets",
+      "label": "Attach connectors and LoRA",
+      "type": "models.ltx_asset_attach",
+      "category": "models",
+      "lifecycle": "lazy_persist",
+      "inputs": {
+        "assets": "resolve_assets.assets",
+        "video_transformer": "load_transformer.video_transformer"
+      },
+      "outputs": {
+        "video_transformer": "video_transformer"
+      },
+      "transitions": [
+        {
+          "target": "configure_ltx_graph",
+          "condition": {
+            "type": "always"
+          }
+        }
+      ]
+    },
+    {
+      "id": "configure_ltx_graph",
+      "label": "Configure LTX Comfy parity nodes",
+      "type": "models.ltx_graph_settings",
+      "category": "models",
+      "lifecycle": "persist",
+      "inputs": {
+        "stage1_sampler": "$setting.ltx_stage1_sampler",
+        "stage1_sigmas": "$setting.ltx_stage1_sigmas",
+        "stage1_cfg": "$setting.ltx_stage1_cfg",
+        "stage2_sampler": "$setting.ltx_stage2_sampler",
+        "stage2_sigmas": "$setting.ltx_stage2_sigmas",
+        "stage2_cfg": "$setting.ltx_stage2_cfg",
+        "crop_guides_enabled": "$setting.ltx_crop_guides_enabled",
+        "chunk_feedforward_chunks": "$setting.ltx_chunk_feedforward_chunks",
+        "chunk_feedforward_dim_threshold": "$setting.ltx_chunk_feedforward_dim_threshold",
+        "distilled_lora_strength": "$setting.ltx_distilled_lora_strength",
+        "detailer_lora_path": "$setting.ltx_detailer_lora_path",
+        "detailer_lora_strength": "$setting.ltx_detailer_lora_strength"
+      },
+      "outputs": {
+        "graph_settings": "ltx_graph_settings"
+      },
+      "transitions": [
+        {
+          "target": "sample_video",
+          "condition": {
+            "type": "always"
+          }
+        }
+      ]
+    },
+    {
+      "id": "sample_video",
+      "label": "Sample video latents",
+      "type": "models.ltx_sampler",
+      "category": "models",
+      "lifecycle": "persist",
+      "inputs": {
+        "video_transformer": "attach_ltx_assets.video_transformer",
+        "prompt_context": "encode_prompt.prompt_context",
+        "width": "$input.width",
+        "height": "$input.height",
+        "frames": "$input.frames",
+        "fps": "$input.fps",
+        "steps": "$input.steps",
+        "guidance_scale": "$input.guidance_scale",
+        "seed": "$input.seed"
+      },
+      "outputs": {
+        "latent_video": "latent_video"
+      },
+      "transitions": [
+        {
+          "target": "decode_video",
+          "condition": {
+            "type": "always"
+          }
+        }
+      ]
+    },
+    {
+      "id": "decode_video",
+      "label": "Decode video VAE",
+      "type": "models.video_vae_decode",
+      "category": "models",
+      "lifecycle": "lazy_unload",
+      "inputs": {
+        "assets": "resolve_assets.assets",
+        "latent_video": "sample_video.latent_video"
+      },
+      "outputs": {
+        "decoded_video": "decoded_video"
+      },
+      "cleanup": [
+        "video_vae",
+        "audio_vae"
+      ],
+      "transitions": [
+        {
+          "target": "encode_mp4",
+          "condition": {
+            "type": "always"
+          }
+        }
+      ]
+    },
+    {
+      "id": "encode_mp4",
+      "label": "Encode MP4",
+      "type": "models.video_encode",
+      "category": "models",
+      "lifecycle": "persist",
+      "inputs": {
+        "decoded_video": "decode_video.decoded_video",
+        "fps": "$input.fps",
+        "codec": "$setting.codec"
+      },
+      "outputs": {
+        "output_video": "output_video"
+      },
+      "transitions": [
+        {
+          "target": "cleanup",
+          "condition": {
+            "type": "always"
+          }
+        }
+      ]
+    },
+    {
+      "id": "cleanup",
+      "label": "Release workflow resources",
+      "type": "models.cleanup",
+      "category": "models",
+      "lifecycle": "terminal",
+      "inputs": {
+        "targets": [
+          "video_transformer",
+          "prompt_context",
+          "latent_video",
+          "decoded_video"
+        ]
+      },
+      "outputs": {
+        "done": true
+      }
+    }
+  ]
+}

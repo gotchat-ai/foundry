@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 from plugins.ai_routes.base import BaseRoute, RouterCore
-from plugins.ai_routes.model_deck_utils import ImageGenRunner
+from plugins.ai_routes.model_deck_utils import ImageGenRunner, normalize_workflow_media_inputs
 
 
 PLUGIN_ID = "image_gen"
@@ -82,6 +82,14 @@ class ImageGenRoute(BaseRoute):
                 pass
 
         settings = self._merge_settings(req)
+        media_inputs = normalize_workflow_media_inputs(req)
+        if media_inputs:
+            settings.update(media_inputs)
+            model_overrides = settings.get("image_gen_model_settings")
+            if not isinstance(model_overrides, dict):
+                model_overrides = {}
+            model_overrides.update(media_inputs)
+            settings["image_gen_model_settings"] = model_overrides
         cancel_cb = self._cancel_cb(settings)
         if self._is_canceled(settings):
             return {"route_id": self.route_id, "ok": False, "error": "canceled"}
@@ -243,7 +251,7 @@ class ImageGenRoute(BaseRoute):
 
     def _merge_settings(self, req: Any) -> Dict[str, Any]:
         settings: Dict[str, Any] = dict(self.core.settings or {})
-        ext = getattr(req, "ext", None)
+        ext = req.get("ext") if isinstance(req, dict) else getattr(req, "ext", None)
         if isinstance(ext, dict):
             settings.update(_plugin_settings_from_ext(ext, self.route_id))
         if "image_gen_use_prompt_embeds" not in settings:

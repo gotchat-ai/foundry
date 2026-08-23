@@ -234,19 +234,48 @@ def _latest_assistant_message_after(
     *,
     previous_msg_id: str = "",
     previous_ts: int = 0,
+    ai_job_id: str = "",
     limit: int = 40,
 ) -> Optional[Dict[str, Any]]:
     rows = db.list_messages(pid=pid, sid=sid, after_msg_id=None, since_ts=None, limit=limit, order_desc=True)
+    fallback: Optional[Dict[str, Any]] = None
+    run_match: Optional[Dict[str, Any]] = None
+    run_stream_match: Optional[Dict[str, Any]] = None
     for row in rows:
         if str(row.get("role") or "").strip().lower() != "assistant":
             continue
         msg_id = str(row.get("msg_id") or "").strip()
         ts = int(row.get("ts") or 0)
+        meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
+        row_ai_job_id = str(meta.get("ai_job_id") or meta.get("job_id") or "").strip()
+        row_flow_run_id = str(meta.get("flow_run_id") or meta.get("flow_result_for_run_id") or "").strip()
+        is_flow_result = bool(meta.get("flow_result"))
+        is_flow_stream = bool(meta.get("flow_stream"))
+        if previous_msg_id and msg_id and msg_id == previous_msg_id:
+            continue
+        if previous_ts and ts <= previous_ts:
+            continue
+        if ai_job_id and row_flow_run_id == ai_job_id:
+            if is_flow_result:
+                return row
+            if run_match is None:
+                run_match = row
+            if is_flow_stream and run_stream_match is None:
+                run_stream_match = row
+            continue
+        if ai_job_id and row_ai_job_id == ai_job_id:
+            return row
         if previous_msg_id and msg_id and msg_id != previous_msg_id:
-            return row
+            fallback = fallback or row
+            continue
         if previous_ts and ts > previous_ts:
-            return row
-    return None
+            fallback = fallback or row
+            continue
+    if run_match is not None and not bool((run_match.get("meta") if isinstance(run_match.get("meta"), dict) else {}).get("flow_stream")):
+        return run_match
+    if run_stream_match is not None:
+        return run_stream_match
+    return fallback
 
 
 def _service_enabled_plugins(router_enabled: Iterable[Any]) -> str:
@@ -1557,6 +1586,17 @@ def _service_user_message(
     }
 
 
+def _service_publish_live_message(app: Any, pid: str, sid: str, msg: Optional[Dict[str, Any]]) -> None:
+    if not isinstance(msg, dict):
+        return
+    try:
+        hub = getattr(app.state, "collab_hub", None)
+        if hub is not None:
+            hub.publish(pid, sid, event="message", data={"msg": msg})
+    except Exception:
+        pass
+
+
 def _service_startup_warmup_state(app: Any) -> Dict[str, Any]:
     try:
         warmup_s = float(os.environ.get("MODEL_LOADER_SERVICE_CHAT_WARMUP_SECONDS") or 60.0)
@@ -2215,10 +2255,10 @@ class _SessionHub:
         with self._lock:
             self._subs.setdefault(key, []).append(q)
             sub_count = len(self._subs.get(key) or [])
-        try:
-            print(f"[collab_events] subscribe pid={pid} sid={sid} subs={sub_count}", flush=True)
-        except Exception:
-            pass
+        # try:
+        #     print(f"[collab_events] subscribe pid={pid} sid={sid} subs={sub_count}", flush=True)
+        # except Exception:
+        #     pass
         return q
 
     def unsubscribe(self, pid: str, sid: str, q: queue.Queue) -> None:
@@ -2232,10 +2272,10 @@ class _SessionHub:
             if not cur:
                 self._subs.pop(key, None)
             sub_count = len(self._subs.get(key) or [])
-        try:
-            print(f"[collab_events] unsubscribe pid={pid} sid={sid} subs={sub_count}", flush=True)
-        except Exception:
-            pass
+        # try:
+        #     print(f"[collab_events] unsubscribe pid={pid} sid={sid} subs={sub_count}", flush=True)
+        # except Exception:
+        #     pass
 
     # def publish(self, pid: str, sid: str, *, event: str, data: Dict[str, Any]) -> None:
     def publish(self, pid: str, sid: str, event: str, data: Dict[str, Any]) -> None:
@@ -2247,10 +2287,10 @@ class _SessionHub:
             data_keys = ",".join(sorted((data or {}).keys()))
             msg_id = str((data or {}).get("msg_id") or ((data or {}).get("msg") or {}).get("msg_id") or "").strip()
             role = str(((data or {}).get("msg") or {}).get("role") or "").strip()
-            print(
-                f"[collab_events] publish pid={pid} sid={sid} event={event} subs={len(subs)} msg_id={msg_id} role={role} keys={data_keys}",
-                flush=True,
-            )
+            # print(
+            #     f"[collab_events] publish pid={pid} sid={sid} event={event} subs={len(subs)} msg_id={msg_id} role={role} keys={data_keys}",
+            #     flush=True,
+            # )
         except Exception:
             pass
         if not subs:
@@ -3320,7 +3360,7 @@ class _DB:
                     if row:
                         where.append("(ts>? OR (ts=? AND msg_id>?))")
                         args.extend([int(row[0]), int(row[0]), after_msg_id])
-                order = "ORDER BY ts DESC, msg_id DESC" if order_desc else "ORDER BY ts, msg_id"
+                order = "ORDER BY ts DESC, rowid DESC" if order_desc else "ORDER BY ts, rowid"
                 q = (
                     "SELECT msg_id, pid, sid, ts, role, kind, author_username, author_alias, content, meta_json "
                     "FROM messages WHERE " + " AND ".join(where) + f" {order} LIMIT ?"
@@ -3743,6 +3783,7 @@ class ModelTurnRequest(BaseModel):
     prompt: Optional[str] = None
     content: Optional[str] = None
     messages: Optional[List[Dict[str, Any]]] = None
+    system: Optional[str] = None
 
     alias: Optional[str] = None
     client_msg_id: Optional[str] = None
@@ -3752,6 +3793,9 @@ class ModelTurnRequest(BaseModel):
     max_tokens: Optional[int] = None
     top_p: Optional[float] = None
     stop: Optional[Any] = None
+    route_id: Optional[str] = None
+    router_enabled_plugins: Optional[List[str]] = None
+    ext: Optional[Dict[str, Any]] = None
 
 
 class ServiceChatRequest(BaseModel):
@@ -5066,11 +5110,40 @@ def install(app) -> None:
         previous_assistant = _latest_assistant_message(db, pid, sid)
         previous_msg_id = str((previous_assistant or {}).get("msg_id") or "").strip() if isinstance(previous_assistant, dict) else ""
         previous_ts = int((previous_assistant or {}).get("ts") or 0) if isinstance(previous_assistant, dict) else 0
+        headers = _internal_service_headers(request, pid=pid, sid=sid, enabled_plugins=["agent_flow"])
+        try:
+            latest_state_payload = await _internal_json_request(
+                app,
+                method="GET",
+                path=f"/v1/projects/{pid}/sessions/{sid}/agent_flow/status",
+                headers=headers,
+            )
+            latest_state = latest_state_payload.get("state") if isinstance(latest_state_payload, dict) else {}
+            active_run_id = str((latest_state or {}).get("run_id") or "").strip()
+            if active_run_id and bool((latest_state or {}).get("running")):
+                cancelled = getattr(app.state, "ai_jobs_cancelled", None)
+                if not isinstance(cancelled, dict):
+                    cancelled = {}
+                    app.state.ai_jobs_cancelled = cancelled
+                cancelled[active_run_id] = True
+                for _ in range(30):
+                    await asyncio.sleep(0.5)
+                    latest_state_payload = await _internal_json_request(
+                        app,
+                        method="GET",
+                        path=f"/v1/projects/{pid}/sessions/{sid}/agent_flow/status?run_id={active_run_id}",
+                        headers=headers,
+                    )
+                    latest_state = latest_state_payload.get("state") if isinstance(latest_state_payload, dict) else {}
+                    if not bool((latest_state or {}).get("running")):
+                        break
+        except Exception:
+            pass
         flows_payload = await _internal_json_request(
             app,
             method="GET",
             path=f"/v1/projects/{pid}/sessions/{sid}/agent_flow/flows",
-            headers=_internal_service_headers(request, pid=pid, sid=sid, enabled_plugins=["agent_flow"]),
+            headers=headers,
         )
         flows = flows_payload.get("flows") if isinstance(flows_payload.get("flows"), dict) else {}
         runtime_flow_name = str(flow_name or "").strip()
@@ -5079,8 +5152,22 @@ def install(app) -> None:
             raise HTTPException(status_code=400, detail="service_chat_flow_not_found")
         enabled = set(str(x or "").strip() for x in (router_cfg.get("enabled") or []) if str(x or "").strip())
         enabled.add("agent_flow")
-        nodes = runtime_flow_def.get("nodes") if isinstance(runtime_flow_def.get("nodes"), dict) else {}
-        for node in nodes.values():
+        raw_nodes = runtime_flow_def.get("nodes")
+        if isinstance(raw_nodes, dict):
+            node_iter = raw_nodes.values()
+        elif isinstance(raw_nodes, list):
+            node_iter = raw_nodes
+        elif isinstance(raw_nodes, str):
+            try:
+                parsed_nodes = json.loads(raw_nodes)
+            except Exception:
+                parsed_nodes = {}
+            node_iter = parsed_nodes.values() if isinstance(parsed_nodes, dict) else (parsed_nodes if isinstance(parsed_nodes, list) else [])
+        else:
+            node_iter = []
+        for node in node_iter:
+            if not isinstance(node, dict):
+                continue
             plugin_id = str((node or {}).get("plugin_id") or "").strip()
             if plugin_id:
                 enabled.add(plugin_id)
@@ -5127,6 +5214,10 @@ def install(app) -> None:
         )
         run_id = str(run.get("run_id") or "").strip()
         wait_timeout_s = float(svc.wait_timeout_s or 90.0)
+        if str(getattr(svc, 'selected_flow', '') or '').strip() and wait_timeout_s < 420.0:
+            wait_timeout_s = 420.0
+        if bool(getattr(svc, 'stream', False)) and wait_timeout_s < 420.0:
+            wait_timeout_s = 420.0
         if runtime_flow_name == "__autoflow_builtin_general_answer__" and wait_timeout_s < 150.0:
             wait_timeout_s = 150.0
         state = await _wait_for_agent_flow_completion(pid, sid, run_id, headers, wait_timeout_s) if run_id else {}
@@ -5136,27 +5227,40 @@ def install(app) -> None:
             sid,
             previous_msg_id=previous_msg_id,
             previous_ts=previous_ts,
+            ai_job_id=run_id,
         )
-        if not isinstance(latest, dict):
-            final_result_text = str((state or {}).get("final_result") or "").strip()
+        final_result_text = str((state or {}).get("final_result") or "").strip()
+        latest_meta = latest.get("meta") if isinstance(latest, dict) and isinstance(latest.get("meta"), dict) else {}
+        latest_is_stream = bool(latest_meta.get("flow_stream"))
+        latest_run_id = str(latest_meta.get("flow_run_id") or latest_meta.get("flow_result_for_run_id") or latest_meta.get("ai_job_id") or latest_meta.get("job_id") or "").strip()
+        if final_result_text and ((not isinstance(latest, dict)) or latest_is_stream or (latest_run_id and latest_run_id != run_id)):
+            latest = _service_assistant_message(
+                db,
+                pid,
+                sid,
+                final_result_text,
+                client_msg_id=str(svc.client_msg_id or ""),
+                meta={"service_result_proxy": True, "service_flow_only": True, "ai_job_id": run_id, "flow_run_id": run_id},
+            )
+        elif not isinstance(latest, dict):
             state_error = str((state or {}).get("error") or "").strip()
-            if final_result_text:
-                latest = _service_assistant_message(
-                    db,
-                    pid,
-                    sid,
-                    final_result_text,
-                    client_msg_id=str(svc.client_msg_id or ""),
-                    meta={"service_result_proxy": True, "service_flow_only": True},
-                )
-            elif state_error:
+            if state_error:
                 latest = _service_assistant_message(
                     db,
                     pid,
                     sid,
                     f"The assistant backend failed during this turn: {state_error}",
                     client_msg_id=str(svc.client_msg_id or ""),
-                    meta={"service_flow_error": True},
+                    meta={"service_flow_error": True, "ai_job_id": run_id},
+                )
+            elif bool((state or {}).get("running")):
+                latest = _service_assistant_message(
+                    db,
+                    pid,
+                    sid,
+                    f"AgentFlow is still running: {str((state or {}).get('status') or 'Running').strip()}",
+                    client_msg_id=str(svc.client_msg_id or ""),
+                    meta={"service_flow_status": True, "ai_job_id": run_id},
                 )
         return {
             "mode": "agent_flow",
@@ -5849,12 +5953,56 @@ def install(app) -> None:
         if isinstance(router_evt, dict):
             rr = router_evt.get("router_result") if isinstance(router_evt.get("router_result"), dict) else {}
         rr = rr if isinstance(rr, dict) else {}
+        action_history = rr.get("action_history") if isinstance(rr.get("action_history"), list) else []
         assistant_text = _strip_reasoning_artifacts(_repair_common_mojibake(str(rr.get("assistant_response") or rr.get("text") or ""))).strip()
-        if not assistant_text:
-            action_history = rr.get("action_history") if isinstance(rr.get("action_history"), list) else []
-            if action_history:
-                last_action = action_history[-1] if isinstance(action_history[-1], dict) else {}
-                assistant_text = _strip_reasoning_artifacts(_repair_common_mojibake(str(last_action.get("result_text") or ""))).strip()
+        last_action_text = ""
+        if action_history:
+            last_action = action_history[-1] if isinstance(action_history[-1], dict) else {}
+            last_action_text = _strip_reasoning_artifacts(_repair_common_mojibake(str(last_action.get("result_text") or ""))).strip()
+        should_rewrite = bool(
+            last_action_text
+            and (
+                not assistant_text
+                or bool(re.match(r"^(fetch|find|look\s*up|search|retrieve|get|check|determine|extract|list|show|identify)\b", assistant_text, re.IGNORECASE))
+                or _should_rewrite_web_research_answer(prompt, assistant_text)
+                or _looks_like_generic_current_info_answer(prompt, assistant_text)
+            )
+        )
+        if should_rewrite:
+            try:
+                rewritten = await _run_direct_model_with_research_context_timed(
+                    pid,
+                    sid,
+                    prompt,
+                    svc,
+                    request,
+                    research_text=last_action_text,
+                    context_label="retrieved workflow results",
+                    answer_style="web_research_rewrite",
+                    timeout_s=18.0,
+                )
+                rewritten_assistant = rewritten.get("assistant_message") if isinstance(rewritten, dict) else None
+                rewritten_text = str((rewritten_assistant or {}).get("content") or "").strip() if isinstance(rewritten_assistant, dict) else ""
+                if rewritten_text:
+                    return {
+                        "ok": True,
+                        "mode": "chat",
+                        "project_id": pid,
+                        "session_id": sid,
+                        "selected_flow": "",
+                        "assistant_response": rewritten_text,
+                        "assistant_message": rewritten_assistant,
+                        "result": {
+                            "mode": "chat",
+                            "assistant_message": rewritten_assistant,
+                            "llm_autoflow": rr,
+                            "rewritten_from_action_history": True,
+                        },
+                    }
+            except Exception:
+                pass
+        if not assistant_text and last_action_text:
+            assistant_text = last_action_text
         if not assistant_text:
             raise HTTPException(status_code=500, detail="llm_autoflow_empty_result")
         assistant = _service_assistant_message(
@@ -6092,21 +6240,27 @@ def install(app) -> None:
             raise HTTPException(status_code=400, detail="service_chat_message_required")
         prefs = db.get_gui_prefs_effective(pid, u.username)
         router_cfg = _extract_router_config_from_prefs(prefs, pid, sid)
+        alias = str((prefs.get("alias") if isinstance(prefs, dict) else None) or u.username).strip() or u.username
+        user_msg = _service_user_message(
+            db,
+            pid,
+            sid,
+            prompt,
+            author_username=u.username,
+            author_alias=alias,
+            client_msg_id=str(body.client_msg_id or ""),
+            meta={"via": "service_chat"},
+        )
+        _service_publish_live_message(app, pid, sid, user_msg)
         wants_stream = _service_chat_wants_stream(request, body)
-        if wants_stream and body.selected_flow is None:
-            stream_body = ModelTurnRequest(
-                prompt=prompt,
-                content=prompt,
-                alias=body.alias,
-                client_msg_id=body.client_msg_id,
-                temperature=body.temperature,
-                max_tokens=body.max_tokens,
-                top_p=body.top_p,
-            )
-            return await model_turn_stream(stream_body, pid, sid, request)
+        # Do not bypass the normal session router for service_chat streaming requests.
+        # The chat_js UI expects the endpoint to honor the session's active flow/plugins
+        # and to publish progress into the shared chat, not to force a separate direct
+        # model stream path that can diverge from what the session would normally run.
         canned_response = _general_chat_canned_response(prompt) if _looks_like_general_chat(prompt) else ""
         if canned_response:
             assistant = _service_assistant_message(db, pid, sid, canned_response, client_msg_id=str(body.client_msg_id or ""))
+            _service_publish_live_message(app, pid, sid, assistant)
             return {
                 "ok": True,
                 "mode": "chat",
@@ -6119,6 +6273,7 @@ def install(app) -> None:
         if _looks_like_conceptual_workflow_question(prompt):
             conceptual_response = _conceptual_workflow_fallback_answer(prompt)
             assistant = _service_assistant_message(db, pid, sid, conceptual_response, client_msg_id=str(body.client_msg_id or ""), meta={"service_conceptual_direct": True})
+            _service_publish_live_message(app, pid, sid, assistant)
             return {
                 "ok": True,
                 "mode": "chat",
@@ -6139,6 +6294,7 @@ def install(app) -> None:
         if not active_flow and not llm_autoflow_selected and not llm_skill_autoflow_selected:
             no_flow_selected = True
         request_selected_flow = body.selected_flow if hasattr(body, "selected_flow") else None
+        explicit_flow_requested = False
         if request_selected_flow is not None:
             requested_flow = str(request_selected_flow or "").strip()
             if not requested_flow or requested_flow == NO_FLOW_VALUE:
@@ -6161,6 +6317,7 @@ def install(app) -> None:
                 active_flow = requested_flow
                 llm_autoflow_selected = False
                 llm_skill_autoflow_selected = False
+                explicit_flow_requested = True
         autoflow_cfg = settings_map.get("autoflow") if isinstance(settings_map.get("autoflow"), dict) else {}
         llm_autoflow_cfg = settings_map.get("llm_autoflow") if isinstance(settings_map.get("llm_autoflow"), dict) else {}
         llm_skill_autoflow_cfg = settings_map.get("llm_skill_autoflow") if isinstance(settings_map.get("llm_skill_autoflow"), dict) else {}
@@ -6169,13 +6326,14 @@ def install(app) -> None:
         llm_autoflow_enabled = (("llm_autoflow" in set(router_cfg.get("enabled") or [])) or ("llm_autoflow" in header_enabled)) and llm_autoflow_cfg.get("llm_autoflow_enabled", True) is not False
         llm_skill_autoflow_enabled = (("llm_skill_autoflow" in set(router_cfg.get("enabled") or [])) or ("llm_skill_autoflow" in header_enabled)) and llm_skill_autoflow_cfg.get("llm_skill_autoflow_enabled", True) is not False
         text_model_available = _service_text_model_available(app)
-        direct_pick_any = _local_builtin_candidate(prompt)
-        direct_flow_any = str((direct_pick_any.get("name") if isinstance(direct_pick_any, dict) else "") or "").strip()
-        direct_general_chat = bool(no_flow_selected and not direct_flow_any and _looks_like_general_chat(prompt) and not _looks_like_current_context_explanatory_chat(prompt) and not _looks_like_current_context_authoring(prompt))
-        direct_text_generation = bool(no_flow_selected and not direct_flow_any and _looks_like_direct_text_generation(prompt))
-        direct_structured_authoring = bool(no_flow_selected and not direct_flow_any and _looks_like_structured_authoring_request(prompt))
-        direct_current_context_authoring = bool(no_flow_selected and not direct_flow_any and _looks_like_current_context_authoring(prompt))
-        direct_current_context_question = bool(no_flow_selected and not direct_flow_any and _looks_like_current_context_explanatory_chat(prompt))
+        flow_locked = bool(explicit_flow_requested or active_flow)
+        direct_pick_any = None if flow_locked else _local_builtin_candidate(prompt)
+        direct_flow_any = "" if flow_locked else str((direct_pick_any.get("name") if isinstance(direct_pick_any, dict) else "") or "").strip()
+        direct_general_chat = bool((not flow_locked) and no_flow_selected and not direct_flow_any and _looks_like_general_chat(prompt) and not _looks_like_current_context_explanatory_chat(prompt) and not _looks_like_current_context_authoring(prompt))
+        direct_text_generation = bool((not flow_locked) and no_flow_selected and not direct_flow_any and _looks_like_direct_text_generation(prompt))
+        direct_structured_authoring = bool((not flow_locked) and no_flow_selected and not direct_flow_any and _looks_like_structured_authoring_request(prompt))
+        direct_current_context_authoring = bool((not flow_locked) and no_flow_selected and not direct_flow_any and _looks_like_current_context_authoring(prompt))
+        direct_current_context_question = bool((not flow_locked) and no_flow_selected and not direct_flow_any and _looks_like_current_context_explanatory_chat(prompt))
         direct_model_chat = bool(direct_general_chat or (direct_text_generation and not direct_structured_authoring))
         if (direct_model_chat or direct_structured_authoring or direct_current_context_authoring or direct_current_context_question) and not text_model_available:
             try:
@@ -6185,7 +6343,11 @@ def install(app) -> None:
             if ensured:
                 text_model_available = _service_text_model_available(app)
         route_with_llm_skill_autoflow = bool(llm_skill_autoflow_selected and llm_skill_autoflow_enabled)
-        route_with_llm_autoflow = bool((not route_with_llm_skill_autoflow) and llm_autoflow_selected and llm_autoflow_enabled)
+        route_with_llm_autoflow = bool(
+            (not route_with_llm_skill_autoflow)
+            and llm_autoflow_enabled
+            and (llm_autoflow_selected or no_flow_selected)
+        )
         route_with_autoflow = bool((not route_with_llm_skill_autoflow) and (not route_with_llm_autoflow) and no_flow_selected and autoflow_enabled and not direct_flow_any and not direct_model_chat and not (direct_structured_authoring and not direct_current_context_authoring))
         warmup_state = _service_startup_warmup_state(app)
         if warmup_state.get("active") and direct_general_chat and not text_model_available:
@@ -6206,6 +6368,7 @@ def install(app) -> None:
                     "retry_after_seconds": remaining_s,
                 },
             )
+            _service_publish_live_message(app, pid, sid, assistant)
             return {
                 "ok": False,
                 "mode": "chat",
@@ -6289,6 +6452,7 @@ def install(app) -> None:
                                 "identity_verification_failure_direct": True,
                             },
                         )
+                        _service_publish_live_message(app, pid, sid, assistant)
                         return {
                             "ok": True,
                             "mode": "chat",
@@ -6828,6 +6992,7 @@ def install(app) -> None:
                     conceptual_fallback = _conceptual_workflow_fallback_answer(prompt) if _looks_like_conceptual_workflow_question(prompt) else ""
                     unavailable_text = conceptual_fallback or "The text chat model is not loaded right now, so a direct answer is unavailable. Load a text model or wait for the main text LLM to finish loading, then try again. Built-in skill requests such as weather, web research, finance lookups, and file analysis can still run through AutoFlow when they match those capabilities."
                     assistant = _service_assistant_message(db, pid, sid, unavailable_text, client_msg_id=str(body.client_msg_id or ""), meta={"service_text_model_unavailable": True, "service_conceptual_fallback": bool(conceptual_fallback)})
+                    _service_publish_live_message(app, pid, sid, assistant)
                     return {
                         "ok": bool(conceptual_fallback),
                         "mode": "chat",
@@ -6841,6 +7006,7 @@ def install(app) -> None:
                     conceptual_fallback = _conceptual_workflow_fallback_answer(prompt) if _looks_like_conceptual_workflow_question(prompt) else ""
                     direct_error_text = conceptual_fallback or "The direct answer backend did not complete this request. Try again after the text model finishes loading or switch to a workflow only if you want tool-backed execution."
                     assistant = _service_assistant_message(db, pid, sid, direct_error_text, client_msg_id=str(body.client_msg_id or ""), meta={"service_direct_model_failed": True, "service_conceptual_fallback": bool(conceptual_fallback)})
+                    _service_publish_live_message(app, pid, sid, assistant)
                     return {
                         "ok": bool(conceptual_fallback),
                         "mode": "chat",
@@ -6903,6 +7069,7 @@ def install(app) -> None:
                                     pass
                             timeout_text = "The assistant backend did not respond in time. Try again after the text model finishes loading."
                             assistant = _service_assistant_message(db, pid, sid, timeout_text, client_msg_id=str(body.client_msg_id or ""), meta={"service_timeout": True})
+                            _service_publish_live_message(app, pid, sid, assistant)
                             return {
                                 "ok": False,
                                 "mode": "chat",
@@ -6949,6 +7116,7 @@ def install(app) -> None:
                                     pass
                             timeout_text = "The assistant backend did not respond in time. Try again after the text model finishes loading."
                             assistant = _service_assistant_message(db, pid, sid, timeout_text, client_msg_id=str(body.client_msg_id or ""), meta={"service_timeout": True})
+                            _service_publish_live_message(app, pid, sid, assistant)
                             return {
                                 "ok": False,
                                 "mode": "chat",
@@ -6961,6 +7129,7 @@ def install(app) -> None:
                     else:
                         timeout_text = "The assistant backend did not respond in time. Try again after the text model finishes loading."
                         assistant = _service_assistant_message(db, pid, sid, timeout_text, client_msg_id=str(body.client_msg_id or ""), meta={"service_timeout": True})
+                        _service_publish_live_message(app, pid, sid, assistant)
                         return {
                             "ok": False,
                             "mode": "chat",
@@ -6977,7 +7146,15 @@ def install(app) -> None:
         if isinstance(result, dict):
             state = result.get("state") if isinstance(result.get("state"), dict) else {}
             final_result_text = _strip_reasoning_artifacts(str(state.get("final_result") or ""))
-            if final_result_text.strip():
+            assistant_low = assistant_text.strip().lower()
+            assistant_is_status_like = (
+                assistant_low.startswith("autoflow ")
+                or assistant_low.startswith("[agent_flow]")
+                or assistant_low.startswith("running ")
+                or assistant_low.startswith("checking ")
+                or assistant_low.startswith("using: ")
+            )
+            if final_result_text.strip() and (not assistant_text.strip() or assistant_is_status_like):
                 assistant_text = final_result_text
         stream_text = ""
         if isinstance(result, dict):
@@ -6994,6 +7171,7 @@ def install(app) -> None:
                     assistant["content"] = assistant_text
                 else:
                     assistant = _service_assistant_message(db, pid, sid, assistant_text, client_msg_id=str(body.client_msg_id or ""), meta={"service_result_proxy": True})
+                    _service_publish_live_message(app, pid, sid, assistant)
         if isinstance(result, dict):
             result["assistant_message"] = assistant
         response_mode = str((result or {}).get("mode") or "chat")
@@ -7002,6 +7180,7 @@ def install(app) -> None:
             selected_flow = str(
                 (result.get("flow_name") or ((result.get("autoflow") or {}).get("selected_flow")) or "")
             ).strip()
+        _service_publish_live_message(app, pid, sid, assistant)
         return {
             "ok": True,
             "mode": response_mode,
@@ -8197,10 +8376,10 @@ def install(app) -> None:
         alias = actor.get("alias") or (request.headers.get("X-User-Alias") or u.username).strip()
         token = (request.headers.get("X-Events-Token") or request.query_params.get("token") or secrets.token_hex(8)).strip()
         joined = pres.join(pid, sid, u.username, alias)
-        try:
-            print(f"[collab_events] open pid={pid} sid={sid} user={u.username} alias={alias} token={token}", flush=True)
-        except Exception:
-            pass
+        # try:
+        #     print(f"[collab_events] open pid={pid} sid={sid} user={u.username} alias={alias} token={token}", flush=True)
+        # except Exception:
+        #     pass
 
         try:
             app.state.collab_hub.publish(pid, sid, event="presence", data={"action": "join", "username": u.username, "alias": alias, "ts": _now_ts()})
@@ -8212,6 +8391,8 @@ def install(app) -> None:
 
         hub: _SessionHub = app.state.collab_hub
         q = hub.subscribe(pid, sid)
+        if q is None:
+            raise HTTPException(status_code=500, detail="collab event subscription unavailable")
         # print("subscribed to: ", pid, "__", sid)
 
         async def _gen():
@@ -8244,10 +8425,10 @@ def install(app) -> None:
                     hub.unsubscribe(pid, sid, q)
                 except Exception:
                     pass
-                try:
-                    print(f"[collab_events] close pid={pid} sid={sid} user={u.username} alias={alias} token={token}", flush=True)
-                except Exception:
-                    pass
+                # try:
+                #     print(f"[collab_events] close pid={pid} sid={sid} user={u.username} alias={alias} token={token}", flush=True)
+                # except Exception:
+                #     pass
                 try:
                     pres.leave(pid, sid, u.username)
                     app.state.collab_hub.publish(pid, sid, event="presence", data={"action": "leave", "username": u.username, "alias": alias, "ts": _now_ts()})
@@ -8345,11 +8526,24 @@ def install(app) -> None:
                 # avoid duplicating system prompts from clients (we manage it above)
                 continue
 
-            content = (m.get("content") or "")
+            meta = m.get("meta") if isinstance(m.get("meta"), dict) else {}
+            content = str(m.get("content") or "")
+            if not content.strip():
+                # Ignore empty placeholder rows so the model history does not end in
+                # synthetic assistant messages created only for live streaming.
+                continue
+            if role == "assistant" and meta.get("is_draft"):
+                continue
             if role == "user" and multi_author:
                 alias = (m.get("author_alias") or m.get("author_username") or "").strip()
                 if alias:
                     content = f"{alias}: {content}"
+            if out and out[-1].get("role") == role:
+                prior = str(out[-1].get("content") or "").strip()
+                current = str(content or "").strip()
+                if current:
+                    out[-1]["content"] = (prior + "\n\n" + current).strip() if prior else current
+                continue
             out.append({"role": role, "content": content})
 
         return out
@@ -8368,19 +8562,19 @@ def install(app) -> None:
     @r.post("/v1/projects/{pid}/sessions/{sid}/model_turn_stream")
     async def model_turn_stream(body: ModelTurnRequest, pid: str, sid: str, request: Request):
     # async def model_turn_stream1(pid: str, sid: str, body: ModelTurnRequest):
-        # print(235235234234)
+        print(235235234234)
         require_gui_plugin_enabled(request, gui_plugin_id=GUI_PLUGIN_ID)
         actor = _require_user_or_guest(app, request, pid, sid, alias_value=body.alias)
         u = actor["user"]
 
         # if EventSourceResponse is None:
         #     raise HTTPException(status_code=500, detail="SSE not available")
-        # print(34324324324)
+        print(34324324324)
         prompt = (body.prompt or "").strip()
         if not prompt:
             raise HTTPException(status_code=400, detail="Empty prompt")
 
-        # print(23423523523)
+        print(23423523523)
         hub: _SessionHub = app.state.collab_hub
         turn_id = secrets.token_hex(10)
 
@@ -8436,6 +8630,19 @@ def install(app) -> None:
         settings_map = router_cfg.get("settings") if isinstance(router_cfg.get("settings"), dict) else {}
         agent_settings = settings_map.get("agent_flow") if isinstance(settings_map.get("agent_flow"), dict) else {}
         raw_active = str(agent_settings.get("agent_flow_active_flow") or "").strip()
+        requested_route_id = str(getattr(body, "route_id", "") or "").strip()
+        requested_plugins = set()
+        try:
+            if isinstance(getattr(body, "router_enabled_plugins", None), list):
+                requested_plugins |= {str(x or "").strip() for x in (body.router_enabled_plugins or []) if str(x or "").strip()}
+        except Exception:
+            pass
+        try:
+            body_ext = getattr(body, "ext", None)
+            if isinstance(body_ext, dict) and isinstance(body_ext.get("router_enabled_plugins"), list):
+                requested_plugins |= {str(x or "").strip() for x in (body_ext.get("router_enabled_plugins") or []) if str(x or "").strip()}
+        except Exception:
+            pass
         llm_autoflow_selected = raw_active == LLM_AUTOFLOW_FLOW_VALUE
         llm_skill_autoflow_selected = raw_active == LLM_SKILL_AUTOFLOW_FLOW_VALUE
         no_flow_selected = raw_active == NO_FLOW_VALUE or ("agent_flow_active_flow" in agent_settings and raw_active == "")
@@ -8447,7 +8654,9 @@ def install(app) -> None:
         header_enabled = _parse_enabled_header(request.headers.get("X-Gui-Enabled-Plugins")) or set()
         llm_autoflow_enabled = (("llm_autoflow" in set(router_cfg.get("enabled") or [])) or ("llm_autoflow" in header_enabled)) and llm_autoflow_cfg.get("llm_autoflow_enabled", True) is not False
         llm_skill_autoflow_enabled = (("llm_skill_autoflow" in set(router_cfg.get("enabled") or [])) or ("llm_skill_autoflow" in header_enabled)) and llm_skill_autoflow_cfg.get("llm_skill_autoflow_enabled", True) is not False
-        if llm_skill_autoflow_selected and llm_skill_autoflow_enabled:
+        llm_autoflow_requested = requested_route_id == "llm_autoflow" or ("llm_autoflow" in requested_plugins)
+        llm_skill_autoflow_requested = requested_route_id == "llm_skill_autoflow" or ("llm_skill_autoflow" in requested_plugins)
+        if (llm_skill_autoflow_selected or llm_skill_autoflow_requested) and llm_skill_autoflow_enabled:
             svc = ServiceChatRequest(
                 message=prompt,
                 alias=body.alias,
@@ -8709,7 +8918,7 @@ def install(app) -> None:
                     pass
 
             return StreamingResponse(_gen_llm_skill_autoflow(), media_type="text/event-stream")
-        if llm_autoflow_selected and llm_autoflow_enabled:
+        if (llm_autoflow_selected or llm_autoflow_requested or (no_flow_selected and llm_autoflow_enabled and "llm_autoflow" in header_enabled)) and llm_autoflow_enabled:
             svc = ServiceChatRequest(
                 message=prompt,
                 alias=body.alias,
@@ -8994,12 +9203,27 @@ def install(app) -> None:
         settings_fn = getattr(app.state, "settings", None)
         settings = settings_fn() if callable(settings_fn) else {}
         sys_default = str(settings.get("default_system") or settings.get("system") or "You are a helpful assistant.")
-        system_prompt = (body.system or sys_default)
+        system_prompt = (getattr(body, "system", None) or sys_default)
         model_msgs = _build_model_messages(pid=pid, sid=sid, system_prompt=system_prompt, limit=90)
 
-        # Pull the active model from app.state (same instance used by /v1/chat/...)
+        # Pull the active model from app.state (same instance used by /v1/chat/...),
+        # but fall back to the currently loaded main text LLM from Model Deck.
         model_fn = getattr(app.state, "model", None)
-        model_obj = model_fn() if callable(model_fn) else None
+        model_obj = model_fn() if callable(model_fn) else model_fn
+        if model_obj is None:
+            get_loaded = getattr(app.state, "get_main_text_llm_if_loaded", None)
+            if callable(get_loaded):
+                try:
+                    model_obj = get_loaded()
+                except Exception:
+                    model_obj = None
+        if model_obj is None or not hasattr(model_obj, "stream_chat"):
+            ensure_main = getattr(app.state, "ensure_main_text_llm_loaded", None)
+            if callable(ensure_main):
+                try:
+                    model_obj = ensure_main()
+                except Exception:
+                    model_obj = None
         if model_obj is None or not hasattr(model_obj, "stream_chat"):
             raise HTTPException(status_code=503, detail="Model not available")
 

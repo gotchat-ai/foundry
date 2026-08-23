@@ -6,5 +6,6 @@
   "dependencies": [
     "model_deck",
     "collab_chat"
-  ]
+  ],
+  "category": "Models/Inference"
 }

@@ -3376,6 +3376,30 @@ class AutoFlowRoute(BaseRoute):
                     + "\n\nImprove the workflow so it performs the required retrieval or file processing directly and returns the requested output instead of deflecting."
                 ).strip(),
             }
+        status_only_hints = (
+            "workflow result",
+            "agent jobs -",
+            "qa review complete",
+            "verification pending",
+            "build verification pending",
+            "generated a bounded analysis summary",
+            "suggested review steps",
+            "status: ",
+            "plan:",
+            "analysis:",
+            "response:",
+        )
+        short_result = len(str(result_text or "").strip()) <= 500
+        if short_result and any(hint in low_result for hint in status_only_hints):
+            return {
+                "satisfied": False,
+                "score": 0.05,
+                "reason": "The workflow returned progress or review/status text instead of the final requested answer.",
+                "improved_request": (
+                    user_text
+                    + "\n\nImprove the workflow so it returns the final user-facing answer or requested artifact directly, not internal workflow status, review notes, or planning text."
+                ).strip(),
+            }
         if any(tok in low_req for tok in ("top 10", "top ten", "top 5", "top five", "top 3", "top three", "list")):
             numbered = len(re.findall(r"(?:^|\n)\s*(?:\d+\.|- )", str(result_text or "")))
             if numbered >= 3 and len(str(result_text or "").strip()) >= 80:

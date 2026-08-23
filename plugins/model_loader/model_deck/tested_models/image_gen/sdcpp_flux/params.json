@@ -1,0 +1,7 @@
+{
+  "width": 1024,
+  "height": 1024,
+  "steps": 20,
+  "cfg_scale": 1.0,
+  "device": "vulkan"
+}

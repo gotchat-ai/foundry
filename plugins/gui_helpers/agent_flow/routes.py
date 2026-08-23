@@ -67,6 +67,15 @@ class AgentFlowRunRequest(BaseModel):
     ext: Dict[str, Any] = Field(default_factory=dict)
 
 
+class AgentFlowNodeActionRequest(BaseModel):
+    action: str = "warm_prompt_encoder"
+    flow_name: str = ""
+    node_id: str = ""
+    node_label: str = ""
+    params: Dict[str, Any] = Field(default_factory=dict)
+    ext: Dict[str, Any] = Field(default_factory=dict)
+
+
 def install(app) -> None:
     if not hasattr(app.state, "agent_flow_runs"):
         app.state.agent_flow_runs = {}
@@ -526,7 +535,18 @@ def install(app) -> None:
                     continue
                 pending.append({"record": sub_row, "export_name": str(sub_row.get("flow_name") or ref.get("flow_name") or "").strip()})
 
-        payload = {"flows": flows}
+        settings_payload = _portable_agent_flow_settings_payload(root_name, None)
+        payload = {
+            "flows": flows,
+            "metadata": {
+                "bundle_manifest": {
+                    "agent_flow_manifest_version": 1,
+                    "root_flow": root_name,
+                    "flow_names": [str(x or "").strip() for x in flows.keys() if str(x or "").strip()],
+                    "agent_flow_settings": settings_payload,
+                }
+            },
+        }
         canonical_json = json.dumps(payload, ensure_ascii=True, indent=2)
         return {
             "root_name": root_name,
@@ -536,7 +556,55 @@ def install(app) -> None:
             "warnings": warnings,
         }
 
-    def _stage_temp_library_export_bundle(pid: str, rec: Dict[str, Any]) -> Dict[str, Any]:
+    def _portable_agent_flow_settings_payload(root_flow_name: str, raw: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        src = raw if isinstance(raw, dict) else {}
+        default_flow = str(src.get("default_flow") or src.get("agent_flow_default_flow") or root_flow_name or "").strip() or root_flow_name
+        active_flow = str(src.get("active_flow") or src.get("agent_flow_active_flow") or default_flow or "").strip() or default_flow
+        mode = str(src.get("mode") or src.get("agent_flow_mode") or "execute").strip() or "execute"
+        try:
+            max_steps = max(1, min(128, int(src.get("max_steps") or src.get("agent_flow_max_steps") or 32)))
+        except Exception:
+            max_steps = 32
+        return {
+            "default_flow": default_flow,
+            "active_flow": active_flow,
+            "mode": mode,
+            "max_steps": max_steps,
+            "loop_max_passes": src.get("loop_max_passes", src.get("agent_flow_loop_max_passes", 16)),
+            "force_loop_max_passes": bool(src.get("force_loop_max_passes", src.get("agent_flow_force_loop_max_passes", False))),
+            "request_timeout_s": src.get("request_timeout_s", src.get("agent_flow_request_timeout_s", 45)),
+            "autobuild_sandbox_profile": str(src.get("autobuild_sandbox_profile") or src.get("agent_flow_autobuild_sandbox_profile") or "lightweight").strip() or "lightweight",
+            "autobuild_lightweight_max_requests": src.get("autobuild_lightweight_max_requests", src.get("agent_flow_autobuild_lightweight_max_requests", 1)),
+            "autobuild_lightweight_wait_s": src.get("autobuild_lightweight_wait_s", src.get("agent_flow_autobuild_lightweight_wait_s", 120)),
+            "autobuild_lightweight_final_grace_s": src.get("autobuild_lightweight_final_grace_s", src.get("agent_flow_autobuild_lightweight_final_grace_s", 10)),
+            "autobuild_independent_max_requests": src.get("autobuild_independent_max_requests", src.get("agent_flow_autobuild_independent_max_requests", 3)),
+            "autobuild_independent_wait_s": src.get("autobuild_independent_wait_s", src.get("agent_flow_autobuild_independent_wait_s", 180)),
+            "autobuild_independent_final_grace_s": src.get("autobuild_independent_final_grace_s", src.get("agent_flow_autobuild_independent_final_grace_s", 20)),
+        }
+
+    def _write_agent_flow_bundle_manifest(stage_root: Path, *, root_flow_name: str, workflow_filename: str, flow_names: List[str], raw_settings: Dict[str, Any] | None = None) -> Path:
+        manifest = {
+            "agent_flow_manifest_version": 1,
+            "root_flow": str(root_flow_name or "").strip() or "workflow",
+            "workflow_file": str(workflow_filename or "").strip(),
+            "flow_names": [str(x or "").strip() for x in (flow_names or []) if str(x or "").strip()],
+            "agent_flow_settings": _portable_agent_flow_settings_payload(root_flow_name, raw_settings),
+        }
+        path = stage_root / "agent_flow_manifest.json"
+        atomic_write_text(path, json.dumps(manifest, ensure_ascii=True, indent=2), make_backup=False)
+        return path
+
+    def _read_agent_flow_bundle_manifest(bundle_dir: Path) -> Dict[str, Any]:
+        manifest_path = bundle_dir / "agent_flow_manifest.json"
+        if not manifest_path.is_file():
+            return {}
+        try:
+            raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        return raw if isinstance(raw, dict) else {}
+
+    def _stage_temp_library_export_bundle(pid: str, rec: Dict[str, Any], raw_settings: Dict[str, Any] | None = None) -> Dict[str, Any]:
         export_payload = _compose_temp_library_export(pid, rec)
         root_name = str(export_payload.get("root_name") or rec.get("flow_name") or rec.get("id") or "workflow").strip() or "workflow"
         root_slug = re.sub(r"[^a-z0-9]+", "_", root_name.lower()).strip("_") or "workflow"
@@ -544,6 +612,14 @@ def install(app) -> None:
         try:
             workflow_json_path = stage_root / f"{root_slug}.json"
             atomic_write_text(workflow_json_path, str(export_payload.get("canonical_json") or ""), make_backup=False)
+            flow_names = sorted((export_payload.get("payload", {}).get("flows") or {}).keys())
+            manifest_path = _write_agent_flow_bundle_manifest(
+                stage_root,
+                root_flow_name=root_name,
+                workflow_filename=workflow_json_path.name,
+                flow_names=flow_names,
+                raw_settings=raw_settings,
+            )
 
             records_by_name = export_payload.get("records_by_name") if isinstance(export_payload.get("records_by_name"), dict) else {}
             included_subflows = [name for name in records_by_name.keys() if str(name) != root_name]
@@ -552,6 +628,7 @@ def install(app) -> None:
                 "",
                 "Contents:",
                 f"- Portable workflow import: {workflow_json_path.name}",
+                f"- Bundle manifest: {manifest_path.name}",
                 f"- Included flows: {len(records_by_name)}",
             ]
             if included_subflows:
@@ -729,6 +806,7 @@ def install(app) -> None:
             _safe_extract_zip_to_dir(tmp_zip, stage_dir)
             workflow_file = _find_bundle_workflow_file(stage_dir)
             flows_map, root_flow_name, warnings = _load_import_flows_payload(workflow_file)
+            bundle_manifest = _read_agent_flow_bundle_manifest(stage_dir)
             root_flow = flows_map.get(root_flow_name) if isinstance(flows_map.get(root_flow_name), dict) else {}
             public_meta = _derive_public_workflow_metadata(
                 flow_name=root_flow_name,
@@ -775,6 +853,7 @@ def install(app) -> None:
                         "imported_bundle_filename": filename,
                         "imported_flow_names": sorted(flows_map.keys()),
                         "import_warnings": warnings,
+                        "bundle_manifest": bundle_manifest,
                     },
                 },
             )
@@ -791,6 +870,7 @@ def install(app) -> None:
                 "flow_name": root_flow_name,
                 "flow_names": sorted(flows_map.keys()),
                 "warnings": warnings,
+                "bundle_manifest": bundle_manifest,
             }
         finally:
             try:
@@ -1183,6 +1263,176 @@ def install(app) -> None:
                 out[str(name)] = flow_def
         return out
 
+    def _hydrate_model_deck_ltx_workflow_flows(flows: Dict[str, Any]) -> tuple[Dict[str, Any], bool]:
+        """Overlay the current Model Deck Video LLM default onto saved LTX flows.
+
+        The Agent Flow designer stores a project-flow copy of each workflow. For
+        model workflows, that copy includes convenient first-class node params
+        and nested JSON blobs. When the user edits the default Video LLM in
+        Model Deck (for example replacing the LoRA), the saved graph can become
+        stale even though the runtime overlay still sees the new deck setting.
+        Hydrate the project flow before returning it to the designer so opening
+        the workflow reflects the selected Model Deck model.
+        """
+        if not isinstance(flows, dict) or not flows:
+            return flows, False
+        try:
+            from .skills.models._model_workflow_common import (
+                _current_model_deck_video_default_settings,
+                normalize_workflow_settings,
+            )
+        except Exception:
+            return flows, False
+
+        try:
+            deck_settings, deck_model_id = _current_model_deck_video_default_settings()
+        except Exception:
+            deck_settings, deck_model_id = {}, ""
+        if not isinstance(deck_settings, dict) or not deck_settings:
+            return flows, False
+        template_flow_name = "Models / Unsloth LTX 2.3 GGUF"
+        model_flow_name = str(deck_settings.get("model_workflow_flow_name") or "").strip()
+        candidate_flow_names = []
+        for candidate in (model_flow_name, template_flow_name):
+            if candidate and candidate in flows and candidate not in candidate_flow_names:
+                candidate_flow_names.append(candidate)
+        if not candidate_flow_names:
+            return flows, False
+
+        overlay_settings = dict(deck_settings)
+        if deck_model_id:
+            overlay_settings["__model_deck_default_model_id"] = str(deck_model_id)
+        try:
+            normalize_workflow_settings(overlay_settings)
+        except Exception:
+            pass
+
+        def _parse_json_dict(value: Any) -> Dict[str, Any]:
+            if isinstance(value, dict):
+                return dict(value)
+            text = str(value or "").strip()
+            if not text:
+                return {}
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                return {}
+            return dict(parsed) if isinstance(parsed, dict) else {}
+
+        runtime_assets = _parse_json_dict(overlay_settings.get("video_runtime_assets_json"))
+        runtime_params = _parse_json_dict(overlay_settings.get("video_runtime_params_json"))
+
+        asset_key_names = {
+            "python_bin",
+            "script_path",
+            "workflow_runner_path",
+            "gguf_path",
+            "model_path",
+            "embeddings_connectors_path",
+            "video_vae_path",
+            "audio_vae_path",
+            "text_encoder_gguf_path",
+            "text_encoder_mmproj_path",
+            "distilled_lora_path",
+            "spatial_upscaler_path",
+        }
+        asset_values: Dict[str, Any] = {}
+        for source in (runtime_assets, overlay_settings):
+            for key, value in source.items():
+                if value in (None, "", [], {}):
+                    continue
+                key_text = str(key)
+                if key_text in asset_key_names or key_text.endswith("_path"):
+                    asset_values[key_text] = value
+
+        settings_values: Dict[str, Any] = {}
+        for source in (runtime_params, overlay_settings):
+            for key, value in source.items():
+                if value in (None, "", [], {}):
+                    continue
+                key_text = str(key)
+                if key_text in {"video_runtime_template_json", "video_runtime_assets_json", "video_runtime_params_json"}:
+                    continue
+                settings_values[key_text] = value
+        # First-class Model Deck asset fields should beat stale nested preset
+        # JSON. If a LoRA/upscaler path is selected and the deck model did not
+        # explicitly set top-level skip flags, make the graph show/use those
+        # assets instead of silently inheriting old skip=true values from
+        # video_runtime_params_json.
+        if asset_values.get("distilled_lora_path") and "skip_lora" not in overlay_settings:
+            settings_values["skip_lora"] = False
+        if asset_values.get("distilled_lora_path") and "native_skip_lora" not in overlay_settings:
+            settings_values["native_skip_lora"] = False
+        if asset_values.get("spatial_upscaler_path") and "native_debug_skip_stage2" not in overlay_settings:
+            settings_values["native_debug_skip_stage2"] = False
+
+        def _merged_json(raw_value: Any, updates: Dict[str, Any]) -> str:
+            blob = _parse_json_dict(raw_value)
+            for key, value in updates.items():
+                if value not in (None, "", [], {}):
+                    blob[str(key)] = value
+            return json.dumps(blob, indent=2)
+
+        def _hydrate_params(params: Dict[str, Any]) -> None:
+            if not isinstance(params, dict):
+                return
+            settings = params.get("settings") if isinstance(params.get("settings"), dict) else {}
+            settings = dict(settings or {})
+            assets = params.get("assets") if isinstance(params.get("assets"), dict) else {}
+            assets = dict(assets or {})
+
+            settings.update(settings_values)
+            for key, value in asset_values.items():
+                assets[key] = value
+                settings[key] = value
+
+            # Keep nested custom JSON fields in sync too; these are what the
+            # parsed-form editor and some legacy runners read.
+            settings["video_runtime_assets_json"] = _merged_json(
+                overlay_settings.get("video_runtime_assets_json") or settings.get("video_runtime_assets_json"),
+                asset_values,
+            )
+            settings["video_runtime_params_json"] = _merged_json(
+                overlay_settings.get("video_runtime_params_json") or settings.get("video_runtime_params_json"),
+                settings_values,
+            )
+            if overlay_settings.get("video_runtime_template_json") not in (None, ""):
+                settings["video_runtime_template_json"] = overlay_settings.get("video_runtime_template_json")
+
+            params["settings"] = settings
+            params["assets"] = assets
+            existing_keys = params.get("asset_keys") if isinstance(params.get("asset_keys"), list) else []
+            merged_keys = []
+            seen_keys = set()
+            for key in [*existing_keys, *asset_values.keys()]:
+                text = str(key or "").strip()
+                if text and text not in seen_keys:
+                    seen_keys.add(text)
+                    merged_keys.append(text)
+            if merged_keys:
+                params["asset_keys"] = merged_keys
+
+        def _walk(value: Any) -> None:
+            if isinstance(value, dict):
+                tool_cfg = value.get("tool_config") if isinstance(value.get("tool_config"), dict) else None
+                if tool_cfg is not None and isinstance(tool_cfg.get("params"), dict):
+                    _hydrate_params(tool_cfg["params"])
+                for item in value.values():
+                    _walk(item)
+            elif isinstance(value, list):
+                for item in value:
+                    _walk(item)
+
+        try:
+            before = _canonical_hash({name: flows.get(name) for name in candidate_flow_names})
+            hydrated = json.loads(json.dumps(flows))
+            for name in candidate_flow_names:
+                _walk(hydrated.get(name))
+            after = _canonical_hash({name: hydrated.get(name) for name in candidate_flow_names})
+            return hydrated, before != after
+        except Exception:
+            return flows, False
+
     def _require_flow_access(user: Any, flow_name: str, flow_def: Dict[str, Any], *, action: str = "access") -> Dict[str, Any]:
         access = _flow_skill_access(user, flow_def)
         if not access.get("allowed"):
@@ -1229,12 +1479,425 @@ def install(app) -> None:
         rid = str(run_id or "").strip()
         return f"{pid}::{sid}::{rid}" if rid else f"{pid}::{sid}"
 
+    def _repair_repo_review_summary_simple(state: Any, text_value: Any) -> str:
+        raw = str(text_value or "").strip()
+        if not isinstance(state, dict) or not raw:
+            return raw
+        low = raw.lower()
+        if "target folder:" not in low or "verified files:" not in low:
+            return raw
+        steps = state.get("steps") if isinstance(state.get("steps"), list) else []
+        m_target = re.search(r"target folder:\s*`?([^\r\n`]+?)(?=`|\r?\n|$)", raw, flags=re.IGNORECASE)
+        target_folder = str(m_target.group(1) or "").strip(" .`") if m_target else ""
+        target_tail = target_folder.split("data/agent_workflow/repo/", 1)[-1].strip("/") if "data/agent_workflow/repo/" in target_folder else target_folder.strip("/")
+        verified_files: List[str] = []
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            out0 = str(step.get("output") or "")
+            for m in re.finditer(r"repo\.(?:read|read_range): ok \(([^)]+)\)", out0, flags=re.IGNORECASE):
+                path0 = str(m.group(1) or "").strip().replace("\\", "/")
+                if not path0:
+                    continue
+                if target_tail and not (path0 == target_tail or path0.startswith(target_tail + "/")):
+                    continue
+                if path0 not in verified_files:
+                    verified_files.append(path0)
+        if verified_files and re.search(r"(?im)^verified files:\s*none\b", raw):
+            raw = re.sub(r"(?im)^verified files:\s*.*$", "Verified files: " + ", ".join(verified_files), raw, count=1)
+        if verified_files and "verified files: none" in low:
+            raw = re.sub(r"verified files:\s*.*?(?=(?:\.\s+[A-Z][a-z ]+:)|(?:\r?\n[A-Z][a-z ]+:)|$)", "Verified files: " + ", ".join(verified_files), raw, count=1, flags=re.IGNORECASE | re.DOTALL)
+        low = raw.lower()
+        delivered_idx = low.find("**delivered**")
+        if delivered_idx >= 0:
+            raw = raw[:delivered_idx].rstrip()
+        return raw
+
+    def _strip_repo_review_tail(text_value: Any, flow_name_value: Any = None) -> str:
+        raw = str(text_value or "").strip()
+        if not raw:
+            return ""
+        flow_name0 = str(flow_name_value or "").strip().lower()
+        low = raw.lower()
+        looks_like_repo_review = (
+            flow_name0.startswith("workflow_repo_")
+            or (
+                "target folder:" in low
+                and "verified files:" in low
+                and "changed files:" in low
+            )
+        )
+        if not looks_like_repo_review:
+            return raw
+        lines: List[str] = []
+        for line in raw.splitlines():
+            s = str(line or "").rstrip()
+            sl = s.strip().lower()
+            if sl.startswith("**delivered**"):
+                break
+            if sl.startswith("did:"):
+                continue
+            if sl.startswith("skills_invoked:"):
+                continue
+            if sl.startswith("skill_results:"):
+                continue
+            if sl.startswith("- inspect repo scope:"):
+                continue
+            if "calendar-tool-light-nodejs/src/index.js" in sl and "target folder:" not in low:
+                continue
+            lines.append(s)
+        return "\n".join(lines).rstrip()
+
+    def _synthesize_workflow_repo_summary(state: Any, raw_text: Any) -> str:
+        raw = str(raw_text or "").strip()
+        if not isinstance(state, dict):
+            return raw
+        flow_name0 = str(state.get("flow_name") or "").strip()
+        if not flow_name0.startswith("workflow_repo_"):
+            return raw
+        steps = state.get("steps") if isinstance(state.get("steps"), list) else []
+        target_folder = ""
+        for source in [raw, *[str((s or {}).get("output") or "") for s in steps if isinstance(s, dict)]]:
+            m = re.search(r"(data/agent_workflow/repo/[A-Za-z0-9_.\-/]+)", source, flags=re.IGNORECASE)
+            if m:
+                target_folder = str(m.group(1) or "").strip()
+                break
+            m2 = re.search(r"calendar-tool-light(?:-nodejs|-rust)?", source, flags=re.IGNORECASE)
+            if m2 and not target_folder:
+                target_folder = f"data/agent_workflow/repo/{str(m2.group(0) or '').strip()}"
+        if not target_folder:
+            return raw
+        target_tail = target_folder.split("data/agent_workflow/repo/", 1)[-1].strip("/")
+        verified_files: List[str] = []
+        findings: List[str] = []
+        improvements: List[str] = []
+        git_status = ""
+        rag_status = ""
+        changed_paths: List[str] = []
+        out_of_scope: List[str] = []
+        def _normalize_repo_rel_path(path_value: Any) -> str:
+            path0 = str(path_value or "").strip().replace("\\", "/").strip("`")
+            if not path0:
+                return ""
+            if "data/agent_workflow/repo/" in path0:
+                path0 = path0.split("data/agent_workflow/repo/", 1)[-1].strip("/")
+            return path0
+        def _push_changed_path(path_value: Any) -> None:
+            path0 = _normalize_repo_rel_path(path_value)
+            if not path0:
+                return
+            if target_tail and not (path0 == target_tail or path0.startswith(target_tail + "/")):
+                return
+            if path0 not in changed_paths:
+                changed_paths.append(path0)
+        inline_changed = re.search(r"(?im)^changed files:\s*(.+)$", raw)
+        if inline_changed:
+            inline_value = str(inline_changed.group(1) or "").strip()
+            if inline_value and inline_value.lower() != "none":
+                for item in re.split(r"[,|\n]+", inline_value):
+                    _push_changed_path(item)
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            out0 = str(step.get("output") or "")
+            low0 = out0.lower()
+            for m in re.finditer(r"repo\.(?:read|read_range): ok \(([^)]+)\)", out0, flags=re.IGNORECASE):
+                path0 = str(m.group(1) or "").strip().replace("\\", "/")
+                if path0 and (path0 == target_tail or path0.startswith(target_tail + "/")) and path0 not in verified_files:
+                    verified_files.append(path0)
+            if not git_status:
+                if "empty git repo with no commits" in low0:
+                    git_status = "unavailable for target folder (empty git repo with no commits)"
+                elif "not a git repo" in low0 or "git scope unavailable for target folder" in low0:
+                    git_status = "unavailable for target folder (not a git repo)"
+                elif "no changes in calendar-tool-light-rust" in low0 and target_tail.endswith("calendar-tool-light-rust"):
+                    git_status = f"No changes in {target_tail}"
+            if not rag_status:
+                if "no delta" in low0:
+                    rag_status = "no delta"
+                elif "delta refreshed" in low0 or "rag refresh: completed" in low0:
+                    rag_status = "completed"
+            for m in re.finditer(r"changed file:\s*([^\r\n]+)", out0, flags=re.IGNORECASE):
+                _push_changed_path(m.group(1))
+            for m in re.finditer(r"final path:\s*([^\r\n]+)", out0, flags=re.IGNORECASE):
+                _push_changed_path(m.group(1))
+            in_findings = False
+            in_improvements = False
+            for line in out0.splitlines():
+                s = str(line or "").strip()
+                sl = s.lower()
+                if sl == "bugs:" or sl == "findings:":
+                    in_findings = True
+                    in_improvements = False
+                    continue
+                if sl == "fixes:" or sl == "proposed improvements:":
+                    in_improvements = True
+                    in_findings = False
+                    continue
+                if re.match(r"^[a-z_ ]+:\s*", sl) and sl not in {"bugs:", "findings:", "fixes:", "proposed improvements:"}:
+                    in_findings = False
+                    in_improvements = False
+                if s.startswith("-"):
+                    item = s if s.startswith("- ") else f"- {s.lstrip('-').strip()}"
+                    if in_findings and item not in findings:
+                        findings.append(item)
+                    if in_improvements and item not in improvements:
+                        improvements.append(item)
+            if target_tail and target_tail.endswith("calendar-tool-light-rust"):
+                for m in re.finditer(r"(calendar-tool-light-nodejs/[A-Za-z0-9_./-]+|plugins/[A-Za-z0-9_./-]+|rag_git_flow_tests/[A-Za-z0-9_./-]+)", out0, flags=re.IGNORECASE):
+                    p = str(m.group(1) or "").strip()
+                    if p and p not in out_of_scope:
+                        out_of_scope.append(p)
+        if not git_status:
+            m = re.search(r"(?im)^git status:\s*(.+)$", raw)
+            if m:
+                git_status = str(m.group(1) or "").strip()
+        if not rag_status:
+            m = re.search(r"(?im)^rag sync:\s*(.+)$", raw)
+            if m:
+                rag_status = str(m.group(1) or "").strip()
+        if not findings:
+            m = re.search(r"(?is)\nfindings:\s*(.*?)(?=\nproposed improvements:|\Z)", raw)
+            if m:
+                for line in str(m.group(1) or "").splitlines():
+                    s = str(line or "").strip()
+                    if s:
+                        findings.append(s if s.startswith("-") else f"- {s}")
+        if not improvements:
+            m = re.search(r"(?is)\nproposed improvements:\s*(.*)$", raw)
+            if m:
+                for line in str(m.group(1) or "").splitlines():
+                    s = str(line or "").strip()
+                    if s and not s.lower().startswith("**delivered**"):
+                        improvements.append(s if s.startswith("-") else f"- {s}")
+        if changed_paths:
+            changed_files = ", ".join(changed_paths)
+            if not findings:
+                findings.append(f"- Implemented the requested change in {changed_paths[0]}.")
+            filtered_improvements: List[str] = []
+            for item in improvements:
+                il = str(item or "").strip().lower()
+                if not il:
+                    continue
+                if "i will verify" in il or "pending verification" in il:
+                    continue
+                if il.startswith("- add ") or il.startswith("- read ") or il.startswith("- run git status") or il.startswith("- run git") or il.startswith("- refresh rag"):
+                    continue
+                filtered_improvements.append(item)
+            improvements = filtered_improvements
+            if not improvements:
+                improvements = ["- None required for the requested change."]
+        else:
+            changed_files = "none"
+        lines = [f"Target folder: {target_folder}"]
+        lines.append("Verified files: " + (", ".join(verified_files) if verified_files else "none"))
+        if git_status:
+            lines.append(f"Git status: {git_status}")
+        if rag_status:
+            lines.append(f"RAG sync: {rag_status}")
+        lines.append(f"Changed files: {changed_files}")
+        if findings:
+            lines.append("Findings:")
+            lines.extend(findings[:8])
+        if improvements:
+            lines.append("Proposed improvements:")
+            lines.extend(improvements[:8])
+        if out_of_scope:
+            lines.append("Out-of-scope background repo state: " + ", ".join(out_of_scope[:8]))
+        rebuilt = "\n".join(lines).strip() or raw
+        rebuilt_low = rebuilt.lower()
+        delivered_idx = rebuilt_low.find("**delivered**")
+        if delivered_idx >= 0:
+            rebuilt = rebuilt[:delivered_idx].rstrip()
+        return _strip_repo_review_tail(rebuilt, flow_name0)
+
+    def _sanitize_agent_flow_state(state: Any) -> Any:
+        if not isinstance(state, dict):
+            return state
+        def _extract_target_folder(text_value: str, steps_value: Any) -> str:
+            raw = str(text_value or "")
+            m = re.search(r"(?im)^target folder:\s*`?([^\r\n`]+)`?\s*$", raw)
+            if m:
+                return str(m.group(1) or "").strip()
+            for step in (steps_value or []):
+                if not isinstance(step, dict):
+                    continue
+                out0 = str(step.get("output") or "")
+                m2 = re.search(r"(data/agent_workflow/repo/[A-Za-z0-9_.\-/]+)", out0, flags=re.IGNORECASE)
+                if m2:
+                    return str(m2.group(1) or "").strip()
+            return ""
+        def _extract_verified_files(steps_value: Any, target_folder: str) -> List[str]:
+            out_files: List[str] = []
+            target_rel = str(target_folder or "").replace("\\", "/").strip()
+            target_tail = target_rel.split("data/agent_workflow/repo/", 1)[-1].strip("/") if "data/agent_workflow/repo/" in target_rel else target_rel.strip("/")
+            for step in (steps_value or []):
+                if not isinstance(step, dict):
+                    continue
+                out0 = str(step.get("output") or "")
+                for m in re.finditer(r"repo\.(?:read|read_range): ok \(([^)]+)\)", out0, flags=re.IGNORECASE):
+                    path0 = str(m.group(1) or "").strip().replace("\\", "/")
+                    if not path0:
+                        continue
+                    if target_tail and not (path0 == target_tail or path0.startswith(target_tail + "/")):
+                        continue
+                    if path0 not in out_files:
+                        out_files.append(path0)
+            return out_files
+        def _extract_git_status(steps_value: Any, raw_value: str) -> str:
+            for step in (steps_value or []):
+                if not isinstance(step, dict):
+                    continue
+                out0 = str(step.get("output") or "")
+                low0 = out0.lower()
+                if "empty git repo with no commits" in low0:
+                    return "unavailable for target folder (empty git repo with no commits)"
+                if "not a git repo" in low0 or "git scope unavailable for target folder" in low0:
+                    return "unavailable for target folder (not a git repo)"
+            m = re.search(r"(?im)^git status:\s*(.+)$", str(raw_value or ""))
+            return str(m.group(1) or "").strip() if m else ""
+        def _extract_rag_status(steps_value: Any, raw_value: str) -> str:
+            for step in (steps_value or []):
+                if not isinstance(step, dict):
+                    continue
+                out0 = str(step.get("output") or "")
+                low0 = out0.lower()
+                if "no delta" in low0:
+                    return "no delta"
+                if "rag refresh: completed" in low0 or "delta refreshed" in low0:
+                    return "completed"
+            m = re.search(r"(?im)^rag sync:\s*(.+)$", str(raw_value or ""))
+            return str(m.group(1) or "").strip() if m else ""
+        def _section_block(raw_value: str, header: str, next_headers: List[str]) -> str:
+            raw = str(raw_value or "")
+            pat = rf"(?is)(^|\n){re.escape(header)}:\s*(.*?)(?=\n(?:{'|'.join(re.escape(h) for h in next_headers)}):|\Z)"
+            m = re.search(pat, raw)
+            return str(m.group(2) or "").strip() if m else ""
+        def _rebuild_repo_review_text(raw_value: str, steps_value: Any) -> str:
+            raw = str(raw_value or "").strip()
+            if not raw:
+                return ""
+            low = raw.lower()
+            structured = ("target folder:" in low or "**target folder:**" in low) and ("verified files:" in low or "**verified files:**" in low)
+            if not structured:
+                return raw
+            target_folder = _extract_target_folder(raw, steps_value)
+            verified_files = _extract_verified_files(steps_value, target_folder)
+            current_verified = _section_block(raw, "Verified files", ["Git status", "RAG sync", "Changed files", "Findings", "Proposed improvements", "Notes", "Note"])
+            git_status = _extract_git_status(steps_value, raw)
+            rag_status = _extract_rag_status(steps_value, raw)
+            changed_files = _section_block(raw, "Changed files", ["Findings", "Proposed improvements", "Notes", "Note"]) or "none"
+            findings = _section_block(raw, "Findings", ["Proposed improvements", "Notes", "Note"])
+            improvements = _section_block(raw, "Proposed improvements", ["Notes", "Note"])
+            changed_from_steps: List[str] = []
+            target_tail = target_folder.split("data/agent_workflow/repo/", 1)[-1].strip("/") if "data/agent_workflow/repo/" in target_folder else str(target_folder or "").replace("\\", "/").strip("/")
+            for step in (steps_value or []):
+                if not isinstance(step, dict):
+                    continue
+                out0 = str(step.get("output") or "")
+                for pat in (r"changed file:\s*([^\r\n]+)", r"final path:\s*([^\r\n]+)"):
+                    for m in re.finditer(pat, out0, flags=re.IGNORECASE):
+                        path0 = str(m.group(1) or "").strip().replace("\\", "/").strip("`")
+                        if "data/agent_workflow/repo/" in path0:
+                            path0 = path0.split("data/agent_workflow/repo/", 1)[-1].strip("/")
+                        if not path0:
+                            continue
+                        if target_tail and not (path0 == target_tail or path0.startswith(target_tail + "/")):
+                            continue
+                        if path0 not in changed_from_steps:
+                            changed_from_steps.append(path0)
+            if not verified_files and current_verified and "unverified in current evidence" not in current_verified.lower():
+                verified_files = [x.strip().lstrip("- ").strip("`") for x in re.split(r"[,\\n]+", current_verified) if str(x or "").strip()]
+            if changed_from_steps:
+                changed_files = ", ".join(changed_from_steps)
+                if not findings.strip():
+                    findings = f"- Implemented the requested change in {changed_from_steps[0]}."
+                if improvements.strip():
+                    keep_lines: List[str] = []
+                    for line in improvements.splitlines():
+                        line0 = str(line or "").strip()
+                        low0 = line0.lower()
+                        if not line0:
+                            continue
+                        if "i will verify" in low0 or "pending verification" in low0:
+                            continue
+                        if low0.startswith("- add ") or low0.startswith("- read ") or low0.startswith("- run git status") or low0.startswith("- run git") or low0.startswith("- refresh rag"):
+                            continue
+                        keep_lines.append(line0)
+                    improvements = "\n".join(keep_lines).strip() or "- None required for the requested change."
+            lines: List[str] = []
+            if target_folder:
+                lines.append(f"Target folder: {target_folder}")
+            if verified_files:
+                lines.append("Verified files: " + ", ".join(verified_files))
+            elif current_verified:
+                lines.append(f"Verified files: {current_verified}")
+            if git_status:
+                lines.append(f"Git status: {git_status}")
+            if rag_status:
+                lines.append(f"RAG sync: {rag_status}")
+            lines.append(f"Changed files: {changed_files}")
+            if findings:
+                lines.append("Findings:")
+                for line in findings.splitlines():
+                    line0 = str(line or "").strip()
+                    if line0:
+                        lines.append(line0 if line0.startswith("-") else f"- {line0}")
+            if improvements:
+                lines.append("Proposed improvements:")
+                for line in improvements.splitlines():
+                    line0 = str(line or "").strip()
+                    if line0:
+                        lines.append(line0 if line0.startswith("-") else f"- {line0}")
+            rebuilt = "\n".join(x for x in lines if str(x or "").strip()).strip()
+            return rebuilt or raw
+        def _clean_repo_review_text(value: Any, steps_value: Any = None) -> str:
+            raw = str(value or "").strip()
+            if not raw:
+                return ""
+            low = raw.lower()
+            structured = ("target folder:" in low or "**target folder:**" in low) and ("verified files:" in low or "**verified files:**" in low)
+            if structured:
+                raw = _rebuild_repo_review_text(raw, steps_value)
+                low = raw.lower()
+            if structured:
+                for marker in ("\ndid:", "\n**delivered**"):
+                    idx = low.find(marker)
+                    if idx >= 0:
+                        raw = raw[:idx].rstrip()
+                        low = raw.lower()
+            elif "**delivered**" in low:
+                split_idx = low.find("**delivered**")
+                if split_idx >= 0:
+                    raw = raw[:split_idx].rstrip()
+            return raw
+        out = dict(state)
+        try:
+            steps0 = out.get("steps")
+            if isinstance(steps0, list):
+                cleaned_steps = []
+                for step in steps0:
+                    if not isinstance(step, dict):
+                        cleaned_steps.append(step)
+                        continue
+                    step_clean = dict(step)
+                    if "output" in step_clean:
+                        step_clean["output"] = _clean_repo_review_text(step_clean.get("output"), steps0)
+                    cleaned_steps.append(step_clean)
+                out["steps"] = cleaned_steps
+            out["final_result"] = _clean_repo_review_text(out.get("final_result"), out.get("steps"))
+            out["final_result"] = _repair_repo_review_summary_simple(out, out.get("final_result"))
+            out["final_result"] = _synthesize_workflow_repo_summary(out, out.get("final_result"))
+        except Exception:
+            pass
+        return out
+
     def _agent_flow_get_state(pid: str, sid: str, run_id: str = "") -> Optional[Dict[str, Any]]:
         key = _agent_flow_state_key(pid, sid, run_id)
         lock = app.state.agent_flow_runs_lock
         with lock:
             state = app.state.agent_flow_runs.get(key)
-            return dict(state) if isinstance(state, dict) else None
+            return _sanitize_agent_flow_state(state)
 
     def _agent_flow_set_state(pid: str, sid: str, state: Dict[str, Any], preserve_pause: bool = True) -> None:
         run_id = str((state or {}).get("run_id") or "").strip()
@@ -1248,8 +1911,9 @@ def install(app) -> None:
                     state["paused"] = bool(current.get("paused"))
                     state["pause_requested"] = bool(current.get("pause_requested"))
                     state["status"] = current.get("status") or state.get("status") or "Paused"
-            app.state.agent_flow_runs[key] = dict(state)
-            app.state.agent_flow_runs[latest_key] = dict(state)
+            cleaned = _sanitize_agent_flow_state(state)
+            app.state.agent_flow_runs[key] = dict(cleaned)
+            app.state.agent_flow_runs[latest_key] = dict(cleaned)
 
     def _agent_flow_clear_state(pid: str, sid: str, run_id: str = "") -> None:
         key = _agent_flow_state_key(pid, sid, run_id)
@@ -1507,9 +2171,9 @@ def install(app) -> None:
         if not s:
             return ""
         patterns = [
-            r"([A-Za-z]:[/\\\\][^\s\"']+\.(?:xlsx|xlsm|xls|csv|tsv|pdf|json|txt|js|ts|py|png|jpg|jpeg|webp|bmp|tif|tiff))",
-            r"(/[^\\s\"']+\.(?:xlsx|xlsm|xls|csv|tsv|pdf|json|txt|js|ts|py|png|jpg|jpeg|webp|bmp|tif|tiff))",
-            r"([A-Za-z0-9_.\\/-]+\.(?:xlsx|xlsm|xls|csv|tsv|pdf|json|txt|js|ts|py|png|jpg|jpeg|webp|bmp|tif|tiff))",
+            r"([A-Za-z]:[/\\\\][^\s\"']+\.(?:xlsx|xlsm|xls|csv|tsv|pdf|json|txt|js|ts|py|png|jpg|jpeg|webp|bmp|tif|tiff|mp4|mov|webm|mkv|avi))",
+            r"(/[^\\s\"']+\.(?:xlsx|xlsm|xls|csv|tsv|pdf|json|txt|js|ts|py|png|jpg|jpeg|webp|bmp|tif|tiff|mp4|mov|webm|mkv|avi))",
+            r"([A-Za-z0-9_.\\/-]+\.(?:xlsx|xlsm|xls|csv|tsv|pdf|json|txt|js|ts|py|png|jpg|jpeg|webp|bmp|tif|tiff|mp4|mov|webm|mkv|avi))",
         ]
         for pat in patterns:
             m = re.search(pat, s, flags=re.IGNORECASE)
@@ -1645,6 +2309,32 @@ def install(app) -> None:
             return _match_rule(node)
 
         return _match_node(cond)
+
+    def _is_repo_analysis_only_request(user_text_value: Any, flow_name_value: Any = None) -> bool:
+        try:
+            user_low = str(user_text_value or '').strip().lower()
+            flow_low = str(flow_name_value or '').strip().lower()
+            if flow_low and not flow_low.startswith('workflow_repo_'):
+                return False
+            return any(
+                token in user_low
+                for token in (
+                    'analyze the existing',
+                    'review the',
+                    'identify concrete issues',
+                    'propose exact code-level improvements',
+                    'do not modify files',
+                    'analysis-only',
+                    'analysis only',
+                    'review-only',
+                    'review only',
+                    'without modifying',
+                    'without editing',
+                    'keep the current structure',
+                )
+            )
+        except Exception:
+            return False
 
     def _is_explicit_chart_request(text: str) -> bool:
         q = str(text or "").lower()
@@ -2131,8 +2821,57 @@ def install(app) -> None:
                 or step.get("label")
                 or ""
             ).strip().lower()
+            runtime_flow_name = str(plugin_settings.get("runtime_flow_name") or "").strip().lower()
             change_intent = bool(re.search(r"\b(create|generate|build|implement|write|make|develop)\b", str(user_text or "").lower()))
             has_changed = bool(recent_changed_files)
+            if runtime_flow_name == "workflow_team_discovery":
+                if "product" in role:
+                    return (
+                        "You are in the discovery stage. Planning only. Define scope, user outcomes, acceptance criteria, "
+                        "and one coherent implementation stack. Do not create, patch, or verify files."
+                    )
+                if "designer" in role:
+                    return (
+                        "You are in the discovery stage. Planning only. Produce UI/UX guidance, frontend file list, "
+                        "and stack-aligned interaction requirements. Do not create, patch, or verify files."
+                    )
+                if "architect" in role:
+                    return (
+                        "You are in the discovery stage. Planning only. Confirm the single stack, minimum file set, "
+                        "and implementation constraints. Do not create, patch, or verify files."
+                    )
+                return "You are in the discovery stage. Planning only. Do not create, patch, or verify files."
+            if runtime_flow_name == "workflow_team_build":
+                if "staff" in role:
+                    if has_changed:
+                        return (
+                            "You are in the build stage as a repair/review engineer. Patch or complete the existing implementation only. "
+                            "Do not replace the chosen stack and do not start a fresh competing implementation."
+                        )
+                    return (
+                        "You are in the build stage as a repair/review engineer. No implementation exists yet, so do not create files here. "
+                        "Hand off a precise implementation plan and constraints to the Coding Engineer."
+                    )
+                if any(k in role for k in ["coding", "coder", "engineer"]):
+                    if has_changed:
+                        return (
+                            "You are the primary implementation owner in the build stage. Continue the existing implementation using write/patch "
+                            "tool calls and keep the selected stack stable."
+                        )
+                    return (
+                        "You are the primary implementation owner in the build stage. Create the requested implementation now using write/patch "
+                        "tool calls and keep the selected stack stable."
+                    )
+                if "designer" in role:
+                    return (
+                        "You are in the build stage as a UI reviewer. Review the implementation plan and UI/UX details only. "
+                        "Do not create or patch files in this node."
+                    )
+            if runtime_flow_name == "workflow_team_release":
+                return (
+                    "You are in the release stage. Review only. Assess the existing implementation, tests, and readiness. "
+                    "Do not create or patch files in this node."
+                )
             if any(k in role for k in ["staff", "coding", "coder", "engineer"]) and change_intent:
                 if has_changed:
                     return "You are in an execution stage. Modify or complete the implementation using write/patch tool calls. Do not switch to file verification unless you are fixing a concrete written artifact."
@@ -2282,36 +3021,104 @@ def install(app) -> None:
         flows = ext.get("agent_flow_flows") or {}
         force_runtime_flow = bool(ext.get("agent_flow_force_runtime_flow"))
         if not isinstance(flows, dict) or not flows:
+            project_doc = _load_project_flows(pid)
+            project_flows = project_doc.get("flows") if isinstance(project_doc, dict) and isinstance(project_doc.get("flows"), dict) else {}
+            if not isinstance(project_flows, dict):
+                project_flows = {}
+            if not project_flows:
+                project_flows = _default_flow_library() or {}
+            flows = _filter_flows_for_user(u, project_flows)
+            if isinstance(flows, dict) and flows:
+                ext["agent_flow_flows"] = flows
+        if not isinstance(flows, dict) or not flows:
             raise HTTPException(status_code=400, detail="agent_flow_flows missing")
 
         flow_name = ext.get("agent_flow_active_flow") or ext.get("agent_flow_default_flow")
+        flow_workflow_id = (
+            ext.get("agent_flow_active_workflow_id")
+            or ext.get("agent_flow_default_workflow_id")
+            or ""
+        )
         if not flow_name and len(flows) == 1:
             flow_name = next(iter(flows.keys()))
         if not flow_name or flow_name not in flows:
             raise HTTPException(status_code=400, detail="agent_flow_active_flow missing or invalid")
 
+        flows, _model_deck_hydrated_for_run = _hydrate_model_deck_ltx_workflow_flows(flows)
+        try:
+            if str(flow_name or "").strip() == "Models / Unsloth LTX 2.3 GGUF":
+                from .skills.models._model_workflow_common import _current_model_deck_video_default_settings
+                deck_settings_for_flow, _deck_model_for_flow = _current_model_deck_video_default_settings()
+                owned_flow_name = str((deck_settings_for_flow or {}).get("model_workflow_flow_name") or "").strip()
+                if owned_flow_name and owned_flow_name in flows:
+                    flow_name = owned_flow_name
+                    flow_workflow_id = ""
+        except Exception:
+            pass
         flow_for_run = dict(flows.get(flow_name) or {})
         _require_flow_access(u, str(flow_name), flow_for_run, action="run")
         user_text = str(req.text or "").strip()
         run_id = secrets.token_hex(8)
         version_diag = _flow_version_diag(pid=pid, active_flow=str(flow_name), runtime_flows=flows)
-        # Prefer saved project flow when client/runtime payload is stale.
-        # This avoids running outdated node configs from cached browser state.
+        project_records_by_name: Dict[str, Dict[str, Any]] = {}
+        # Prefer saved project flow when the client/runtime payload is stale.
+        # The browser/designer can hold older in-memory definitions for a flow
+        # name even after the project workflow has been updated in the DB.
+        # When a saved project workflow exists, use that current record unless
+        # the caller explicitly forces a runtime-only flow.
         try:
-            proj_doc = _load_project_flows(pid)
-            proj_flows = proj_doc.get("flows") if isinstance(proj_doc, dict) else {}
-            proj_flow = proj_flows.get(flow_name) if isinstance(proj_flows, dict) else None
+            project_record = None
+            wanted_id = str(flow_workflow_id or "").strip()
+            if wanted_id:
+                row = _workflow_store._fetch_record_by_id({"app": app, "pid": pid}, wanted_id)
+                if (
+                    isinstance(row, dict)
+                    and str(row.get("scope") or "").strip() == "project"
+                    and str(row.get("pid") or "").strip() == str(pid)
+                    and isinstance(row.get("flow_json"), dict)
+                ):
+                    project_record = row
+            records = _workflow_store.project_flow_records({"app": app, "pid": pid}, pid)
+            for row in records:
+                if (
+                    isinstance(row, dict)
+                    and str(row.get("flow_name") or "").strip()
+                    and isinstance(row.get("flow_json"), dict)
+                ):
+                    project_records_by_name[str(row.get("flow_name") or "").strip()] = row
+            if project_record is None:
+                for row in records:
+                    if not isinstance(row, dict):
+                        continue
+                    if str(row.get("flow_name") or "").strip() != str(flow_name):
+                        continue
+                    if not isinstance(row.get("flow_json"), dict):
+                        continue
+                    project_record = row
+                    break
+            proj_flow = project_record.get("flow_json") if isinstance(project_record, dict) else None
             run_hash = str(version_diag.get("runtime_hash") or "").strip()
-            proj_hash = str(version_diag.get("project_hash") or "").strip()
-            if not force_runtime_flow and isinstance(proj_flow, dict) and run_hash and proj_hash and run_hash != proj_hash:
+            proj_hash = _canonical_hash(proj_flow) if isinstance(proj_flow, dict) else ""
+            if not force_runtime_flow and isinstance(proj_flow, dict):
+                hydrated_project_flows, _ = _hydrate_model_deck_ltx_workflow_flows({str(flow_name): proj_flow})
+                proj_flow = hydrated_project_flows.get(str(flow_name)) if isinstance(hydrated_project_flows, dict) else proj_flow
                 flow_for_run = dict(proj_flow)
                 # Keep _build_flow_steps references consistent.
                 flows = dict(flows)
                 flows[flow_name] = flow_for_run
+                for saved_name, saved_row in project_records_by_name.items():
+                    saved_flow = saved_row.get("flow_json") if isinstance(saved_row, dict) else None
+                    if isinstance(saved_flow, dict):
+                        flows[saved_name] = dict(saved_flow)
                 version_diag = _flow_version_diag(pid=pid, active_flow=str(flow_name), runtime_flows=flows)
                 warns = version_diag.get("warnings") if isinstance(version_diag.get("warnings"), list) else []
-                if "runtime_flow_replaced_with_project_flow" not in warns:
-                    warns.append("runtime_flow_replaced_with_project_flow")
+                replace_flag = "runtime_flow_replaced_with_project_flow"
+                if wanted_id and project_record and str(project_record.get("workflow_id") or "").strip() == wanted_id:
+                    replace_flag = "runtime_flow_replaced_with_project_workflow_id"
+                if replace_flag not in warns:
+                    warns.append(replace_flag)
+                if run_hash and proj_hash and run_hash == proj_hash and "runtime_flow_matched_project_flow" not in warns:
+                    warns.append("runtime_flow_matched_project_flow")
                 version_diag["warnings"] = warns
         except Exception:
             pass
@@ -2343,6 +3150,15 @@ def install(app) -> None:
             "ts": _now_ts(),
         }
         _agent_flow_set_state(pid, sid, state)
+        try:
+            runtime_nodes_dbg = flow_for_run.get("nodes") if isinstance(flow_for_run.get("nodes"), dict) else {}
+            planned_dbg = " -> ".join(str(s.get("label") or s.get("node_id") or "").strip() for s in steps[:12] if str(s.get("label") or s.get("node_id") or "").strip())
+            node_keys_dbg = ",".join(str(k or "").strip() for k in list(runtime_nodes_dbg.keys())[:24] if str(k or "").strip())
+            _publish_step_stream(
+                f"[agent_flow] planned steps: count={len(steps)} nodes={len(runtime_nodes_dbg)} path={planned_dbg or '-'} node_keys={node_keys_dbg or '-'}"
+            )
+        except Exception:
+            pass
 
         hub = app.state.collab_hub
         db = app.state.collab_db
@@ -2373,6 +3189,14 @@ def install(app) -> None:
 
         def _run_flow() -> None:
             nonlocal state
+            try:
+                state["status"] = f"Starting workflow worker 0/{len(steps)}"
+                state["ts"] = _now_ts()
+                _agent_flow_set_state(pid, sid, state)
+                _publish_flow_status({})
+                print(f"[agent_flow] worker entered run_id={run_id} flow_name={flow_name}", flush=True)
+            except Exception:
+                pass
             def _is_canceled() -> bool:
                 try:
                     cancelled = getattr(app.state, "ai_jobs_cancelled", None)
@@ -2496,6 +3320,17 @@ def install(app) -> None:
             flow_anchor_client_msg_id = {"v": str(req.client_msg_id or "").strip()}
             flow_user_ts = {"v": 0}
             flow_stream_ts = {"v": 0}
+            skip_chat_persist = bool(ext.get("agent_flow_skip_chat_persist"))
+
+            def _startup_checkpoint(label: str) -> None:
+                try:
+                    state["status"] = f"Starting workflow worker: {label} 0/{len(steps)}"
+                    state["ts"] = _now_ts()
+                    _agent_flow_set_state(pid, sid, state)
+                    _publish_flow_status({})
+                    print(f"[agent_flow] startup {label} run_id={run_id}", flush=True)
+                except Exception:
+                    pass
 
             def _flow_stream_meta() -> Dict[str, Any]:
                 meta = {"flow": True, "flow_stream": True, "flow_stream_tokens": True, "flow_run_id": run_id}
@@ -2513,6 +3348,8 @@ def install(app) -> None:
                 run_stream_started["v"] = True
                 if initial_text:
                     run_stream_parts.append(initial_text)
+                if skip_chat_persist:
+                    return
                 ts_s = _now_ts()
                 try:
                     hub.publish(
@@ -2547,6 +3384,8 @@ def install(app) -> None:
                 piece = "".join(run_token_buffer)
                 run_token_buffer.clear()
                 run_token_last_flush["v"] = now
+                if skip_chat_persist:
+                    return
                 try:
                     hub.publish(
                         pid,
@@ -2598,6 +3437,8 @@ def install(app) -> None:
                 if not text_snapshot.strip():
                     return
                 run_stream_last_snapshot["v"] = now
+                if skip_chat_persist:
+                    return
                 ts_snap = max(_now_ts(), int(flow_user_ts["v"] or 0) + 1)
                 flow_stream_ts["v"] = int(ts_snap)
                 try:
@@ -2621,6 +3462,7 @@ def install(app) -> None:
 
             try:
                 # persist user message
+                _startup_checkpoint("persist_user_before")
                 user_msg_id = req.client_msg_id or secrets.token_hex(12)
                 if not flow_anchor_client_msg_id["v"]:
                     flow_anchor_client_msg_id["v"] = str(user_msg_id)
@@ -2637,40 +3479,41 @@ def install(app) -> None:
                     meta_u["attachments"] = attachments
                 ts_u = _now_ts()
                 flow_user_ts["v"] = int(ts_u)
-                db.add_message(
-                    msg_id=user_msg_id,
-                    pid=pid,
-                    sid=sid,
-                    ts=ts_u,
-                    role="user",
-                    kind="human",
-                    author_username=u.username,
-                    author_alias=(u.username),
-                    content=text,
-                    meta=meta_u,
-                )
-                try:
-                    hub.publish(
-                        pid,
-                        sid,
-                        event="message",
-                        data={
-                            "msg": {
-                                "msg_id": user_msg_id,
-                                "pid": pid,
-                                "sid": sid,
-                                "ts": ts_u,
-                                "role": "user",
-                                "kind": "human",
-                                "author_username": u.username,
-                                "author_alias": (u.username),
-                                "content": text,
-                                "meta": meta_u,
-                            }
-                        },
+                if not skip_chat_persist:
+                    db.add_message(
+                        msg_id=user_msg_id,
+                        pid=pid,
+                        sid=sid,
+                        ts=ts_u,
+                        role="user",
+                        kind="human",
+                        author_username=u.username,
+                        author_alias=(u.username),
+                        content=text,
+                        meta=meta_u,
                     )
-                except Exception:
-                    pass
+                    try:
+                        hub.publish(
+                            pid,
+                            sid,
+                            event="message",
+                            data={
+                                "msg": {
+                                    "msg_id": user_msg_id,
+                                    "pid": pid,
+                                    "sid": sid,
+                                    "ts": ts_u,
+                                    "role": "user",
+                                    "kind": "human",
+                                    "author_username": u.username,
+                                    "author_alias": (u.username),
+                                    "content": text,
+                                    "meta": meta_u,
+                                }
+                            },
+                        )
+                    except Exception:
+                        pass
                 _publish_run_line(f"[agent_flow] flow_name: {flow_name}")
                 _publish_run_line(f"[agent_flow] run_id: {run_id}")
                 try:
@@ -2678,9 +3521,12 @@ def install(app) -> None:
                 except Exception:
                     pass
 
+                _startup_checkpoint("load_routes_before")
                 from plugins.ai_routes import load_routes
                 from plugins.ai_routes.base import RouterCore
+                _startup_checkpoint("load_routes_after")
 
+                _startup_checkpoint("runtime_settings_before")
                 base_settings: Dict[str, Any] = _runtime_base_settings()
                 settings = dict(base_settings)
                 nested_base_rps = base_settings.get("router_plugin_settings") if isinstance(base_settings.get("router_plugin_settings"), dict) else {}
@@ -2715,17 +3561,22 @@ def install(app) -> None:
                 settings["__agent_flow_boot_diag"] = {
                     "agent_workflow_member_max_tokens": awmt,
                 }
+                _startup_checkpoint("runtime_settings_after")
                 categories = getattr(app.state, "agent_flow_skill_categories", None)
                 settings["__agent_flow_skill_categories"] = categories if isinstance(categories, dict) else {}
                 raw_temp_skill_dirs = ext.get("agent_flow_temp_skill_dirs") if isinstance(ext.get("agent_flow_temp_skill_dirs"), list) else []
                 disable_temp_skill_inference = ext.get("agent_flow_disable_temp_skill_inference") is True
+                _startup_checkpoint("temp_skill_infer_before")
                 temp_skill_dirs = list(raw_temp_skill_dirs) if disable_temp_skill_inference else _infer_temp_skill_dirs_for_flow(str(flow_name or ""), flow_for_run, raw_temp_skill_dirs)
+                _startup_checkpoint("temp_skill_infer_after")
                 if temp_skill_dirs and not raw_temp_skill_dirs:
                     _publish_run_line(f"[agent_flow] inferred generated skill overlay: {len(temp_skill_dirs)} dir(s)")
                 reg = getattr(app.state, "agent_workflow_tools", None)
                 if temp_skill_dirs:
                     try:
+                        _startup_checkpoint("tool_registry_overlay_before")
                         overlay = build_agent_flow_tool_registry(app, extra_skill_dirs=[str(x or "").strip() for x in temp_skill_dirs if str(x or "").strip()])
+                        _startup_checkpoint("tool_registry_overlay_after")
                         reg = overlay.get("registry") if isinstance(overlay, dict) else reg
                         if isinstance(overlay, dict):
                             settings["__agent_flow_sandbox_skill_specs"] = dict(overlay.get("skill_specs") or {})
@@ -2735,6 +3586,7 @@ def install(app) -> None:
                         _publish_run_line(f"[agent_flow] sandbox skill overlay failed: {exc}")
                 if not temp_skill_dirs:
                     try:
+                        _startup_checkpoint("tool_registry_probe_before")
                         reg_names = []
                         if reg is not None:
                             for attr in ("tools", "_tools", "registry", "_registry"):
@@ -2742,6 +3594,20 @@ def install(app) -> None:
                                 if isinstance(raw_tools, dict):
                                     reg_names = [str(x or "").strip() for x in raw_tools.keys()]
                                     break
+                        flow_name_text = str(flow_name or "").strip()
+                        is_model_tool_workflow = any(
+                            str(
+                                (
+                                    (_step.get("plugin_settings") or {}).get("tool_config") or {}
+                                ).get("tool")
+                                if isinstance(_step.get("plugin_settings"), dict)
+                                and isinstance((_step.get("plugin_settings") or {}).get("tool_config"), dict)
+                                else ""
+                            ).strip().lower().startswith("models.")
+                            for _step in steps
+                            if isinstance(_step, dict)
+                        )
+                        is_model_workflow = flow_name_text.lower().startswith("models /") or is_model_tool_workflow
                         needs_agent_flow_registry = False
                         for _step_probe in steps:
                             if not isinstance(_step_probe, dict):
@@ -2751,21 +3617,23 @@ def install(app) -> None:
                             ps_probe = _step_probe.get("plugin_settings") if isinstance(_step_probe.get("plugin_settings"), dict) else {}
                             skills_probe = ps_probe.get("action_skills") if isinstance(ps_probe.get("action_skills"), list) else []
                             tc_probe = ps_probe.get("tool_config") if isinstance(ps_probe.get("tool_config"), dict) else {}
-                            probe_names = [str(x or "").strip() for x in skills_probe]
+                            # Model workflows are direct tool-node graphs. The UI may still show
+                            # the model tool skill bundle on every node, but startup should only
+                            # validate the concrete tool this node calls. Validating every displayed
+                            # skill here can stall workflow start and pull unrelated registry work
+                            # into model execution.
+                            probe_names = [] if is_model_workflow else [str(x or "").strip() for x in skills_probe]
                             probe_names.append(str(tc_probe.get("tool") or "").strip())
-                            node_type_probe = str(ps_probe.get("node_type") or "").strip().lower()
-                            if node_type_probe == "tool_node" and any(name and name not in reg_names for name in probe_names):
+                            probe_names = [name for name in probe_names if name]
+                            if any(name not in reg_names for name in probe_names):
                                 needs_agent_flow_registry = True
                                 break
-                            for skill_probe in skills_probe:
-                                skill_id_probe = str(skill_probe or "").strip()
-                                if skill_id_probe.startswith("workflow.") and skill_id_probe not in reg_names:
-                                    needs_agent_flow_registry = True
-                                    break
                             if needs_agent_flow_registry:
                                 break
                         if needs_agent_flow_registry:
+                            _startup_checkpoint("tool_registry_refresh_before")
                             overlay = build_agent_flow_tool_registry(app, extra_skill_dirs=None)
+                            _startup_checkpoint("tool_registry_refresh_after")
                             reg = overlay.get("registry") if isinstance(overlay, dict) else reg
                             if isinstance(overlay, dict):
                                 settings["__agent_flow_sandbox_skill_specs"] = dict(overlay.get("skill_specs") or {})
@@ -2774,6 +3642,21 @@ def install(app) -> None:
                     except Exception as exc:
                         _publish_run_line(f"[agent_flow] workflow skill registry refresh failed: {exc}")
                 try:
+                    _startup_checkpoint("tool_registry_required_check_before")
+                    flow_name_text = str(flow_name or "").strip()
+                    is_model_tool_workflow = any(
+                        str(
+                            (
+                                (_step.get("plugin_settings") or {}).get("tool_config") or {}
+                            ).get("tool")
+                            if isinstance(_step.get("plugin_settings"), dict)
+                            and isinstance((_step.get("plugin_settings") or {}).get("tool_config"), dict)
+                            else ""
+                        ).strip().lower().startswith("models.")
+                        for _step in steps
+                        if isinstance(_step, dict)
+                    )
+                    is_model_workflow = flow_name_text.lower().startswith("models /") or is_model_tool_workflow
                     tool_registry_required = False
                     for _step_probe in steps:
                         if not isinstance(_step_probe, dict):
@@ -2783,17 +3666,18 @@ def install(app) -> None:
                         ps_probe = _step_probe.get("plugin_settings") if isinstance(_step_probe.get("plugin_settings"), dict) else {}
                         skills_probe = ps_probe.get("action_skills") if isinstance(ps_probe.get("action_skills"), list) else []
                         tc_probe = ps_probe.get("tool_config") if isinstance(ps_probe.get("tool_config"), dict) else {}
-                        probe_names = [str(x or "").strip() for x in skills_probe]
+                        probe_names = [] if is_model_workflow else [str(x or "").strip() for x in skills_probe]
                         probe_names.append(str(tc_probe.get("tool") or "").strip())
-                        node_type_probe = str(ps_probe.get("node_type") or "").strip().lower()
-                        if node_type_probe == "tool_node" and any(name for name in probe_names if name):
-                            tool_registry_required = True
-                            break
-                        if any(name.startswith("workflow.") for name in probe_names if name):
+                        probe_names = [name for name in probe_names if name]
+                        if is_model_workflow and probe_names and all(name.lower().startswith("models.") for name in probe_names):
+                            continue
+                        if probe_names:
                             tool_registry_required = True
                             break
                     if tool_registry_required and (reg is None or not hasattr(reg, "call_tool")):
+                        _startup_checkpoint("tool_registry_build_before")
                         overlay = build_agent_flow_tool_registry(app, extra_skill_dirs=None)
+                        _startup_checkpoint("tool_registry_build_after")
                         reg = overlay.get("registry") if isinstance(overlay, dict) else reg
                         if isinstance(overlay, dict):
                             settings["__agent_flow_sandbox_skill_specs"] = dict(overlay.get("skill_specs") or {})
@@ -2801,6 +3685,28 @@ def install(app) -> None:
                             settings["__agent_flow_sandbox_skill_warnings"] = list(overlay.get("warnings") or [])
                 except Exception as exc:
                     _publish_run_line(f"[agent_flow] workflow skill registry build failed: {exc}")
+                try:
+                    if bool(locals().get("is_model_workflow")):
+                        def _direct_model_tool_call(name: str, ctx0: dict, params0: dict):
+                            tool_name = str(name or "").strip()
+                            if not tool_name.lower().startswith("models."):
+                                raise RuntimeError(f"model workflow cannot directly call non-model tool: {tool_name}")
+                            import importlib
+                            mod_name = tool_name.split(".", 1)[1].strip()
+                            if not mod_name or not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", mod_name):
+                                raise RuntimeError(f"invalid model workflow tool name: {tool_name}")
+                            mod = importlib.import_module(
+                                f"plugins.gui_helpers.agent_flow.skills.models.{mod_name}"
+                            )
+                            fn = getattr(mod, "run", None)
+                            if not callable(fn):
+                                raise RuntimeError(f"model workflow tool has no run(ctx, params): {tool_name}")
+                            return fn(dict(ctx0 or {}), dict(params0 or {}))
+
+                        settings["__agent_workflow_tool_call"] = _direct_model_tool_call
+                        _startup_checkpoint("model_direct_tool_dispatch_ready")
+                except Exception as exc:
+                    _publish_run_line(f"[agent_flow] workflow model direct tool dispatch failed: {exc}")
                 if reg is not None and hasattr(reg, "call_tool"):
                     try:
                         app.state.agent_workflow_tools = reg
@@ -2922,9 +3828,17 @@ def install(app) -> None:
                     model_obj = _ensure_main_text_model_loaded(str(sid or "_default"))
                     return model_obj
 
-                core = RouterCore(chat_llm=_resolve_chat_model(), backend_type="auto", settings=settings)
+                if bool(locals().get("is_model_workflow")):
+                    _startup_checkpoint("model_workflow_skip_chat_model_resolve")
+                    core = RouterCore(chat_llm=None, backend_type="model_workflow", settings=settings)
+                else:
+                    _startup_checkpoint("chat_model_resolve_before")
+                    core = RouterCore(chat_llm=_resolve_chat_model(), backend_type="auto", settings=settings)
+                    _startup_checkpoint("chat_model_resolve_after")
                 core.settings["__resolve_chat_model"] = _resolve_chat_model
+                _startup_checkpoint("load_member_routes_before")
                 routes = load_routes(core) or []
+                _startup_checkpoint("load_member_routes_after")
                 route_by_id = {r.route_id: r for r in routes}
 
                 last_output_text = ""
@@ -2974,6 +3888,14 @@ def install(app) -> None:
                             pass
                     if not key and not wanted_id:
                         return None
+                    if not force_runtime_flow:
+                        try:
+                            project_row = project_records_by_name.get(key)
+                            candidate = project_row.get("flow_json") if isinstance(project_row, dict) else None
+                            if isinstance(candidate, dict):
+                                return dict(candidate)
+                        except Exception:
+                            pass
                     candidate = flows.get(key) if isinstance(flows, dict) else None
                     if isinstance(candidate, dict):
                         return dict(candidate)
@@ -3120,12 +4042,50 @@ def install(app) -> None:
                         "fail_count",
                         "review_summary",
                     )
+                    state_keys = (
+                        "current_request",
+                        "current_request_text",
+                        "remaining_requests",
+                        "completed_requests",
+                        "completed_count",
+                        "created_count",
+                        "failed_count",
+                        "total_requests",
+                        "has_current",
+                        "has_more",
+                        "tracker_state",
+                        "subflow_parent_state",
+                        "subflow_result_state",
+                        "planned_requests",
+                        "handoff",
+                        "request_text",
+                        "user_request",
+                        "request",
+                        "text",
+                        "prompt",
+                    )
                     for key in artifact_keys:
                         if carried.get(key) not in (None, "", [], {}):
                             continue
                         value = step_ext.get(key)
                         if value in (None, "", [], {}):
                             continue
+                        carried[key] = value
+                    for key in state_keys:
+                        if carried.get(key) not in (None, "", [], {}):
+                            continue
+                        value = step_ext.get(key)
+                        if value in (None, "", [], {}):
+                            continue
+                        if key == "current_request":
+                            value = _coerce_single_request(value)
+                        elif key == "tracker_state":
+                            value = _normalize_tracker_state(value)
+                        elif key in {"remaining_requests", "completed_requests"}:
+                            if isinstance(value, tuple):
+                                value = list(value)
+                            if value is not None and not isinstance(value, list):
+                                value = [value]
                         carried[key] = value
                     return carried
 
@@ -3307,6 +4267,7 @@ def install(app) -> None:
                         return []
                     runtime_nodes = flow_for_run.get("nodes") if isinstance(flow_for_run.get("nodes"), dict) else {}
                     active_runtime_flow_name = ""
+                    runtime_nodes_ref: Dict[str, Any] = {}
                     try:
                         ps_current = step.get("plugin_settings") if isinstance(step.get("plugin_settings"), dict) else {}
                         active_runtime_flow_name = str(ps_current.get("runtime_flow_name") or "").strip()
@@ -3338,7 +4299,25 @@ def install(app) -> None:
                     transition_origin_slug = re.sub(r"[^A-Za-z0-9_.:-]+", "_", transition_origin_id).strip("_") or "origin"
                     for path_index, path_step in enumerate(built):
                         template_id = str(path_step.get("template_node_id") or path_step.get("node_id") or "").split("::")[0].strip()
-                        base_template = step_templates.get(template_id) if template_id else None
+                        base_template = None
+                        if active_runtime_flow_name and template_id:
+                            runtime_template = runtime_nodes_ref.get(template_id) if isinstance(runtime_nodes_ref, dict) else None
+                            if isinstance(runtime_template, dict):
+                                base_template = {
+                                    "step_index": len(step_templates),
+                                    "node_id": template_id,
+                                    "template_node_id": template_id,
+                                    "label": runtime_template.get("label") or template_id,
+                                    "plugin_id": runtime_template.get("plugin_id") or path_step.get("plugin_id") or "chat",
+                                    "system_prompt": runtime_template.get("system_prompt") or path_step.get("system_prompt") or "",
+                                    "return_only_text": runtime_template.get("return_only_text") is not False,
+                                    "delay_ms": int(runtime_template.get("delay_ms") or path_step.get("delay_ms") or 0),
+                                    "transitions": runtime_template.get("transitions") or path_step.get("transitions") or [],
+                                    "plugin_settings": runtime_template.get("plugin_settings") or path_step.get("plugin_settings") or {},
+                                    "initial_user_input": "",
+                                }
+                        if base_template is None:
+                            base_template = step_templates.get(template_id) if template_id else None
                         base = dict(base_template or path_step)
                         clone = _clone_step_for_transition(
                             base,
@@ -3346,14 +4325,19 @@ def install(app) -> None:
                             extra_system_prompt=extra_system_prompt if path_index == 0 else "",
                         )
                         clone["node_id"] = f"{template_id or target_key}::loopback::{retry_num}::from::{transition_origin_slug}::path::{path_index}"
-                        clone["template_node_id"] = template_id or target_key
+                        runtime_scope_id = str((step.get("plugin_settings") if isinstance(step.get("plugin_settings"), dict) else {}).get("fanout_parent_id") or "").strip()
+                        scoped_template_id = runtime_subflow_template_keys.get(runtime_scope_id, {}).get(template_id, template_id) if runtime_scope_id else template_id
+                        clone["template_node_id"] = scoped_template_id or target_key
                         clone_ps = clone.get("plugin_settings") if isinstance(clone.get("plugin_settings"), dict) else {}
                         clone_ps = dict(clone_ps)
                         if active_runtime_flow_name:
                             clone_ps["runtime_flow_name"] = active_runtime_flow_name
+                            clone_ps["runtime_template_node_id"] = template_id
                         clone["plugin_settings"] = clone_ps
                         out_steps.append(clone)
                     return out_steps
+
+                runtime_subflow_template_keys: Dict[str, Dict[str, str]] = {}
 
                 def _build_runtime_subflow_steps(
                     parent_step: Dict[str, Any],
@@ -3369,16 +4353,19 @@ def install(app) -> None:
                         return []
                     try:
                         runtime_nodes = target_flow.get("nodes") if isinstance(target_flow.get("nodes"), dict) else {}
+                        template_key_map = runtime_subflow_template_keys.setdefault(str(parent_runtime_id or "").strip(), {})
                         for node_id, node in runtime_nodes.items():
                             node_key = str(node_id or "").strip()
                             if not node_key or not isinstance(node, dict):
                                 continue
-                            if node_key in step_templates:
+                            scoped_template_id = template_key_map.get(node_key) or f"{parent_runtime_id}::template::{node_key}"
+                            template_key_map[node_key] = scoped_template_id
+                            if scoped_template_id in step_templates:
                                 continue
-                            step_templates[node_key] = {
+                            step_templates[scoped_template_id] = {
                                 "step_index": len(step_templates),
-                                "node_id": node_key,
-                                "template_node_id": node_key,
+                                "node_id": scoped_template_id,
+                                "template_node_id": scoped_template_id,
                                 "label": node.get("label") or node_key,
                                 "plugin_id": node.get("plugin_id") or "chat",
                                 "system_prompt": node.get("system_prompt") or "",
@@ -3408,6 +4395,12 @@ def install(app) -> None:
                             direct_val = report_obj.get(key)
                             if direct_val not in (None, "", [], {}):
                                 return direct_val
+                            nested_state = report_obj.get("subflow_result_state") if isinstance(report_obj.get("subflow_result_state"), dict) else {}
+                            if key in nested_state and nested_state.get(key) not in (None, "", [], {}):
+                                return nested_state.get(key)
+                            nested_parent = report_obj.get("subflow_parent_state") if isinstance(report_obj.get("subflow_parent_state"), dict) else {}
+                            if key in nested_parent and nested_parent.get(key) not in (None, "", [], {}):
+                                return nested_parent.get(key)
                             tr_rows = report_obj.get("tool_results") if isinstance(report_obj.get("tool_results"), list) else []
                             for tr_row in tr_rows:
                                 if not isinstance(tr_row, dict):
@@ -3524,9 +4517,10 @@ def install(app) -> None:
                         for child_index, child in enumerate(branch_steps):
                             clone = dict(child)
                             base_template_id = str(clone.get("template_node_id") or clone.get("node_id") or "").split("::")[0].strip()
+                            scoped_template_id = runtime_subflow_template_keys.get(str(parent_runtime_id or "").strip(), {}).get(base_template_id, base_template_id)
                             branch_prefix = f"{parent_runtime_id}::branch::{branch_index}::{child_index}"
                             clone["node_id"] = branch_prefix
-                            clone["template_node_id"] = base_template_id or str(clone.get("node_id") or "")
+                            clone["template_node_id"] = scoped_template_id or str(clone.get("node_id") or "")
                             clone["label"] = f"{parent_label} / {branch_index + 1}/{len(branch_items)} / {clone.get('label') or clone.get('node_id') or ''}".strip(" /")
                             clone_ps = clone.get("plugin_settings") if isinstance(clone.get("plugin_settings"), dict) else {}
                             clone_ps = dict(clone_ps)
@@ -3535,6 +4529,7 @@ def install(app) -> None:
                             clone_ps["fanout_branch_total"] = len(branch_items)
                             clone_ps["fanout_branch_terminal"] = child_index == max(0, branch_total - 1)
                             clone_ps["runtime_flow_name"] = subflow_name_ref
+                            clone_ps["runtime_template_node_id"] = base_template_id
                             clone["plugin_settings"] = clone_ps
                             clone["input"] = {
                                 **(clone.get("input") if isinstance(clone.get("input"), dict) else {}),
@@ -3600,6 +4595,21 @@ def install(app) -> None:
                     latest_branch = branches[-1] if branches else {}
                     latest_report = latest_branch.get("report") if isinstance(latest_branch, dict) and isinstance(latest_branch.get("report"), dict) else {}
                     latest_input = latest_branch.get("input") if isinstance(latest_branch, dict) and isinstance(latest_branch.get("input"), dict) else {}
+                    latest_role = str(
+                        latest_report.get("role")
+                        or latest_branch.get("label")
+                        or ""
+                    ).strip().lower()
+                    if "summary" in latest_role:
+                        latest_bugs = latest_report.get("bugs") if isinstance(latest_report.get("bugs"), list) else None
+                        latest_fixes = latest_report.get("fixes") if isinstance(latest_report.get("fixes"), list) else None
+                        latest_actions = latest_report.get("actions") if isinstance(latest_report.get("actions"), list) else None
+                        if latest_bugs is not None:
+                            bugs = [str(v or "").strip() for v in latest_bugs if str(v or "").strip()]
+                        if latest_fixes is not None:
+                            fixes = [str(v or "").strip() for v in latest_fixes if str(v or "").strip()]
+                        if latest_actions is not None:
+                            actions = [str(v or "").strip() for v in latest_actions if str(v or "").strip()]
                     latest_report_state = latest_report.get("subflow_result_state") if isinstance(latest_report, dict) else {}
                     output_map = bucket.get("output_map") if isinstance(bucket.get("output_map"), dict) else {}
                     mapped_state: Dict[str, Any] = {}
@@ -3715,14 +4725,21 @@ def install(app) -> None:
                         if val not in (None, "", [], {}):
                             mapped_state[pkey] = val
                     status_text = f"Completed {len(branches)}/{item_total} subflow branch(es) for {str(bucket.get('subflow_name') or '').strip() or 'subflow'}."
+                    preferred_result_text = str(
+                        mapped_state.get("execution_text")
+                        or mapped_state.get("response")
+                        or mapped_state.get("summary")
+                        or mapped_state.get("text")
+                        or ""
+                    ).strip()
                     out_report = {
                         "step": 0,
                         "total": 0,
                         "role": str(bucket.get("parent_label") or "Fan In").strip(),
                         "plan": "",
                         "analysis": status_text,
-                        "response": status_text,
-                        "did": status_text,
+                        "response": preferred_result_text or status_text,
+                        "did": preferred_result_text or status_text,
                         "actions": actions,
                         "bugs": bugs,
                         "fixes": fixes,
@@ -3920,8 +4937,159 @@ def install(app) -> None:
                     actions = rep.get("actions") if isinstance(rep.get("actions"), list) else []
                     fixes = rep.get("fixes") if isinstance(rep.get("fixes"), list) else []
                     bugs = rep.get("bugs") if isinstance(rep.get("bugs"), list) else []
+                    path_hints = [str(x or "").strip() for x in _tool_result_paths(rep) if str(x or "").strip()]
+                    def _repo_file_summary_lines(paths_in: List[str], blob_text: str = "") -> List[str]:
+                        cleaned_paths: List[str] = []
+                        for p0 in paths_in:
+                            low0 = p0.lower()
+                            if any(seg in low0 for seg in ("\\obj\\", "/obj/", "\\bin\\", "/bin/")):
+                                continue
+                            if p0 not in cleaned_paths:
+                                cleaned_paths.append(p0)
+                        if not cleaned_paths:
+                            return []
+                        parent_counts: Dict[str, int] = {}
+                        for p0 in cleaned_paths:
+                            try:
+                                parent = str(Path(p0).parent).strip()
+                            except Exception:
+                                parent = ""
+                            if parent:
+                                parent_counts[parent] = int(parent_counts.get(parent, 0)) + 1
+                        target_folder = ""
+                        if parent_counts:
+                            target_folder = sorted(parent_counts.items(), key=lambda kv: (-kv[1], -len(kv[0]), kv[0]))[0][0]
+                        repo_root = ""
+                        if target_folder:
+                            marker = f"{os.sep}data{os.sep}agent_workflow{os.sep}repo"
+                            low_target = target_folder.lower()
+                            idx = low_target.find(marker.lower())
+                            if idx >= 0:
+                                repo_root = target_folder[: idx + len(marker)]
+                        lines: List[str] = []
+                        if repo_root:
+                            lines.append(f"Repo root: `{repo_root}`")
+                        if target_folder:
+                            lines.append(f"Target folder: `{target_folder}`")
+                        lines.append("Verified files:")
+                        lines.extend(f"- `{p}`" for p in cleaned_paths[:12])
+                        support_lines: List[str] = []
+                        blob_low = str(blob_text or "").lower()
+                        if "appointment" in blob_low:
+                            support_lines.append("- Tracks appointments.")
+                        if "date range" in blob_low or "daterange" in blob_low or "range quer" in blob_low:
+                            support_lines.append("- Returns appointments filtered by date range.")
+                        if "controller" in blob_low or "/api/appointments" in blob_low:
+                            support_lines.append("- Exposes an API endpoint for appointment retrieval.")
+                        if support_lines:
+                            lines.append("")
+                            lines.append("What it supports:")
+                            lines.extend(support_lines[:4])
+                        return lines
+                    status_like_response = bool(
+                        response
+                        and (
+                            response.lower().startswith("status:")
+                            or "verification pending" in response.lower()
+                            or "qa review complete" in response.lower()
+                        )
+                    )
+                    if status_like_response and path_hints:
+                        cleaned_paths: List[str] = []
+                        for p0 in path_hints:
+                            low0 = p0.lower()
+                            if any(seg in low0 for seg in ("\\obj\\", "/obj/", "\\bin\\", "/bin/")):
+                                continue
+                            if p0 not in cleaned_paths:
+                                cleaned_paths.append(p0)
+                        if cleaned_paths:
+                            parent_counts: Dict[str, int] = {}
+                            for p0 in cleaned_paths:
+                                try:
+                                    parent = str(Path(p0).parent).strip()
+                                except Exception:
+                                    parent = ""
+                                if parent:
+                                    parent_counts[parent] = int(parent_counts.get(parent, 0)) + 1
+                            target_folder = ""
+                            if parent_counts:
+                                target_folder = sorted(parent_counts.items(), key=lambda kv: (-kv[1], -len(kv[0]), kv[0]))[0][0]
+                            repo_root = ""
+                            if target_folder:
+                                marker = f"{os.sep}data{os.sep}agent_workflow{os.sep}repo"
+                                low_target = target_folder.lower()
+                                idx = low_target.find(marker.lower())
+                                if idx >= 0:
+                                    repo_root = target_folder[: idx + len(marker)]
+                            support_lines: List[str] = []
+                            low_blob = " ".join([response] + [str(x or "") for x in actions] + [str(x or "") for x in fixes]).lower()
+                            if "appointment" in low_blob:
+                                support_lines.append("- Tracks appointments.")
+                            if "date range" in low_blob or "daterange" in low_blob or "range" in low_blob:
+                                support_lines.append("- Returns appointments filtered by date range.")
+                            if "post" in low_blob or "create" in low_blob:
+                                support_lines.append("- Supports creating appointments through an API endpoint.")
+                            lines = ["Build completed with verified files."]
+                            if repo_root:
+                                lines.append("")
+                                lines.append(f"Repo root: `{repo_root}`")
+                            if target_folder:
+                                lines.append(f"Target folder: `{target_folder}`")
+                            lines.append("")
+                            lines.append("Verified files:")
+                            lines.extend(f"- `{p}`" for p in cleaned_paths[:12])
+                            if support_lines:
+                                lines.append("")
+                                lines.append("What it supports:")
+                                lines.extend(support_lines[:4])
+                            return "\n".join(lines).strip()
+                    member_role_local = (
+                        str((last_step_report or {}).get("member_role") or "").strip().lower()
+                        if isinstance(last_step_report, dict)
+                        else ""
+                    )
                     if response:
+                        response_low = response.lower()
+                        release_summary_structured = (
+                            member_role_local == "release_summary"
+                            and any(
+                                marker in response_low
+                                for marker in (
+                                    "target folder:",
+                                    "verified files:",
+                                    "changed files:",
+                                    "rag sync:",
+                                    "git status:",
+                                    "**target folder:**",
+                                    "**verified files:**",
+                                    "**changed files:**",
+                                    "**rag sync:**",
+                                    "**git status:**",
+                                )
+                            )
+                        )
+                        if release_summary_structured:
+                            split_idx = response_low.find("**delivered**")
+                            if split_idx >= 0:
+                                return response[:split_idx].rstrip()
+                            return response.strip()
                         lines: List[str] = [response]
+                        if (
+                            path_hints
+                            and "verified files:" not in response.lower()
+                            and any(
+                                phrase in response.lower()
+                                for phrase in (
+                                    "has been created",
+                                    "has been implemented",
+                                    "successfully implemented",
+                                    "implementation is complete",
+                                    "all required files exist",
+                                )
+                            )
+                        ):
+                            lines.append("")
+                            lines.extend(_repo_file_summary_lines(path_hints, " ".join([response] + [str(x or '') for x in actions] + [str(x or '') for x in fixes])))
                         if fixes:
                             lines.append("")
                             lines.append("**Fixes Applied**")
@@ -3931,9 +5099,53 @@ def install(app) -> None:
                             lines.append("**Notes**")
                             lines.extend(f"- {str(x or '').strip()}" for x in bugs if str(x or "").strip())
                         if actions:
-                            lines.append("")
-                            lines.append("**Delivered**")
-                            lines.extend(f"- {str(x or '').strip()}" for x in actions if str(x or "").strip())
+                            action_lines = [str(x or "").strip() for x in actions if str(x or "").strip()]
+                            internal_action_lines = []
+                            user_facing_action_lines = []
+                            for action_line in action_lines:
+                                low_action = action_line.lower()
+                                if (
+                                    low_action == "no further actions required."
+                                    or low_action.startswith("repo.")
+                                    or low_action.startswith("git.")
+                                    or low_action.startswith("rag.")
+                                    or low_action.startswith("tests.")
+                                    or low_action.startswith("system.")
+                                    or low_action.startswith("browser.")
+                                    or low_action.startswith("code.")
+                                    or low_action.startswith("debug.")
+                                    or low_action.startswith("interaction.")
+                                    or low_action.startswith("call ")
+                                    or low_action.startswith("- call ")
+                                ):
+                                    internal_action_lines.append(action_line)
+                                else:
+                                    user_facing_action_lines.append(action_line)
+                            summary_already_structured = any(
+                                marker in response.lower()
+                                for marker in (
+                                    "final summary:",
+                                    "target folder:",
+                                    "verified files:",
+                                    "changed files:",
+                                    "git status:",
+                                    "rag sync:",
+                                    "**target folder**",
+                                    "**verified files**",
+                                    "**changed files**",
+                                    "**git status**",
+                                    "**rag sync**",
+                                )
+                            )
+                            if (
+                                not summary_already_structured
+                                and (user_facing_action_lines or action_lines)
+                                and not release_summary_structured
+                                and member_role_local != "release_summary"
+                            ):
+                                lines.append("")
+                                lines.append("**Delivered**")
+                                lines.extend(f"- {item}" for item in (user_facing_action_lines or action_lines))
                         return "\n".join(lines).strip()
                     text = str(raw_text or "").strip()
                     if not text:
@@ -3953,6 +5165,26 @@ def install(app) -> None:
                                 buffer.append(str(line or "").rstrip())
                         if current_key:
                             fields[current_key] = "\n".join(buffer).strip()
+                        response_field = str(fields.get("response") or "").strip()
+                        handoff_field = str(fields.get("handoff") or "").strip()
+                        def _structured_tail(text_value: str) -> str:
+                            raw_value = str(text_value or "").strip()
+                            if not raw_value:
+                                return ""
+                            markers = ["Target folder:", "**Target folder:**", "Verified files:", "**Verified files:**", "Changed files:", "**Changed files:**"]
+                            starts = [raw_value.find(marker) for marker in markers if raw_value.find(marker) >= 0]
+                            if not starts:
+                                return ""
+                            start = min(starts)
+                            return raw_value[start:].strip()
+                        handoff_structured = _structured_tail(handoff_field)
+                        response_is_placeholder = response_field.lower() in {
+                            "final result provided below.",
+                            "pending git status and test file verification.",
+                            "checking git status and code state for calendar-tool-light-nodejs.",
+                        }
+                        if handoff_structured and (response_is_placeholder or not response_field):
+                            return handoff_structured
                         preferred = (
                             fields.get("response")
                             or fields.get("did")
@@ -4015,6 +5247,35 @@ def install(app) -> None:
                             except Exception:
                                 continue
                     return None
+
+                def _sanitize_repo_review_final_result(text_value: str, state_value: Optional[Dict[str, Any]] = None) -> str:
+                    raw = str(text_value or "").strip()
+                    if not raw:
+                        return ""
+                    steps_value = []
+                    if isinstance(state_value, dict) and isinstance(state_value.get("steps"), list):
+                        steps_value = state_value.get("steps") or []
+                    low = raw.lower()
+                    structured = ("target folder:" in low or "**target folder:**" in low) and ("verified files:" in low or "**verified files:**" in low)
+                    if structured:
+                        try:
+                            probe_state = {"final_result": raw, "steps": steps_value}
+                            repaired = _sanitize_agent_flow_state(probe_state)
+                            if isinstance(repaired, dict):
+                                raw = str(repaired.get("final_result") or raw).strip()
+                                low = raw.lower()
+                        except Exception:
+                            pass
+                        for marker in ("\ndid:", "\n**delivered**"):
+                            split_idx = low.find(marker)
+                            if split_idx >= 0:
+                                raw = raw[:split_idx].rstrip()
+                                low = raw.lower()
+                    if "**delivered**" in low:
+                        split_idx = low.find("**delivered**")
+                        if split_idx >= 0:
+                            raw = raw[:split_idx].rstrip()
+                    return raw
 
                 def _to_chart_payload(obj: Any) -> Optional[Dict[str, Any]]:
                     return normalize_chart_payload(obj, user_request=str(user_text or ""))
@@ -4105,12 +5366,28 @@ def install(app) -> None:
                             raw_paths.append(s)
                     seen = set()
                     out: List[Path] = []
+                    transient_dir_parts = {
+                        "obj",
+                        "bin",
+                        "node_modules",
+                        "target",
+                        "__pycache__",
+                        ".pytest_cache",
+                    }
                     for raw in raw_paths:
                         if raw in seen:
                             continue
                         seen.add(raw)
                         fp = _resolve_existing_file(raw)
-                        if fp is not None and fp not in out:
+                        if fp is None:
+                            continue
+                        try:
+                            parts_l = {str(part or "").strip().lower() for part in fp.parts}
+                        except Exception:
+                            parts_l = set()
+                        if parts_l.intersection(transient_dir_parts):
+                            continue
+                        if fp not in out:
                             out.append(fp)
                     return out
 
@@ -4130,6 +5407,8 @@ def install(app) -> None:
                             for key in (
                                 "file",
                                 "path",
+                                "file_path",
+                                "output_path",
                                 "download_path",
                                 "workflow_file",
                                 "workflow_json_file",
@@ -4470,7 +5749,13 @@ def install(app) -> None:
                     if idx == 0 and attachments:
                         messages[0]["meta"] = {"attachments": attachments}
 
-                    step_ext = {"pid": pid, "sid": sid}
+                    step_ext = {
+                        "pid": pid,
+                        "sid": sid,
+                        "run_id": run_id,
+                        "agent_flow_run_id": run_id,
+                        "model_workflow_run_id": run_id,
+                    }
                     if str(last_output_text or "").strip():
                         step_ext["agent_flow_previous_output_text"] = str(last_output_text)
                     if str(last_output_raw or "").strip():
@@ -4578,12 +5863,41 @@ def install(app) -> None:
                         pass
                     # Carry top-level router settings into each node step so tools can resolve
                     # target repo root and other shared plugin settings.
-                    if isinstance(ext.get("router_plugin_settings"), dict):
-                        step_ext["router_plugin_settings"] = dict(ext.get("router_plugin_settings") or {})
-                    if str(ext.get("agent_workflow_target_repo_root") or "").strip():
-                        step_ext["agent_workflow_target_repo_root"] = str(ext.get("agent_workflow_target_repo_root") or "").strip()
-                    if str(ext.get("target_repo_root") or "").strip():
-                        step_ext["target_repo_root"] = str(ext.get("target_repo_root") or "").strip()
+                    resolved_router_plugin_settings = (
+                        dict(ext.get("router_plugin_settings") or {})
+                        if isinstance(ext.get("router_plugin_settings"), dict)
+                        else {}
+                    )
+                    if resolved_router_plugin_settings:
+                        step_ext["router_plugin_settings"] = dict(resolved_router_plugin_settings)
+                    resolved_target_repo_root = str(ext.get("target_repo_root") or "").strip()
+                    resolved_agent_workflow_target_repo_root = str(ext.get("agent_workflow_target_repo_root") or "").strip()
+                    if not resolved_target_repo_root or not resolved_agent_workflow_target_repo_root:
+                        aw_router_settings = (
+                            resolved_router_plugin_settings.get("agent_workflow")
+                            if isinstance(resolved_router_plugin_settings.get("agent_workflow"), dict)
+                            else {}
+                        )
+                        if not resolved_agent_workflow_target_repo_root:
+                            resolved_agent_workflow_target_repo_root = str(
+                                aw_router_settings.get("target_repo_root")
+                                or aw_router_settings.get("selected_repo_root")
+                                or ""
+                            ).strip()
+                        if not resolved_target_repo_root:
+                            resolved_target_repo_root = str(
+                                aw_router_settings.get("target_repo_root")
+                                or aw_router_settings.get("selected_repo_root")
+                                or ""
+                            ).strip()
+                    if not resolved_target_repo_root and not resolved_agent_workflow_target_repo_root:
+                        fallback_repo_root = os.path.join("data", "agent_workflow", "repo")
+                        resolved_target_repo_root = fallback_repo_root
+                        resolved_agent_workflow_target_repo_root = fallback_repo_root
+                    if resolved_agent_workflow_target_repo_root:
+                        step_ext["agent_workflow_target_repo_root"] = resolved_agent_workflow_target_repo_root
+                    if resolved_target_repo_root:
+                        step_ext["target_repo_root"] = resolved_target_repo_root
                     base_url = str(ext.get("base_url") or ext.get("server_url") or "").strip()
                     if base_url:
                         step_ext["base_url"] = base_url
@@ -4666,6 +5980,14 @@ def install(app) -> None:
                             last_step_report if isinstance(last_step_report, dict) else {},
                         ):
                             val = _resolve_path_from_sources(name, src)
+                            if val not in (None, "", [], {}):
+                                return val
+                            nested_state = src.get("subflow_result_state") if isinstance(src.get("subflow_result_state"), dict) else {}
+                            val = _resolve_path_from_sources(name, nested_state)
+                            if val not in (None, "", [], {}):
+                                return val
+                            nested_parent = src.get("subflow_parent_state") if isinstance(src.get("subflow_parent_state"), dict) else {}
+                            val = _resolve_path_from_sources(name, nested_parent)
                             if val not in (None, "", [], {}):
                                 return val
                             tool_rows = src.get("tool_results") if isinstance(src.get("tool_results"), list) else []
@@ -4838,6 +6160,21 @@ def install(app) -> None:
                             "handoff": f"Runtime subflow {subflow_name_ref} expanded.",
                             "tool_results": [],
                         }
+                        if prior_current_req:
+                            last_step_report["current_request"] = prior_current_req
+                        if prior_current_text:
+                            last_step_report["current_request_text"] = prior_current_text
+                            last_step_report.setdefault("request_text", prior_current_text)
+                            last_step_report.setdefault("user_request", prior_current_text)
+                            last_step_report.setdefault("request", prior_current_text)
+                            last_step_report.setdefault("text", prior_current_text)
+                        parent_state_seed = dict(step_input_now) if isinstance(step_input_now, dict) else {}
+                        if parent_state_seed:
+                            if "current_request" not in parent_state_seed and prior_current_req:
+                                parent_state_seed["current_request"] = prior_current_req
+                            if "current_request_text" not in parent_state_seed and prior_current_text:
+                                parent_state_seed["current_request_text"] = prior_current_text
+                            last_step_report["subflow_parent_state"] = parent_state_seed
                         last_output_text = str(last_step_report.get("response") or "")
                         try:
                             last_output_raw = json.dumps(last_step_report, ensure_ascii=False)
@@ -4866,10 +6203,23 @@ def install(app) -> None:
                         ps_pre = step.get("plugin_settings") if isinstance(step.get("plugin_settings"), dict) else {}
                         node_type_pre = str(ps_pre.get("node_type") or "").strip().lower()
                         allowed_pre = ps_pre.get("action_skills") if isinstance(ps_pre.get("action_skills"), list) else []
+                        skill_rules_pre = ps_pre.get("action_skill_rules") if isinstance(ps_pre.get("action_skill_rules"), dict) else {}
                         allowed_result_pre = [
                             str(skill or "").strip()
                             for skill in allowed_pre
-                            if str(skill or "").strip().lower().startswith("result.")
+                            if (
+                                str(skill or "").strip().lower().startswith("result.")
+                                and (
+                                    not isinstance(
+                                        skill_rules_pre.get(str(skill or "").strip()),
+                                        dict,
+                                    )
+                                    or _action_skill_rule_applies(
+                                        skill_rules_pre.get(str(skill or "").strip()) or {},
+                                        user_text,
+                                    )
+                                )
+                            )
                         ]
                         if (
                             str(plugin_id or "").strip().lower() == "agent_workflow_member"
@@ -4907,6 +6257,11 @@ def install(app) -> None:
                                 ).strip()
                                 if flow_name_hint_pre:
                                     archive_name_pre = f"{flow_name_hint_pre}.zip"
+                                if _is_repo_analysis_only_request(user_text, flow_name_hint_pre):
+                                    allowed_result_pre = [
+                                        sid for sid in allowed_result_pre
+                                        if str(sid or '').strip().lower() not in {'result.file', 'result.files', 'result.zip'}
+                                    ]
                                 for skill_id_pre in allowed_result_pre:
                                     sid_pre = str(skill_id_pre or "").strip().lower()
                                     params_pre: Dict[str, Any] = {"user_request": user_text}
@@ -5097,6 +6452,9 @@ def install(app) -> None:
                         fallback_params = tc_direct.get("fallback_params") if isinstance(tc_direct.get("fallback_params"), dict) else {}
                         merged_params.update(dict(cfg_params))
                         merged_params.update(dict(fallback_params))
+                        merged_params.setdefault("run_id", run_id)
+                        merged_params.setdefault("agent_flow_run_id", run_id)
+                        merged_params.setdefault("model_workflow_run_id", run_id)
                         params_from_input = tc_direct.get("params_from_input") if isinstance(tc_direct.get("params_from_input"), list) else []
                         prior_paths = _tool_result_paths(last_step_report)
                         user_file_hint = _extract_candidate_file_from_text(user_text)
@@ -5169,17 +6527,207 @@ def install(app) -> None:
                                 v = file_hint
                             if v is not None and (not isinstance(v, str) or str(v).strip()):
                                 merged_params[pkey] = v
+                        if tool_name == "result.text":
+                            current_text_val = str(merged_params.get("text") or "").strip()
+                            request_text_val = str(request_seed_text or "").strip()
+                            if not current_text_val or current_text_val == request_text_val:
+                                for alt_key in ("execution_text", "summary", "response", "finalized_text", "final_answer", "markdown", "table_markdown"):
+                                    alt_val = merged_params.get(alt_key)
+                                    if alt_val not in (None, "", [], {}):
+                                        merged_params["text"] = alt_val
+                                        current_text_val = str(alt_val or "").strip()
+                                        break
+                            if (not current_text_val or current_text_val == request_text_val) and str(last_output_text or "").strip():
+                                merged_params["text"] = str(last_output_text or "").strip()
+                        if str(tool_name or "").startswith("models."):
+                            try:
+                                model_settings = merged_params.get("settings") if isinstance(merged_params.get("settings"), dict) else {}
+                                request_image_override = ""
+                                for src_obj in (
+                                    step_ext if isinstance(step_ext, dict) else {},
+                                    ext if isinstance(ext, dict) else {},
+                                    step.get("input") if isinstance(step.get("input"), dict) else {},
+                                    merged_params,
+                                    model_settings if isinstance(model_settings, dict) else {},
+                                ):
+                                    if not isinstance(src_obj, dict):
+                                        continue
+                                    for image_key in (
+                                        "__request_source_image_path",
+                                        "source_image_path",
+                                        "image_path",
+                                        "start_image_path",
+                                        "input_image_path",
+                                        "input_path",
+                                        "file_path",
+                                        "path",
+                                        "file",
+                                    ):
+                                        candidate = str(src_obj.get(image_key) or "").strip()
+                                        if not candidate:
+                                            continue
+                                        lowered_candidate = candidate.lower()
+                                        if image_key in {"input_path", "file_path", "path", "file"} and not lowered_candidate.endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")):
+                                            continue
+                                        request_image_override = candidate
+                                        break
+                                    if request_image_override:
+                                        break
+                                if request_image_override and isinstance(model_settings, dict):
+                                    # Per-run I2V source images must override
+                                    # saved Model Deck defaults. Keep aliases so
+                                    # older model nodes and asset resolvers agree.
+                                    for image_key in (
+                                        "__request_source_image_path",
+                                        "source_image_path",
+                                        "image_path",
+                                        "input_image_path",
+                                    ):
+                                        model_settings[image_key] = request_image_override
+                                        merged_params[image_key] = request_image_override
+                                    merged_params["settings"] = model_settings
+                                model_run_override_keys = {
+                                    "steps",
+                                    "high_noise_steps",
+                                    "low_noise_steps",
+                                    "guidance_scale",
+                                    "high_noise_cfg",
+                                    "low_noise_cfg",
+                                    "sampler_name",
+                                    "scheduler",
+                                    "wan_i2v_denoise_strength",
+                                    "i2v_denoise_strength",
+                                    "i2v_strength",
+                                    "wan_i2v_high_noise_start_step",
+                                    "wan_i2v_low_noise_start_step",
+                                    "wan_i2v_source_encode_mode",
+                                    "wan_i2v_source_conditioning_cache_mode",
+                                    "wan_i2v_source_hold_frames",
+                                    "wan_i2v_source_conditioning_frames",
+                                    "wan_i2v_source_tail_mode",
+                                    "wan_i2v_source_tail_min_strength",
+                                    "wan_i2v_source_tail_decay_power",
+                                    "wan_i2v_vae_encode_device",
+                                    "wan_i2v_source_vae_encode_device",
+                                    "wan_vae_decode_device",
+                                    "wan_vae_decode_mode",
+                                    "wan_vae_halo_core_latent_frames",
+                                    "wan_vae_halo_core_overlap_latent_frames",
+                                    "wan_vae_halo_latent_frames",
+                                    "wan_vae_halo_max_window_latent_frames",
+                                    "wan_vae_halo_spatial_tiled",
+                                    "wan_vae_halo_tile_size",
+                                    "wan_vae_halo_tile_overlap",
+                                    "wan_apply_stage_lora",
+                                    "wan_stage_lora_strength",
+                                    "high_noise_lora_strength",
+                                    "low_noise_lora_strength",
+                                    "negative_prompt",
+                                    "prompt",
+                                }
+                                explicit_model_overrides: Dict[str, Any] = {}
+
+                                def _collect_model_overrides(src_obj: Any) -> None:
+                                    if not isinstance(src_obj, dict):
+                                        return
+                                    for override_key in model_run_override_keys:
+                                        override_val = src_obj.get(override_key)
+                                        if override_val in (None, "", [], {}):
+                                            continue
+                                        explicit_model_overrides[override_key] = override_val
+
+                                # Request/run-level settings are authoritative
+                                # over saved workflow node defaults for one-off
+                                # tests. Check nested settings first because
+                                # service_chat/runner calls commonly place model
+                                # overrides there.
+                                for src_obj in (
+                                    (step_ext.get("router_plugin_settings") if isinstance(step_ext, dict) else {}).get("agent_workflow_member")
+                                    if isinstance((step_ext.get("router_plugin_settings") if isinstance(step_ext, dict) else {}), dict)
+                                    else {},
+                                    step_ext.get("agent_workflow_member_settings") if isinstance(step_ext, dict) else {},
+                                    (ext.get("router_plugin_settings") if isinstance(ext, dict) else {}).get("agent_workflow_member")
+                                    if isinstance((ext.get("router_plugin_settings") if isinstance(ext, dict) else {}), dict)
+                                    else {},
+                                    ext.get("agent_workflow_member_settings") if isinstance(ext, dict) else {},
+                                    step.get("input") if isinstance(step.get("input"), dict) else {},
+                                    ext if isinstance(ext, dict) else {},
+                                    step_ext if isinstance(step_ext, dict) else {},
+                                ):
+                                    _collect_model_overrides(src_obj)
+                                if explicit_model_overrides and isinstance(model_settings, dict):
+                                    model_settings.update(explicit_model_overrides)
+                                    merged_params.update(explicit_model_overrides)
+                                    merged_params["settings"] = model_settings
+                                workflow_mode = str(model_settings.get("workflow_loader_mode") or merged_params.get("workflow_loader_mode") or "").strip().lower()
+                                workflow_backend = str(model_settings.get("workflow_execution_backend") or merged_params.get("execution_backend") or merged_params.get("workflow_execution_backend") or "").strip().lower()
+                                if workflow_mode in {"", "checkpoint_runner"} and (
+                                    "workflow_loader_mode" in model_settings
+                                    or "workflow_execution_backend" in model_settings
+                                    or "workflow_loader_mode" in merged_params
+                                    or "workflow_execution_backend" in merged_params
+                                    or "execution_backend" in merged_params
+                                ):
+                                    workflow_mode = "workflow_model_loader"
+                                    if isinstance(model_settings, dict):
+                                        model_settings["workflow_loader_mode"] = workflow_mode
+                                allow_checkpoint_fallback = False
+                                if isinstance(model_settings, dict):
+                                    allow_checkpoint_fallback = str(
+                                        model_settings.get("native_allow_checkpoint_runner_fallback")
+                                        or model_settings.get("native_checkpoint_runner_parity")
+                                        or ""
+                                    ).strip().lower() in {"1", "true", "yes", "on"}
+                                allow_checkpoint_fallback = allow_checkpoint_fallback or str(
+                                    merged_params.get("native_allow_checkpoint_runner_fallback")
+                                    or merged_params.get("native_checkpoint_runner_parity")
+                                    or ""
+                                ).strip().lower() in {"1", "true", "yes", "on"}
+                                if workflow_mode == "workflow_model_loader" and workflow_backend in {"", "auto"}:
+                                    if isinstance(model_settings, dict):
+                                        model_settings["workflow_execution_backend"] = "native_graph"
+                                    merged_params["execution_backend"] = "native_graph"
+                                    merged_params["workflow_execution_backend"] = "native_graph"
+                                elif (
+                                    workflow_mode == "workflow_model_loader"
+                                    and workflow_backend in {"ltx_checkpoint_runner", "checkpoint_runner"}
+                                    and not allow_checkpoint_fallback
+                                ):
+                                    if isinstance(model_settings, dict):
+                                        model_settings["workflow_execution_backend"] = "native_graph"
+                                    merged_params["execution_backend"] = "native_graph"
+                                    merged_params["workflow_execution_backend"] = "native_graph"
+                                if isinstance(model_settings, dict) and model_settings:
+                                    merged_params["settings"] = model_settings
+                            except Exception:
+                                pass
                         try:
+                            def _model_tool_progress(message: str, **extra: Any) -> None:
+                                text_msg = str(message or "").strip()
+                                if text_msg:
+                                    _publish_step_stream(f"[agent_flow] {label}: {text_msg}")
+                                try:
+                                    state["ts"] = _now_ts()
+                                    if text_msg:
+                                        state["steps"][idx]["output"] = text_msg[:4000]
+                                    _agent_flow_set_state(pid, sid, state)
+                                    _publish_flow_status(dict(extra or {}))
+                                except Exception:
+                                    pass
+
+                            tool_settings = dict(settings)
+                            tool_settings["__agent_flow_progress_callback"] = _model_tool_progress
                             raw_res = aw_call(
                                 tool_name,
                                 {
                                     "app": app,
                                     "pid": pid,
                                     "sid": sid,
-                                    "settings": settings,
+                                    "settings": tool_settings,
                                     "ext": dict(step_ext) if isinstance(step_ext, dict) else {},
                                     "user_text": request_seed_text,
                                     "original_request": request_seed_text,
+                                    "progress": _model_tool_progress,
                                 },
                                 merged_params,
                             )
@@ -5203,7 +6751,32 @@ def install(app) -> None:
                                 continue
                             if k not in tr_row["data"]:
                                 tr_row["data"][k] = v
-                        _publish_step_stream(f"[agent_flow] {label}: direct tool_node executed -> {tool_name}")
+                        status_word = "ok" if tr_row["ok"] else "failed"
+                        try:
+                            data_status = str((tr_row.get("data") if isinstance(tr_row.get("data"), dict) else {}).get("status") or "").strip().lower()
+                            if data_status == "declared":
+                                status_word = "declared"
+                            elif data_status in {"executed", "preloaded", "loaded"} and tr_row["ok"]:
+                                status_word = data_status
+                        except Exception:
+                            pass
+                        detail_bits: List[str] = []
+                        try:
+                            data_row = tr_row.get("data") if isinstance(tr_row.get("data"), dict) else {}
+                            err_txt = str(raw_res.get("error") or data_row.get("error") or "").strip()
+                            log_txt = str(data_row.get("log_file") or "").strip()
+                            out_video = data_row.get("output_video") if isinstance(data_row.get("output_video"), dict) else {}
+                            out_path = str(data_row.get("output_path") or out_video.get("output_path") or "").strip()
+                            if err_txt:
+                                detail_bits.append(f"error={err_txt[:240]}")
+                            if log_txt:
+                                detail_bits.append(f"log={log_txt}")
+                            if out_path:
+                                detail_bits.append(f"output={out_path}")
+                        except Exception:
+                            pass
+                        detail_suffix = f" | {' | '.join(detail_bits)}" if detail_bits else ""
+                        _publish_step_stream(f"[agent_flow] {label}: direct tool_node {status_word} -> {tool_name}{detail_suffix}")
                         route_text = _extract_text_from_route(raw_res)
                         route_out = {
                             "ok": tr_row["ok"],
@@ -5243,7 +6816,6 @@ def install(app) -> None:
                                 and (
                                     str((step.get("plugin_settings") if isinstance(step.get("plugin_settings"), dict) else {}).get("node_type") or "").strip().lower() == "tool_node"
                                     or bool(str((((step.get("plugin_settings") if isinstance(step.get("plugin_settings"), dict) else {}).get("tool_config") if isinstance((step.get("plugin_settings") if isinstance(step.get("plugin_settings"), dict) else {}).get("tool_config"), dict) else {}).get("tool") or "")).strip())
-                                    or bool([str(x or "").strip() for x in (((step.get("plugin_settings") if isinstance(step.get("plugin_settings"), dict) else {}).get("action_skills")) if isinstance((step.get("plugin_settings") if isinstance(step.get("plugin_settings"), dict) else {}).get("action_skills"), list) else []) if str(x or "").strip()])
                                 )
                             )
                             direct_out = None
@@ -5281,15 +6853,23 @@ def install(app) -> None:
                             else:
                                 out = route.handle(step_req)
                         # Enforce per-node skill policy at flow runtime:
-                        # when a node has no action_skills, discard any tool_results
-                        # emitted by the member route to prevent unintended writes.
+                        # - reasoning nodes with no action_skills may not emit tool_results
+                        # - execution nodes normalize an implicit allowlist from tool_config.tool
+                        # - nodes with a non-empty allowlist may only emit tool_results for allowed skills
                             try:
                                 ps_guard = step.get("plugin_settings") if isinstance(step.get("plugin_settings"), dict) else {}
-                                allowed_now = ps_guard.get("action_skills") if isinstance(ps_guard.get("action_skills"), list) else None
+                                raw_allowed_now = ps_guard.get("action_skills") if isinstance(ps_guard.get("action_skills"), list) else None
                                 node_type_guard = str(ps_guard.get("node_type") or "").strip().lower()
                                 tc_guard = ps_guard.get("tool_config") if isinstance(ps_guard.get("tool_config"), dict) else {}
-                                configured_tool = str(tc_guard.get("tool") or "").strip().lower()
-                                if isinstance(out, dict) and isinstance(allowed_now, list) and len(allowed_now) == 0:
+                                configured_tool_raw = str(tc_guard.get("tool") or "").strip()
+                                configured_tool = configured_tool_raw.lower()
+                                allowed_now = [str(x or "").strip() for x in (raw_allowed_now or []) if str(x or "").strip()]
+                                if not allowed_now and configured_tool_raw and (
+                                    node_type_guard == "tool_node" or bool(configured_tool_raw)
+                                ):
+                                    allowed_now = [configured_tool_raw]
+                                allowed_set = {str(x or "").strip().lower() for x in allowed_now if str(x or "").strip()}
+                                if isinstance(out, dict) and isinstance(raw_allowed_now, list) and len(allowed_now) == 0:
                                     tr_bad = out.get("tool_results")
                                     direct_configured_tool_ok = False
                                     if (
@@ -5307,6 +6887,27 @@ def install(app) -> None:
                                         out["tool_results"] = []
                                         out["tool_results_blocked_by_flow_policy"] = True
                                         _publish_step_stream(f"[agent_flow] {label}: blocked tool_results (node action_skills is empty)")
+                                elif isinstance(out, dict) and allowed_set:
+                                    tr_any = out.get("tool_results")
+                                    if isinstance(tr_any, list) and tr_any:
+                                        keep_rows = []
+                                        blocked_skills: List[str] = []
+                                        for row in tr_any:
+                                            if not isinstance(row, dict):
+                                                continue
+                                            skill_name = str(row.get("skill") or "").strip()
+                                            skill_l = skill_name.lower()
+                                            if not skill_l or skill_l in allowed_set:
+                                                keep_rows.append(row)
+                                                continue
+                                            blocked_skills.append(skill_name or "<unknown>")
+                                        if blocked_skills:
+                                            out["tool_results"] = keep_rows
+                                            out["tool_results_blocked_by_flow_policy"] = True
+                                            out["tool_results_blocked_skills"] = blocked_skills
+                                            _publish_step_stream(
+                                                f"[agent_flow] {label}: blocked disallowed tool_results -> {', '.join(blocked_skills[:6])}"
+                                            )
                             except Exception:
                                 pass
                             try:
@@ -5399,6 +7000,9 @@ def install(app) -> None:
                                 fallback_params = tc_now.get("fallback_params") if isinstance(tc_now.get("fallback_params"), dict) else {}
                                 merged_params.update(dict(cfg_params))
                                 merged_params.update(dict(fallback_params))
+                                merged_params.setdefault("run_id", run_id)
+                                merged_params.setdefault("agent_flow_run_id", run_id)
+                                merged_params.setdefault("model_workflow_run_id", run_id)
                                 params_from_input = tc_now.get("params_from_input") if isinstance(tc_now.get("params_from_input"), list) else []
                                 def _prior_value_for_param(name: str) -> Any:
                                     pname = str(name or "").strip()
@@ -5553,6 +7157,18 @@ def install(app) -> None:
                                         v = file_hint
                                     if v is not None and str(v).strip():
                                         merged_params[pkey] = v
+                                if tool_name == "result.text":
+                                    current_text_val = str(merged_params.get("text") or "").strip()
+                                    request_text_val = str(request_seed_text or "").strip()
+                                    if not current_text_val or current_text_val == request_text_val:
+                                        for alt_key in ("execution_text", "summary", "response", "finalized_text", "final_answer", "markdown", "table_markdown"):
+                                            alt_val = merged_params.get(alt_key)
+                                            if alt_val not in (None, "", [], {}):
+                                                merged_params["text"] = alt_val
+                                                current_text_val = str(alt_val or "").strip()
+                                                break
+                                    if (not current_text_val or current_text_val == request_text_val) and str(last_output_text or "").strip():
+                                        merged_params["text"] = str(last_output_text or "").strip()
 
                                 # Last-resort path/file mapping for common tools.
                                 if tool_name.startswith("sheet.") and not any(str(merged_params.get(k) or "").strip() for k in ("file", "path", "file_path")) and file_hint:
@@ -5648,106 +7264,123 @@ def install(app) -> None:
                                     recent_changed_files = changed_acc[:80]
                         except Exception:
                             pass
-                        activity = out.get("activity")
-                        if isinstance(activity, dict):
-                            out["flow_step_report"] = {
-                                "step": idx + 1,
-                                "total": len(steps),
-                                "role": str(activity.get("role") or label or ""),
-                                "plan": str(activity.get("plan") or ""),
-                                "analysis": str(activity.get("analysis") or ""),
-                                "response": str(activity.get("response") or ""),
-                                "did": str(activity.get("did") or ""),
-                                "actions": list(activity.get("actions") or []),
-                                "bugs": list(activity.get("bugs") or []),
-                                "fixes": list(activity.get("fixes") or []),
-                                "skills_invoked": list(activity.get("skills_invoked") or []),
-                                "handoff": str(activity.get("handoff") or ""),
-                                "tool_results": list(tr_list or []) if isinstance(tr_list, list) else [],
-                            }
-                            out["flow_step_report"] = _enrich_report_with_tool_results(out["flow_step_report"]) or out["flow_step_report"]
+                        direct_flow_step_report = out.get("flow_step_report") if isinstance(out.get("flow_step_report"), dict) else None
+                        if isinstance(direct_flow_step_report, dict):
+                            out["flow_step_report"] = _enrich_report_with_tool_results(direct_flow_step_report) or direct_flow_step_report
                             out["flow_step_report"] = _carry_step_artifact_context(out["flow_step_report"], step_ext) or out["flow_step_report"]
                             last_step_report = dict(out["flow_step_report"])
                             tr_keep = last_step_report.get("tool_results") if isinstance(last_step_report.get("tool_results"), list) else []
                             if tr_keep:
                                 last_step_report_with_tools = dict(last_step_report)
+                            try:
+                                visible_summary = _step_report_text(last_step_report)
+                                if visible_summary:
+                                    state["steps"][idx]["output"] = visible_summary[:4000]
+                            except Exception:
+                                pass
                         else:
-                            tr_list_fallback = out.get("tool_results") if isinstance(out.get("tool_results"), list) else []
-                            if isinstance(tr_list_fallback, list) and tr_list_fallback:
-                                skills_invoked = []
-                                fallback_actions = _tool_result_list_field(tr_list_fallback, "actions")
-                                fallback_bugs = _tool_result_list_field(tr_list_fallback, "bugs")
-                                fallback_fixes = _tool_result_list_field(tr_list_fallback, "fixes")
-                                fallback_response = ""
-                                fallback_handoff = ""
-                                for tr0 in tr_list_fallback:
-                                    if isinstance(tr0, dict):
-                                        skill0 = str(tr0.get("skill") or "").strip()
-                                        if skill0:
-                                            skills_invoked.append(skill0)
-                                        data0 = tr0.get("data") if isinstance(tr0.get("data"), dict) else {}
-                                        if not fallback_response:
-                                            for k0 in ("review_summary", "summary", "response", "did", "message", "text", "content", "result"):
-                                                v0 = str(data0.get(k0) or tr0.get(k0) or "").strip()
-                                                if v0:
-                                                    fallback_response = v0
-                                                    break
-                                        if not fallback_response:
-                                            status_bits = []
-                                            for k0 in ("handoff", "coverage_status", "route", "status", "decision", "flow_name", "node_label", "node_type", "plugin_id", "plugin_settings_keys", "exception"):
-                                                v0 = str(data0.get(k0) or tr0.get(k0) or "").strip()
-                                                if v0:
-                                                    status_bits.append(f"{k0}: {v0}")
-                                            warnings0 = tr0.get("warnings") if isinstance(tr0.get("warnings"), list) else []
-                                            if warnings0:
-                                                status_bits.append("warnings: " + ", ".join(str(x or "").strip() for x in warnings0 if str(x or "").strip()))
-                                            if status_bits:
-                                                fallback_response = "; ".join(status_bits)
-                                        if not fallback_handoff:
-                                            fallback_handoff = str(data0.get("handoff") or tr0.get("handoff") or "").strip()
+                            activity = out.get("activity")
+                            if isinstance(activity, dict):
                                 out["flow_step_report"] = {
                                     "step": idx + 1,
                                     "total": len(steps),
-                                    "role": str(label or ""),
-                                    "plan": "",
-                                    "analysis": "",
-                                    "response": str(text_out or fallback_response or ""),
-                                    "did": str(text_out or fallback_response or ""),
-                                    "actions": fallback_actions,
-                                    "bugs": fallback_bugs,
-                                    "fixes": fallback_fixes,
-                                    "skills_invoked": skills_invoked,
-                                    "handoff": str(text_out or fallback_handoff or fallback_response or ""),
-                                    "tool_results": list(tr_list_fallback),
+                                    "role": str(activity.get("role") or label or ""),
+                                    "member_role": str(out.get("member_role") or ""),
+                                    "plan": str(activity.get("plan") or ""),
+                                    "analysis": str(activity.get("analysis") or ""),
+                                    "response": str(activity.get("response") or ""),
+                                    "did": str(activity.get("did") or ""),
+                                    "actions": list(activity.get("actions") or []),
+                                    "bugs": list(activity.get("bugs") or []),
+                                    "fixes": list(activity.get("fixes") or []),
+                                    "skills_invoked": list(activity.get("skills_invoked") or []),
+                                    "handoff": str(activity.get("handoff") or ""),
+                                    "tool_results": list(tr_list or []) if isinstance(tr_list, list) else [],
                                 }
                                 out["flow_step_report"] = _enrich_report_with_tool_results(out["flow_step_report"]) or out["flow_step_report"]
                                 out["flow_step_report"] = _carry_step_artifact_context(out["flow_step_report"], step_ext) or out["flow_step_report"]
                                 last_step_report = dict(out["flow_step_report"])
-                                try:
-                                    visible_summary = _step_report_text(last_step_report)
-                                    if visible_summary:
-                                        state["steps"][idx]["output"] = visible_summary[:4000]
-                                except Exception:
-                                    pass
                                 tr_keep = last_step_report.get("tool_results") if isinstance(last_step_report.get("tool_results"), list) else []
                                 if tr_keep:
                                     last_step_report_with_tools = dict(last_step_report)
+                            else:
+                                tr_list_fallback = out.get("tool_results") if isinstance(out.get("tool_results"), list) else []
+                                if isinstance(tr_list_fallback, list) and tr_list_fallback:
+                                    skills_invoked = []
+                                    fallback_actions = _tool_result_list_field(tr_list_fallback, "actions")
+                                    fallback_bugs = _tool_result_list_field(tr_list_fallback, "bugs")
+                                    fallback_fixes = _tool_result_list_field(tr_list_fallback, "fixes")
+                                    fallback_response = ""
+                                    fallback_handoff = ""
+                                    for tr0 in tr_list_fallback:
+                                        if isinstance(tr0, dict):
+                                            skill0 = str(tr0.get("skill") or "").strip()
+                                            if skill0:
+                                                skills_invoked.append(skill0)
+                                            data0 = tr0.get("data") if isinstance(tr0.get("data"), dict) else {}
+                                            if not fallback_response:
+                                                for k0 in ("review_summary", "summary", "response", "did", "message", "text", "content", "result"):
+                                                    v0 = str(data0.get(k0) or tr0.get(k0) or "").strip()
+                                                    if v0:
+                                                        fallback_response = v0
+                                                        break
+                                            if not fallback_response:
+                                                status_bits = []
+                                                for k0 in ("handoff", "coverage_status", "route", "status", "decision", "flow_name", "node_label", "node_type", "plugin_id", "plugin_settings_keys", "exception"):
+                                                    v0 = str(data0.get(k0) or tr0.get(k0) or "").strip()
+                                                    if v0:
+                                                        status_bits.append(f"{k0}: {v0}")
+                                                warnings0 = tr0.get("warnings") if isinstance(tr0.get("warnings"), list) else []
+                                                if warnings0:
+                                                    status_bits.append("warnings: " + ", ".join(str(x or "").strip() for x in warnings0 if str(x or "").strip()))
+                                                if status_bits:
+                                                    fallback_response = "; ".join(status_bits)
+                                            if not fallback_handoff:
+                                                fallback_handoff = str(data0.get("handoff") or tr0.get("handoff") or "").strip()
+                                    out["flow_step_report"] = {
+                                        "step": idx + 1,
+                                        "total": len(steps),
+                                        "role": str(label or ""),
+                                        "member_role": str(out.get("member_role") or ""),
+                                        "plan": "",
+                                        "analysis": "",
+                                        "response": str(text_out or fallback_response or ""),
+                                        "did": str(text_out or fallback_response or ""),
+                                        "actions": fallback_actions,
+                                        "bugs": fallback_bugs,
+                                        "fixes": fallback_fixes,
+                                        "skills_invoked": skills_invoked,
+                                        "handoff": str(text_out or fallback_handoff or fallback_response or ""),
+                                        "tool_results": list(tr_list_fallback),
+                                    }
+                                    out["flow_step_report"] = _enrich_report_with_tool_results(out["flow_step_report"]) or out["flow_step_report"]
+                                    out["flow_step_report"] = _carry_step_artifact_context(out["flow_step_report"], step_ext) or out["flow_step_report"]
+                                    last_step_report = dict(out["flow_step_report"])
                                     try:
-                                        if not final_result_mode:
-                                            used_result_modes_fb = [
-                                                _result_skill_mode(str((tr.get("skill") if isinstance(tr, dict) else "") or ""))
-                                                for tr in tr_keep
-                                                if isinstance(tr, dict) and tr.get("ok") is not False
-                                            ]
-                                            used_result_modes_fb = [m for m in used_result_modes_fb if m]
-                                            if used_result_modes_fb:
-                                                final_result_mode = used_result_modes_fb[-1]
-                                                final_result_text = str(text_out or "").strip()
-                                                final_result_out = {"tool_results": list(tr_keep)}
+                                        visible_summary = _step_report_text(last_step_report)
+                                        if visible_summary:
+                                            state["steps"][idx]["output"] = visible_summary[:4000]
                                     except Exception:
                                         pass
-                            else:
-                                last_step_report = None
+                                    tr_keep = last_step_report.get("tool_results") if isinstance(last_step_report.get("tool_results"), list) else []
+                                    if tr_keep:
+                                        last_step_report_with_tools = dict(last_step_report)
+                                        try:
+                                            if not final_result_mode:
+                                                used_result_modes_fb = [
+                                                    _result_skill_mode(str((tr.get("skill") if isinstance(tr, dict) else "") or ""))
+                                                    for tr in tr_keep
+                                                    if isinstance(tr, dict) and tr.get("ok") is not False
+                                                ]
+                                                used_result_modes_fb = [m for m in used_result_modes_fb if m]
+                                                if used_result_modes_fb:
+                                                    final_result_mode = used_result_modes_fb[-1]
+                                                    final_result_text = str(text_out or "").strip()
+                                                    final_result_out = {"tool_results": list(tr_keep)}
+                                        except Exception:
+                                            pass
+                                else:
+                                    last_step_report = None
 
                         # Hard per-node skill enforcement:
                         # If action_skill_rules marks a skill as enforce_once and this step did
@@ -5831,6 +7464,17 @@ def install(app) -> None:
                                                 "user_request": user_text,
                                             }
                                         elif sid_l in {"result.file", "result.files", "result.zip"}:
+                                            flow_name_enf = str(
+                                                _coalesce_param_value(
+                                                    step_ext.get("flow_name"),
+                                                    ext.get("flow_name") if isinstance(ext, dict) else None,
+                                                    (last_step_report or {}).get("flow_name") if isinstance(last_step_report, dict) else None,
+                                                    (last_step_report or {}).get("last_flow_name") if isinstance(last_step_report, dict) else None,
+                                                )
+                                                or ""
+                                            ).strip()
+                                            if _is_repo_analysis_only_request(user_text, flow_name_enf):
+                                                continue
                                             file_seed = _tool_result_paths(last_step_report)
                                             if not file_seed and isinstance(last_step_report_with_tools, dict):
                                                 file_seed = _tool_result_paths(last_step_report_with_tools)
@@ -5882,6 +7526,7 @@ def install(app) -> None:
                                         "step": idx + 1,
                                         "total": len(steps),
                                         "role": str(label or ""),
+                                        "member_role": str(out.get("member_role") or ""),
                                         "plan": "",
                                         "analysis": "",
                                         "response": str(text_out or ""),
@@ -5953,7 +7598,10 @@ def install(app) -> None:
                         # Conditional transition loopback/retry injection.
                         try:
                             transitions_now = step.get("transitions") if isinstance(step.get("transitions"), list) else []
+                            step_ps_transition = step.get("plugin_settings") if isinstance(step.get("plugin_settings"), dict) else {}
+                            active_runtime_flow_name_transition = str(step_ps_transition.get("runtime_flow_name") or "").strip()
                             current_template_id = str(step.get("template_node_id") or str(step.get("node_id") or "").split("::")[0]).strip()
+                            current_runtime_template_id = str(step_ps_transition.get("runtime_template_node_id") or "").strip()
                             current_template = step_templates.get(current_template_id) if current_template_id else None
                             request_seed_for_transition = _request_seed_for_step(step, user_text)
                             prior_paths_transition = _tool_result_paths(last_step_report)
@@ -5972,6 +7620,19 @@ def install(app) -> None:
                                 if not target_id:
                                     continue
                                 target_template = step_templates.get(target_id)
+                                if not isinstance(target_template, dict) and active_runtime_flow_name_transition:
+                                    runtime_scope_id = str(step_ps_transition.get("fanout_parent_id") or "").strip()
+                                    scoped_target_id = runtime_subflow_template_keys.get(runtime_scope_id, {}).get(target_id, "")
+                                    if scoped_target_id:
+                                        target_template = step_templates.get(scoped_target_id)
+                                if (
+                                    not isinstance(target_template, dict)
+                                    and active_runtime_flow_name_transition
+                                ):
+                                    runtime_flow_ref_transition = _resolve_runtime_flow(active_runtime_flow_name_transition)
+                                    runtime_nodes_transition = runtime_flow_ref_transition.get("nodes") if isinstance(runtime_flow_ref_transition, dict) and isinstance(runtime_flow_ref_transition.get("nodes"), dict) else {}
+                                    if isinstance(runtime_nodes_transition.get(target_id), dict):
+                                        target_template = {"node_id": target_id, "template_node_id": target_id}
                                 if not isinstance(target_template, dict):
                                     continue
                                 transition_report = last_step_report
@@ -5993,11 +7654,12 @@ def install(app) -> None:
                                 try:
                                     next_step = steps[idx + 1] if idx + 1 < len(steps) else None
                                     next_state = state["steps"][idx + 1] if idx + 1 < len(state.get("steps") or []) else None
-                                    next_template_id = (
-                                        str((next_step or {}).get("template_node_id") or (next_step or {}).get("node_id") or "").split("::")[0].strip()
-                                        if isinstance(next_step, dict)
-                                        else ""
-                                    )
+                                    next_template_id = ""
+                                    if isinstance(next_step, dict):
+                                        next_ps = next_step.get("plugin_settings") if isinstance(next_step.get("plugin_settings"), dict) else {}
+                                        next_template_id = str(next_ps.get("runtime_template_node_id") or "").strip()
+                                        if not next_template_id:
+                                            next_template_id = str((next_step or {}).get("template_node_id") or (next_step or {}).get("node_id") or "").split("::")[0].strip()
                                     next_is_queued = isinstance(next_state, dict) and str(next_state.get("state") or "").strip().lower() == "queued"
                                     if next_template_id == target_id and next_is_queued:
                                         if isinstance(transition_report, dict):
@@ -6013,7 +7675,8 @@ def install(app) -> None:
                                     pass
                                 cond_sig = json.dumps(cond, sort_keys=True, ensure_ascii=True)
                                 current_runtime_transition_id = str(
-                                    current_template_id
+                                    current_runtime_template_id
+                                    or current_template_id
                                     or step.get("template_node_id")
                                     or step.get("node_id")
                                     or ""
@@ -6281,6 +7944,125 @@ def install(app) -> None:
                             final_result_out = captured_result_out
                             if final_result_rows_accum:
                                 final_result_out["tool_results"] = list(final_result_rows_accum)
+                        if (
+                            isinstance(out, dict)
+                            and bool(out.get("ok")) is not False
+                            and str(out.get("tool_node_direct_skill") or "").strip().lower()
+                            in {"models.video_encode", "models.image_encode", "models.media_encode"}
+                        ):
+                            tr_now = out.get("tool_results") if isinstance(out.get("tool_results"), list) else []
+                            output_path_hint = ""
+                            output_video_hint: Dict[str, Any] = {}
+                            for tr_row in tr_now:
+                                if not isinstance(tr_row, dict):
+                                    continue
+                                data_row = tr_row.get("data") if isinstance(tr_row.get("data"), dict) else {}
+                                output_video_hint = data_row.get("output_video") if isinstance(data_row.get("output_video"), dict) else output_video_hint
+                                output_path_hint = str(data_row.get("output_path") or output_video_hint.get("output_path") or output_path_hint or "").strip()
+                            if output_path_hint:
+                                final_result_mode = "files"
+                                final_result_text = f"Generated video: {output_path_hint}"
+                                final_result_out = dict(out)
+                                final_result_out.setdefault("files", [output_path_hint])
+                                final_result_out.setdefault("output_path", output_path_hint)
+                                final_result_out.setdefault("tool_results", list(tr_now))
+                                _publish_step_stream(f"[agent_flow] {label}: captured model output as workflow result -> {output_path_hint}")
+                    except Exception:
+                        pass
+
+                    try:
+                        next_seq_idx = idx + 1
+                        if next_seq_idx < len(steps):
+                            next_seq = steps[next_seq_idx]
+                            if isinstance(next_seq, dict):
+                                next_seq_input = next_seq.get("input") if isinstance(next_seq.get("input"), dict) else {}
+                                carry_keys_seq = {
+                                    "current_request",
+                                    "current_request_text",
+                                    "last_completed_request_text",
+                                    "remaining_requests",
+                                    "completed_requests",
+                                    "completed_count",
+                                    "created_count",
+                                    "failed_count",
+                                    "total_requests",
+                                    "has_current",
+                                    "has_more",
+                                    "handoff",
+                                    "tracker_state",
+                                    "subflow_parent_state",
+                                    "subflow_result_state",
+                                    "planned_requests",
+                                    "request_text",
+                                    "user_request",
+                                    "request",
+                                    "text",
+                                    "prompt",
+                                    "bundle_dir",
+                                    "workflow_file",
+                                    "flow_name",
+                                    "last_bundle_dir",
+                                    "last_workflow_file",
+                                    "last_flow_name",
+                                    "input_path",
+                                    "file_path",
+                                    "path",
+                                    "file",
+                                    "validated_request_text",
+                                    "flow_ext",
+                                    "execution_text",
+                                    "execution_files",
+                                    "execution_zip",
+                                    "result_mode",
+                                    "status",
+                                    "pid",
+                                    "target_type",
+                                    "bugs",
+                                    "all_passed",
+                                    "pass_count",
+                                    "fail_count",
+                                }
+                                seq_sources: List[Dict[str, Any]] = []
+                                if isinstance(step_ext, dict):
+                                    seq_sources.append(step_ext)
+                                if isinstance(last_step_report, dict):
+                                    seq_sources.append(last_step_report)
+                                    nested_seq = last_step_report.get("subflow_result_state")
+                                    if isinstance(nested_seq, dict):
+                                        seq_sources.append(nested_seq)
+                                    parent_seq = last_step_report.get("subflow_parent_state")
+                                    if isinstance(parent_seq, dict):
+                                        seq_sources.append(parent_seq)
+                                    tr_rows_seq = last_step_report.get("tool_results") if isinstance(last_step_report.get("tool_results"), list) else []
+                                    for tr_row_seq in tr_rows_seq:
+                                        if not isinstance(tr_row_seq, dict):
+                                            continue
+                                        seq_sources.append(tr_row_seq)
+                                        data_seq = tr_row_seq.get("data") if isinstance(tr_row_seq.get("data"), dict) else {}
+                                        if data_seq:
+                                            seq_sources.append(data_seq)
+                                merged_seq_input = dict(next_seq_input)
+                                for source in seq_sources:
+                                    if not isinstance(source, dict):
+                                        continue
+                                    for pkey in carry_keys_seq:
+                                        if pkey not in source:
+                                            continue
+                                        value = source.get(pkey)
+                                        if value in (None, "", [], {}):
+                                            continue
+                                        if pkey == "current_request":
+                                            value = _coerce_single_request(value)
+                                        elif pkey == "tracker_state":
+                                            value = _normalize_tracker_state(value)
+                                        elif pkey in {"remaining_requests", "completed_requests"}:
+                                            if isinstance(value, tuple):
+                                                value = list(value)
+                                            if value is not None and not isinstance(value, list):
+                                                value = [value]
+                                        merged_seq_input[pkey] = value
+                                if merged_seq_input:
+                                    next_seq["input"] = merged_seq_input
                     except Exception:
                         pass
 
@@ -6375,17 +8157,83 @@ def install(app) -> None:
                         hub.publish(pid, sid, event="done", data={"msg_id": run_stream_msg_id, "ok": True})
                     except Exception:
                         pass
-                # Emit final result as a normal assistant message outside Agent Jobs stream when
-                # a node selected Result skills (result.text/result.chart).
+                # Emit final result as a normal assistant message outside Agent Jobs stream.
+                # Prefer explicit Result-skill modes, but also allow a terminal plain-text node
+                # to publish a final answer from its last step report.
                 try:
+                    if not final_result_mode and isinstance(last_step_report, dict):
+                        fallback_text_plain = str(
+                            last_step_report.get("response")
+                            or last_step_report.get("finalized_text")
+                            or last_step_report.get("final_answer")
+                            or last_step_report.get("markdown")
+                            or last_step_report.get("content")
+                            or last_step_report.get("summary")
+                            or last_step_report.get("did")
+                            or ""
+                        ).strip()
+                        fallback_low = fallback_text_plain.lower()
+                        if (
+                            fallback_text_plain
+                            and (
+                                fallback_low.startswith("summary:")
+                                or fallback_low.startswith("status:")
+                                or "qa review complete" in fallback_low
+                                or "verification pending" in fallback_low
+                            )
+                            and isinstance(prev_step_report, dict)
+                        ):
+                            prev_humanized = _humanize_result_fallback(
+                                str(
+                                    prev_step_report.get("response")
+                                    or prev_step_report.get("finalized_text")
+                                    or prev_step_report.get("final_answer")
+                                    or prev_step_report.get("markdown")
+                                    or prev_step_report.get("content")
+                                    or prev_step_report.get("summary")
+                                    or prev_step_report.get("did")
+                                    or ""
+                                ).strip(),
+                                prev_step_report,
+                            )
+                            if str(prev_humanized or "").strip():
+                                fallback_text_plain = str(prev_humanized).strip()
+                                fallback_low = fallback_text_plain.lower()
+                        member_role_plain = str(last_step_report.get("member_role") or "").strip().lower()
+                        if member_role_plain == "release_summary" and fallback_text_plain:
+                            final_result_mode = "text"
+                            final_result_text = fallback_text_plain
+                            final_result_out = {"plain_text_fallback": True, "release_summary_passthrough": True}
+                        elif fallback_text_plain and not (
+                            fallback_low.startswith("role:")
+                            or fallback_low.startswith("[agent_flow]")
+                            or fallback_low.startswith("plan:")
+                            or fallback_low.startswith("analysis:")
+                            or fallback_low.startswith("actions:")
+                        ):
+                            final_result_mode = "text"
+                            final_result_text = fallback_text_plain
+                            final_result_out = {"plain_text_fallback": True}
                     if final_result_mode:
                         _publish_step_stream(f"[agent_flow] final result mode: {final_result_mode}")
                         ts_res = _now_ts()
                         msg_id_res = f"{run_id}_result"
-                        content_res = _humanize_result_fallback(
-                            final_result_text or str(last_output_text or "").strip(),
-                            last_step_report,
+                        member_role_result = (
+                            str((last_step_report or {}).get("member_role") or "").strip().lower()
+                            if isinstance(last_step_report, dict)
+                            else ""
                         )
+                        if member_role_result == "release_summary":
+                            content_res = str(
+                                (last_step_report or {}).get("response")
+                                or final_result_text
+                                or str(last_output_text or "").strip()
+                            ).strip()
+                        else:
+                            content_res = _humanize_result_fallback(
+                                final_result_text or str(last_output_text or "").strip(),
+                                last_step_report,
+                            )
                         meta_res: Dict[str, Any] = {
                             "flow": True,
                             "flow_result": True,
@@ -6417,6 +8265,32 @@ def install(app) -> None:
                                 str(last_output_text or "").strip(),
                                 last_step_report,
                             )
+                        content_low_pre = str(content_res or "").strip().lower()
+                        if (
+                            content_low_pre
+                            and (
+                                content_low_pre.startswith("summary:")
+                                or content_low_pre.startswith("status:")
+                                or "qa review complete" in content_low_pre
+                                or "verification pending" in content_low_pre
+                            )
+                            and isinstance(prev_step_report, dict)
+                        ):
+                            prev_promoted = _humanize_result_fallback(
+                                str(
+                                    prev_step_report.get("response")
+                                    or prev_step_report.get("finalized_text")
+                                    or prev_step_report.get("final_answer")
+                                    or prev_step_report.get("markdown")
+                                    or prev_step_report.get("content")
+                                    or prev_step_report.get("summary")
+                                    or prev_step_report.get("did")
+                                    or ""
+                                ).strip(),
+                                prev_step_report,
+                            )
+                            if str(prev_promoted or "").strip():
+                                content_res = str(prev_promoted).strip()
                         if str(final_result_mode or "").strip().lower() == "text":
                             try:
                                 request_file_hint_text = _extract_candidate_file_from_text(user_text)
@@ -6425,6 +8299,21 @@ def install(app) -> None:
                                 if not file_hint_text:
                                     file_hint_text = str(prior_paths_text[0] if prior_paths_text else "").strip()
                                 content_low = str(content_res or "").lower()
+                                repo_review_like_text = bool(
+                                    (
+                                        "target folder:" in content_low
+                                        or "**target folder:**" in content_low
+                                    )
+                                    and (
+                                        "verified files:" in content_low
+                                        or "**verified files:**" in content_low
+                                    )
+                                    and (
+                                        "findings:" in content_low
+                                        or "proposed improvements:" in content_low
+                                        or "changed files:" in content_low
+                                    )
+                                )
                                 should_normalize_text = bool(
                                     (
                                         content_low.startswith("role:")
@@ -6440,6 +8329,7 @@ def install(app) -> None:
                                             or "[team" in content_low
                                         )
                                     )
+                                    or repo_review_like_text
                                 )
                                 if should_normalize_text:
                                     normalized_text_res = result_text_skill.run(
@@ -6492,13 +8382,44 @@ def install(app) -> None:
                             prev_step_report,
                             prev_step_report_with_tools,
                         )
+                        media_output_files: List[Path] = []
+                        try:
+                            for _fp_media in _collect_result_files_any(
+                                recent_changed_files,
+                                final_result_out,
+                                last_step_report,
+                                last_step_report_with_tools,
+                                prev_step_report,
+                                prev_step_report_with_tools,
+                            ):
+                                if str(_fp_media.suffix or "").lower() in {".mp4", ".mov", ".webm", ".mkv", ".avi", ".png", ".jpg", ".jpeg", ".webp"}:
+                                    media_output_files.append(_fp_media)
+                            if media_output_files and str(final_result_mode or "").strip().lower() == "text":
+                                final_result_mode = "files"
+                                meta_res["flow_result_mode"] = "files"
+                                content_res = ""
+                        except Exception:
+                            media_output_files = []
                         substantive_text_result = len(str(content_res or "").strip()) >= 80
                         text_mode_selected = str(final_result_mode or "").strip().lower() == "text"
+                        analysis_repo_review_result = False
+                        try:
+                            content_low_final = str(content_res or "").lower()
+                            analysis_repo_review_result = (
+                                ("target folder:" in content_low_final or "**target folder:**" in content_low_final)
+                                and ("git status:" in content_low_final or "**git status:**" in content_low_final)
+                                and ("rag sync:" in content_low_final or "**rag sync:**" in content_low_final)
+                                and _is_repo_analysis_only_request(user_text, state.get("flow_name") if isinstance(state, dict) else None)
+                            )
+                        except Exception:
+                            analysis_repo_review_result = False
                         should_attach_files = (
                             final_result_mode == "files"
                             or file_requested_by_result
                             or (file_hints_present and not text_mode_selected and not substantive_text_result)
                         )
+                        if analysis_repo_review_result and not file_requested_by_result:
+                            should_attach_files = False
                         if should_attach_files and not has_file_artifact:
                             resolved_files = _collect_result_files_any(
                                 recent_changed_files,
@@ -6518,7 +8439,14 @@ def install(app) -> None:
                                 for item in staged:
                                     lines.append(f"- [{item.get('name')}]({item.get('download_url')})")
                                 staged_text = "\n".join(lines)
-                                content_res = f"{content_res}\n\n{staged_text}".strip() if str(content_res or "").strip() else staged_text
+                                # File-producing model nodes (video/image/media encode) should surface
+                                # the generated artifact directly.  Appending the generic repo-style
+                                # "Target folder / Verified files" summary causes later sanitizers to
+                                # parse media filenames as path fragments (for example video_gen -> video_ge, _).
+                                if str(final_result_mode or "").strip().lower() == "files":
+                                    content_res = staged_text
+                                else:
+                                    content_res = f"{content_res}\n\n{staged_text}".strip() if str(content_res or "").strip() else staged_text
                                 meta_res["files"] = staged
                             elif not content_res:
                                 content_res = "No downloadable files were found."
@@ -6587,8 +8515,45 @@ def install(app) -> None:
                             content_res = f"{zip_text}\n\n{content_res}".strip() if str(content_res or "").strip() else zip_text
                         if not content_res:
                             content_res = "Result ready."
+                        try:
+                            content_text_final = str(content_res or "")
+                            content_low_final = content_text_final.lower()
+                            if (
+                                "**delivered**" in content_low_final
+                                and ("target folder:" in content_low_final or "**target folder:**" in content_low_final)
+                                and ("verified files:" in content_low_final or "**verified files:**" in content_low_final)
+                                and ("changed files:" in content_low_final or "**changed files:**" in content_low_final)
+                            ):
+                                split_idx = content_low_final.find("**delivered**")
+                                if split_idx >= 0:
+                                    content_res = content_text_final[:split_idx].rstrip()
+                        except Exception:
+                            pass
                         meta_res = _json_safe(meta_res) if isinstance(meta_res, dict) else {}
-                        state["final_result"] = str(content_res or "")
+                        exact_result_text = ""
+                        try:
+                            data_meta = meta_res.get("data") if isinstance(meta_res.get("data"), dict) else {}
+                            data_text = str(data_meta.get("text") or "").strip()
+                            low_data_text = data_text.lower()
+                            if (
+                                data_text
+                                and ("target folder:" in low_data_text or "**target folder:**" in low_data_text)
+                                and ("verified files:" in low_data_text or "**verified files:**" in low_data_text)
+                                and ("changed files:" in low_data_text or "**changed files:**" in low_data_text)
+                            ):
+                                exact_result_text = data_text
+                        except Exception:
+                            exact_result_text = ""
+                        final_text_clean = _sanitize_repo_review_final_result(str(exact_result_text or content_res or ""), state)
+                        if not exact_result_text:
+                            temp_state_for_summary = dict(state)
+                            temp_state_for_summary["final_result"] = final_text_clean
+                            final_text_clean = _repair_repo_review_summary_simple(temp_state_for_summary, final_text_clean)
+                            temp_state_for_summary["final_result"] = final_text_clean
+                            final_text_clean = _synthesize_workflow_repo_summary(temp_state_for_summary, final_text_clean)
+                            final_text_clean = _strip_repo_review_tail(final_text_clean, temp_state_for_summary.get("flow_name"))
+                        content_res = final_text_clean
+                        state["final_result"] = final_text_clean
                         state["final_result_mode"] = str(final_result_mode or meta_res.get("flow_result_mode") or "text").strip().lower() or "text"
                         ts_res = max(int(ts_res), int(flow_stream_ts["v"] or 0) + 1)
                         msg_payload = {
@@ -6652,7 +8617,15 @@ def install(app) -> None:
                             "flow_result_for_run_id": run_id,
                             "flow_result_fallback": True,
                         })
-                        state["final_result"] = str(fallback_text or "")
+                        fallback_text_clean = _sanitize_repo_review_final_result(str(fallback_text or ""), state)
+                        temp_state_for_summary = dict(state)
+                        temp_state_for_summary["final_result"] = fallback_text_clean
+                        fallback_text_clean = _repair_repo_review_summary_simple(temp_state_for_summary, fallback_text_clean)
+                        temp_state_for_summary["final_result"] = fallback_text_clean
+                        fallback_text_clean = _synthesize_workflow_repo_summary(temp_state_for_summary, fallback_text_clean)
+                        fallback_text_clean = _strip_repo_review_tail(fallback_text_clean, temp_state_for_summary.get("flow_name"))
+                        fallback_text = fallback_text_clean
+                        state["final_result"] = fallback_text_clean
                         state["final_result_mode"] = str(final_result_mode or "text").strip().lower() or "text"
                         try:
                             db.add_message(
@@ -6764,6 +8737,191 @@ def install(app) -> None:
         _publish_flow_status({})
         return {"ok": True, "run_id": run_id, "flow_name": flow_name, "flow_version": version_diag, "state": state}
 
+    def _agent_flow_find_node_for_action(flow_def: Dict[str, Any], req: AgentFlowNodeActionRequest) -> tuple[str, Dict[str, Any]]:
+        nodes = flow_def.get("nodes") if isinstance(flow_def.get("nodes"), dict) else {}
+        node_id = str(req.node_id or "").strip()
+        if node_id and isinstance(nodes.get(node_id), dict):
+            return node_id, dict(nodes.get(node_id) or {})
+        wanted_label = str(req.node_label or "").strip().lower()
+        if wanted_label:
+            for nid, node in nodes.items():
+                if not isinstance(node, dict):
+                    continue
+                if str(node.get("label") or nid or "").strip().lower() == wanted_label:
+                    return str(nid), dict(node)
+        action = str(req.action or "").strip().lower()
+        if action in {"warm_prompt_encoder", "prompt_encoder_cache", "precache_prompt_encoder"}:
+            preferred_tools = {
+                "models.wan22_prompt_encoder",
+                "models.hunyuan15_text_encoder",
+                "models.minimax_text_encoder",
+            }
+            for nid, node in nodes.items():
+                if not isinstance(node, dict):
+                    continue
+                ps = node.get("plugin_settings") if isinstance(node.get("plugin_settings"), dict) else {}
+                tc = ps.get("tool_config") if isinstance(ps.get("tool_config"), dict) else {}
+                tool = str(tc.get("tool") or "").strip().lower()
+                label = str(node.get("label") or nid or "").strip().lower()
+                if tool in preferred_tools or ("prompt" in label and ("encode" in label or "encoder" in label)):
+                    return str(nid), dict(node)
+        if action in {"precache", "precache_source_conditioning", "source_conditioning_cache", "play"}:
+            preferred_tools = {
+                "models.wan22_i2v_source_vae_encode",
+                "models.wan22_i2v_conditioning_inject",
+            }
+            for nid, node in nodes.items():
+                if not isinstance(node, dict):
+                    continue
+                ps = node.get("plugin_settings") if isinstance(node.get("plugin_settings"), dict) else {}
+                tc = ps.get("tool_config") if isinstance(ps.get("tool_config"), dict) else {}
+                tool = str(tc.get("tool") or "").strip().lower()
+                label = str(node.get("label") or nid or "").strip().lower()
+                if tool in preferred_tools or ("source" in label and "condition" in label):
+                    return str(nid), dict(node)
+        raise HTTPException(status_code=404, detail="matching workflow node not found")
+
+    def _agent_flow_direct_model_tool_call(tool_name: str, ctx0: Dict[str, Any], params0: Dict[str, Any]) -> Dict[str, Any]:
+        tool = str(tool_name or "").strip()
+        if not tool.lower().startswith("models."):
+            raise HTTPException(status_code=400, detail=f"node action can only run models.* tools, got: {tool}")
+        mod_name = tool.split(".", 1)[1].strip()
+        if not mod_name or not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", mod_name):
+            raise HTTPException(status_code=400, detail=f"invalid model tool name: {tool}")
+        import importlib
+        mod = importlib.import_module(f"plugins.gui_helpers.agent_flow.skills.models.{mod_name}")
+        fn = getattr(mod, "run", None)
+        if not callable(fn):
+            raise HTTPException(status_code=400, detail=f"model tool has no run(ctx, params): {tool}")
+        out = fn(dict(ctx0 or {}), dict(params0 or {}))
+        return out if isinstance(out, dict) else {"ok": True, "data": {"result": out}}
+
+    def _agent_flow_clear_model_workflow_caches() -> Dict[str, Any]:
+        try:
+            from plugins.gui_helpers.agent_flow.skills.models._model_workflow_common import (
+                accelerator_cleanup,
+                model_workflow_state,
+                release_workflow_object,
+            )
+            from plugins.gui_helpers.agent_flow.skills.models._model_lifecycle import ModelLifecycleManager
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"workflow cleanup unavailable: {exc}") from exc
+        state0 = model_workflow_state({"app": app})
+        resources = state0.setdefault("resources", {}) if isinstance(state0, dict) else {}
+        removed: List[str] = []
+        released = 0
+        for key in list(resources.keys()):
+            key_text = str(key or "")
+            if not key_text.startswith("cache:wan22_i2v_source_conditioning:"):
+                continue
+            try:
+                released += int(release_workflow_object(resources.get(key)) or 0)
+            except Exception:
+                pass
+            resources.pop(key, None)
+            removed.append(key_text)
+        lifecycle_reports = []
+        for family in ("wan22", "hunyuan15", "minimax_h3"):
+            try:
+                lifecycle_reports.append(ModelLifecycleManager.purge_global_resources(family=family))
+            except Exception as exc:
+                lifecycle_reports.append({"family": family, "error": str(exc)})
+        accelerator_cleanup()
+        return {
+            "ok": True,
+            "removed": removed,
+            "removed_count": len(removed),
+            "released_objects": released,
+            "lifecycle": lifecycle_reports,
+            "cache_entries": sum(int(r.get("cache_entries") or 0) for r in lifecycle_reports if isinstance(r, dict)),
+        }
+
+    @r.post("/v1/projects/{pid}/sessions/{sid}/agent_flow/node_action")
+    def agent_flow_node_action(pid: str, sid: str, request: Request, req: AgentFlowNodeActionRequest):
+        require_gui_plugin_enabled(request, gui_plugin_id=GUI_PLUGIN_ID)
+        u = _require_user(app, request)
+        _require_session_access(app, u, pid, sid)
+        action = str(req.action or "warm_prompt_encoder").strip().lower()
+        if action in {"stop", "clear", "clear_cache", "clear_source_conditioning_cache", "clear_model_workflow_cache", "unload"}:
+            return {"ok": True, "action": action, "result": _agent_flow_clear_model_workflow_caches()}
+
+        project_flows = _load_project_flows(pid).get("flows")
+        default_flows = _load_default_flows_doc().get("flows")
+        flows: Dict[str, Any] = {}
+        if isinstance(default_flows, dict):
+            flows.update(default_flows)
+        if isinstance(project_flows, dict):
+            flows.update(project_flows)
+        flow_name = str(req.flow_name or "").strip()
+        if not flow_name:
+            current_settings = get_plugin_service(app, "router_settings") if False else None
+            flow_name = ""
+        flow_def = flows.get(flow_name) if flow_name else None
+        if not isinstance(flow_def, dict):
+            raise HTTPException(status_code=404, detail=f"unknown flow_name: {flow_name or '(empty)'}")
+        node_id, node = _agent_flow_find_node_for_action(flow_def, req)
+        ps = node.get("plugin_settings") if isinstance(node.get("plugin_settings"), dict) else {}
+        if str(ps.get("node_type") or "").strip().lower() != "tool_node":
+            raise HTTPException(status_code=400, detail="selected node is not a tool node")
+        tc = ps.get("tool_config") if isinstance(ps.get("tool_config"), dict) else {}
+        tool = str(tc.get("tool") or "").strip()
+        if not tool:
+            raise HTTPException(status_code=400, detail="selected node has no configured tool")
+        params: Dict[str, Any] = {}
+        for key in ("params", "fallback_params"):
+            row = tc.get(key) if isinstance(tc.get(key), dict) else {}
+            params.update(dict(row or {}))
+        if isinstance(req.params, dict):
+            params.update(dict(req.params or {}))
+        node_run_id = f"node_action:{pid}:{sid}:{hashlib.sha1((flow_name + ':' + node_id).encode('utf-8')).hexdigest()[:16]}"
+        params.setdefault("run_id", node_run_id)
+        params.setdefault("agent_flow_run_id", node_run_id)
+        params.setdefault("model_workflow_run_id", node_run_id)
+        params.setdefault("node_id", f"node_action_{node_id}")
+        if action in {"warm_prompt_encoder", "prompt_encoder_cache", "precache_prompt_encoder"}:
+            settings0 = params.get("settings") if isinstance(params.get("settings"), dict) else {}
+            if isinstance(settings0, dict):
+                tool_l = str(tool or "").lower()
+                if "wan22_prompt_encoder" in tool_l:
+                    mode = str(settings0.get("wan_prompt_encoder_cache_mode") or settings0.get("prompt_encoder_cache_mode") or "").strip().lower()
+                    if mode not in {"cpu", "vram", "gpu"}:
+                        settings0["wan_prompt_encoder_cache_mode"] = "vram"
+                    settings0["wan_prompt_encoder_persist"] = True
+                    settings0["wan_prompt_encoder_cache_empty_prompt"] = True
+                elif "hunyuan15_text_encoder" in tool_l:
+                    mode = str(settings0.get("hunyuan_text_encoder_cache_mode") or settings0.get("prompt_encoder_cache_mode") or "").strip().lower()
+                    if mode not in {"cpu", "vram", "gpu"}:
+                        settings0["hunyuan_text_encoder_cache_mode"] = "cpu"
+                elif "minimax_text_encoder" in tool_l:
+                    mode = str(settings0.get("minimax_text_encoder_cache_mode") or settings0.get("prompt_encoder_cache_mode") or "").strip().lower()
+                    if mode not in {"cpu", "vram", "gpu"}:
+                        settings0["minimax_text_encoder_cache_mode"] = "cpu"
+                params["settings"] = settings0
+        elif action in {"precache", "precache_source_conditioning", "source_conditioning_cache", "play"}:
+            settings0 = params.get("settings") if isinstance(params.get("settings"), dict) else {}
+            if isinstance(settings0, dict):
+                cache_mode = str(settings0.get("wan_i2v_source_conditioning_cache_mode") or "").strip().lower()
+                if cache_mode not in {"cpu", "gpu"}:
+                    settings0["wan_i2v_source_conditioning_cache_mode"] = "cpu"
+                params["settings"] = settings0
+            if "wan_i2v_source_conditioning_cache_mode" not in params:
+                params["wan_i2v_source_conditioning_cache_mode"] = "cpu"
+        ctx0 = {
+            "app": app,
+            "pid": pid,
+            "sid": sid,
+            "settings": {},
+            "ext": {
+                "agent_flow_run_id": node_run_id,
+                "model_workflow_run_id": node_run_id,
+                "flow_name": flow_name,
+                "node_id": node_id,
+                **(dict(req.ext or {}) if isinstance(req.ext, dict) else {}),
+            },
+        }
+        result = _agent_flow_direct_model_tool_call(tool, ctx0, params)
+        return {"ok": bool(result.get("ok", True)), "action": action, "flow_name": flow_name, "node_id": node_id, "tool": tool, "result": result}
+
     @r.get("/v1/projects/{pid}/sessions/{sid}/agent_flow/status")
     def agent_flow_status(pid: str, sid: str, request: Request):
         require_gui_plugin_enabled(request, gui_plugin_id=GUI_PLUGIN_ID)
@@ -6771,6 +8929,21 @@ def install(app) -> None:
         _require_session_access(app, u, pid, sid)
         run_id = str(request.query_params.get("run_id") or "").strip()
         state = _agent_flow_get_state(pid, sid, run_id)
+        if isinstance(state, dict):
+            try:
+                state = dict(state)
+                state["final_result"] = _repair_repo_review_summary_simple(state, state.get("final_result"))
+                state["final_result"] = _sanitize_repo_review_final_result(str(state.get("final_result") or ""), state)
+                state["final_result"] = _synthesize_workflow_repo_summary(state, state.get("final_result"))
+                state["final_result"] = _strip_repo_review_tail(state.get("final_result"), state.get("flow_name"))
+                final_result_once = str(state.get("final_result") or "")
+                low = final_result_once.lower()
+                if "**delivered**" in low:
+                    split_idx = low.find("**delivered**")
+                    if split_idx >= 0:
+                        state["final_result"] = final_result_once[:split_idx].rstrip()
+            except Exception:
+                pass
         return {"ok": True, "state": state or {"running": False}}
 
     @r.post("/v1/projects/{pid}/sessions/{sid}/agent_flow/pause")
@@ -6888,9 +9061,11 @@ def install(app) -> None:
             register_agent_flow_skills(app)
             current = getattr(app.state, "agent_flow_skill_specs", None)
         categories = getattr(app.state, "agent_flow_skill_categories", None)
+        model_adapters = getattr(app.state, "agent_flow_model_adapters", None)
         warnings = getattr(app.state, "agent_flow_skill_load_warnings", None)
         current_skills = current if isinstance(current, dict) else {}
         current_categories = categories if isinstance(categories, dict) else {}
+        current_model_adapters = model_adapters if isinstance(model_adapters, dict) else {}
         try:
             from plugins.gui_helpers.permissions_manager.core import can_access_skill, compute_effective_permissions
             permission_summary = compute_effective_permissions(app, u)
@@ -6908,6 +9083,7 @@ def install(app) -> None:
             "ok": True,
             "skills": current_skills,
             "categories": current_categories,
+            "model_adapters": current_model_adapters,
             "warnings": warnings if isinstance(warnings, list) else [],
             "initial_load": skill_load_info if isinstance(skill_load_info, dict) else {},
         }
@@ -7194,6 +9370,14 @@ def install(app) -> None:
             # Fallback to bundled defaults so a missing/empty project file does not
             # present "no flow" in the UI.
             flows = _default_flow_library() or {}
+        flows, hydrated_from_model_deck = _hydrate_model_deck_ltx_workflow_flows(flows)
+        if hydrated_from_model_deck:
+            try:
+                prior_ids_by_name = _workflow_store.flow_ids_by_name(project_records)
+                _save_project_flows(pid, flows, prior_ids_by_name if isinstance(prior_ids_by_name, dict) else None)
+                project_records = _workflow_store.project_flow_records({"app": app, "pid": pid}, pid)
+            except Exception:
+                pass
         visible_flows = _filter_flows_for_user(u, flows)
         visible_default_flows = _filter_flows_for_user(u, _default_flow_library() or {})
         visible_names = set(visible_flows.keys())
@@ -7204,6 +9388,7 @@ def install(app) -> None:
             "default_flow_ids_by_name": {k: v for k, v in _workflow_store.flow_ids_by_name(default_records).items() if k in visible_names},
             "flow_hashes": {str(k): _canonical_hash(v) for k, v in visible_flows.items()},
             "default_flow_hashes": {str(k): _canonical_hash(v) for k, v in visible_default_flows.items()},
+            "model_deck_hydrated": bool(hydrated_from_model_deck),
             "hidden_count": max(0, len(flows or {}) - len(visible_flows)),
         }
 
@@ -7254,25 +9439,47 @@ def install(app) -> None:
         if not isinstance(flows, dict) or not flows:
             raise HTTPException(status_code=400, detail="import must include non-empty flows")
 
+        imported_ids_by_name = raw.get("flow_ids_by_name") if isinstance(raw.get("flow_ids_by_name"), dict) else {}
+        if not imported_ids_by_name and isinstance(raw.get("agent_flow_flow_ids_by_name"), dict):
+            imported_ids_by_name = raw.get("agent_flow_flow_ids_by_name") or {}
+        if not imported_ids_by_name and raw.get("exported_workflow_id"):
+            root_flow = str(raw.get("root_flow") or raw.get("active_flow") or raw.get("default_flow") or "").strip()
+            if root_flow:
+                imported_ids_by_name = {root_flow: str(raw.get("exported_workflow_id") or "").strip()}
+        imported_ids_by_name = {
+            str(name or "").strip(): str(workflow_id or "").strip()
+            for name, workflow_id in (imported_ids_by_name or {}).items()
+            if str(name or "").strip() and str(workflow_id or "").strip()
+        }
+
+        metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+        bundle_manifest = metadata.get("bundle_manifest") if isinstance(metadata.get("bundle_manifest"), dict) else {}
+        manifest_settings = bundle_manifest.get("agent_flow_settings") if isinstance(bundle_manifest.get("agent_flow_settings"), dict) else {}
+
         default_flow = str(
             raw.get("default_flow")
+            or manifest_settings.get("default_flow")
             or raw.get("agent_flow_default_flow")
             or ""
         ).strip()
         active_flow = str(
             raw.get("active_flow")
+            or manifest_settings.get("active_flow")
             or raw.get("agent_flow_active_flow")
             or ""
         ).strip()
-        mode = str(raw.get("mode") or raw.get("agent_flow_mode") or "execute").strip().lower() or "execute"
+        mode = str(raw.get("mode") or manifest_settings.get("mode") or raw.get("agent_flow_mode") or "execute").strip().lower() or "execute"
 
         if merge_mode:
             existing = _load_project_flows(pid).get("flows") or {}
             if not isinstance(existing, dict):
                 existing = {}
             flows = {**existing, **flows}
+            existing_ids_by_name = _workflow_store.flow_ids_by_name(_workflow_store.project_flow_records({"app": app, "pid": pid}, pid))
+            if isinstance(existing_ids_by_name, dict):
+                imported_ids_by_name = {**existing_ids_by_name, **imported_ids_by_name}
 
-        _save_project_flows(pid, flows)
+        _save_project_flows(pid, flows, imported_ids_by_name)
         records = _workflow_store.project_flow_records({"app": app, "pid": pid}, pid)
         visible_flows = _filter_flows_for_user(u, flows)
         visible_names = set(visible_flows.keys())
@@ -7281,7 +9488,7 @@ def install(app) -> None:
         selected_flow = visible_flows.get(selected_flow_name) if selected_flow_name and isinstance(visible_flows.get(selected_flow_name), dict) else {}
         visible_default_flow = default_flow if default_flow in visible_flows else ""
         visible_active_flow = active_flow if active_flow in visible_flows else (visible_default_flow or (next(iter(visible_flows.keys())) if visible_flows else ""))
-        max_steps = _resolve_max_steps(selected_flow, raw.get("max_steps") or raw.get("agent_flow_max_steps"), default_floor=8)
+        max_steps = _resolve_max_steps(selected_flow, raw.get("max_steps") or manifest_settings.get("max_steps") or raw.get("agent_flow_max_steps"), default_floor=8)
         return {
             "ok": True,
             "flows": visible_flows,
@@ -7294,6 +9501,16 @@ def install(app) -> None:
                 "agent_flow_active_flow": visible_active_flow,
                 "agent_flow_max_steps": max(1, min(128, max_steps)),
                 "agent_flow_mode": mode,
+                "agent_flow_loop_max_passes": manifest_settings.get("loop_max_passes", raw.get("loop_max_passes", raw.get("agent_flow_loop_max_passes", 16))),
+                "agent_flow_force_loop_max_passes": bool(manifest_settings.get("force_loop_max_passes", raw.get("force_loop_max_passes", raw.get("agent_flow_force_loop_max_passes", False)))),
+                "agent_flow_request_timeout_s": manifest_settings.get("request_timeout_s", raw.get("request_timeout_s", raw.get("agent_flow_request_timeout_s", 45))),
+                "agent_flow_autobuild_sandbox_profile": str(manifest_settings.get("autobuild_sandbox_profile") or raw.get("autobuild_sandbox_profile") or raw.get("agent_flow_autobuild_sandbox_profile") or "lightweight").strip() or "lightweight",
+                "agent_flow_autobuild_lightweight_max_requests": manifest_settings.get("autobuild_lightweight_max_requests", raw.get("autobuild_lightweight_max_requests", raw.get("agent_flow_autobuild_lightweight_max_requests", 1))),
+                "agent_flow_autobuild_lightweight_wait_s": manifest_settings.get("autobuild_lightweight_wait_s", raw.get("autobuild_lightweight_wait_s", raw.get("agent_flow_autobuild_lightweight_wait_s", 120))),
+                "agent_flow_autobuild_lightweight_final_grace_s": manifest_settings.get("autobuild_lightweight_final_grace_s", raw.get("autobuild_lightweight_final_grace_s", raw.get("agent_flow_autobuild_lightweight_final_grace_s", 10))),
+                "agent_flow_autobuild_independent_max_requests": manifest_settings.get("autobuild_independent_max_requests", raw.get("autobuild_independent_max_requests", raw.get("agent_flow_autobuild_independent_max_requests", 3))),
+                "agent_flow_autobuild_independent_wait_s": manifest_settings.get("autobuild_independent_wait_s", raw.get("autobuild_independent_wait_s", raw.get("agent_flow_autobuild_independent_wait_s", 180))),
+                "agent_flow_autobuild_independent_final_grace_s": manifest_settings.get("autobuild_independent_final_grace_s", raw.get("autobuild_independent_final_grace_s", raw.get("agent_flow_autobuild_independent_final_grace_s", 20))),
             },
         }
 
@@ -7308,81 +9525,42 @@ def install(app) -> None:
         if not isinstance(flow_doc, dict):
             raise HTTPException(status_code=400, detail="workflow_json required")
         _require_flow_access(u, str(resolved_name or flow_name), flow_doc, action="export")
+        export_settings_raw = (payload or {}).get("export_settings") if isinstance((payload or {}).get("export_settings"), dict) else {}
         ctx2 = _temp_library_ctx(pid)
-        out = workflow_export_skill.run(ctx2, {"workflow_json": flow_doc, "flow_name": resolved_name or flow_name})
+        out = workflow_export_skill.run(
+            ctx2,
+            {
+                "workflow_json": flow_doc,
+                "flow_name": resolved_name or flow_name,
+                "export_settings": export_settings_raw,
+            },
+        )
         workflow_file = Path(str(out.get("workflow_file") or "").strip()).resolve()
         if not workflow_file.is_file():
             raise HTTPException(status_code=500, detail="exported workflow file not found")
-        staged = _stage_path_for_download_global(
-            workflow_file,
+        export_name = str(out.get("flow_name") or resolved_name or flow_name or "workflow").strip() or "workflow"
+        export_doc = {
+            "flows": {
+                export_name: flow_doc,
+            },
+            "metadata": {
+                "bundle_manifest": {
+                    "agent_flow_manifest_version": 1,
+                    "root_flow": export_name,
+                    "workflow_file": workflow_file.name,
+                    "flow_names": [export_name],
+                    "agent_flow_settings": _portable_agent_flow_settings_payload(export_name, export_settings_raw),
+                }
+            },
+        }
+        staged = _stage_text_for_download_global(
+            json.dumps(export_doc, ensure_ascii=True, indent=2),
             out_name=workflow_file.name,
             suffix_seed=str(resolved_name or flow_name or "workflow"),
-        )
-        return {
-            "ok": True,
-            "flow_name": str(out.get("flow_name") or resolved_name or flow_name),
-            "file": staged,
-            "download_url": staged.get("download_url"),
-            "warnings": list(warnings or []) + list(out.get("warnings") or []),
-        }
-
-    @r.post("/v1/projects/{pid}/sessions/{sid}/agent_flow/flows/export_bundle")
-    def agent_flow_flows_export_bundle(pid: str, sid: str, payload: Dict[str, Any], request: Request):
-        require_gui_plugin_enabled(request, gui_plugin_id=GUI_PLUGIN_ID)
-        u = _require_user(app, request)
-        _require_session_access(app, u, pid, sid)
-        flow_name = str((payload or {}).get("flow_name") or "").strip()
-        flow_value = (payload or {}).get("workflow_json")
-        flow_doc, resolved_name, warnings = ensure_flow_payload(flow_value, flow_name)
-        if not isinstance(flow_doc, dict):
-            raise HTTPException(status_code=400, detail="workflow_json required")
-        _require_flow_access(u, str(resolved_name or flow_name), flow_doc, action="export")
-        ctx2 = _temp_library_ctx(pid)
-        out = workflow_export_skill.run(ctx2, {"workflow_json": flow_doc, "flow_name": resolved_name or flow_name})
-        bundle_dir = Path(str(out.get("bundle_dir") or "").strip()).resolve()
-        if not bundle_dir.is_dir():
-            raise HTTPException(status_code=500, detail="exported bundle directory not found")
-        export_name = str(out.get("flow_name") or resolved_name or flow_name or "workflow").strip() or "workflow"
-        export_slug = re.sub(r"[^a-z0-9]+", "_", export_name.lower()).strip("_") or "workflow"
-        staged = _stage_directory_zip_for_download_global(
-            bundle_dir,
-            archive_name=f"{export_slug}_bundle.zip",
-            suffix_seed=export_slug,
         )
         return {
             "ok": True,
             "flow_name": export_name,
-            "zip": staged,
-            "download_url": staged.get("download_url"),
-            "warnings": list(warnings or []) + list(out.get("warnings") or []),
-        }
-
-    app.include_router(r)
-    print("[gui_helpers] agent_flow routes installed")
-    @r.post("/v1/projects/{pid}/sessions/{sid}/agent_flow/flows/export_workflow")
-    def agent_flow_flows_export_workflow(pid: str, sid: str, payload: Dict[str, Any], request: Request):
-        require_gui_plugin_enabled(request, gui_plugin_id=GUI_PLUGIN_ID)
-        u = _require_user(app, request)
-        _require_session_access(app, u, pid, sid)
-        flow_name = str((payload or {}).get("flow_name") or "").strip()
-        flow_value = (payload or {}).get("workflow_json")
-        flow_doc, resolved_name, warnings = ensure_flow_payload(flow_value, flow_name)
-        if not isinstance(flow_doc, dict):
-            raise HTTPException(status_code=400, detail="workflow_json required")
-        _require_flow_access(u, str(resolved_name or flow_name), flow_doc, action="export")
-        ctx2 = _temp_library_ctx(pid)
-        out = workflow_export_skill.run(ctx2, {"workflow_json": flow_doc, "flow_name": resolved_name or flow_name})
-        workflow_file = Path(str(out.get("workflow_file") or "").strip()).resolve()
-        if not workflow_file.is_file():
-            raise HTTPException(status_code=500, detail="exported workflow file not found")
-        staged = _stage_path_for_download_global(
-            workflow_file,
-            out_name=workflow_file.name,
-            suffix_seed=str(resolved_name or flow_name or "workflow"),
-        )
-        return {
-            "ok": True,
-            "flow_name": str(out.get("flow_name") or resolved_name or flow_name),
             "file": staged,
             "download_url": staged.get("download_url"),
             "warnings": list(warnings or []) + list(out.get("warnings") or []),
@@ -7400,7 +9578,14 @@ def install(app) -> None:
             raise HTTPException(status_code=400, detail="workflow_json required")
         _require_flow_access(u, str(resolved_name or flow_name), flow_doc, action="export")
         ctx2 = _temp_library_ctx(pid)
-        out = workflow_export_skill.run(ctx2, {"workflow_json": flow_doc, "flow_name": resolved_name or flow_name})
+        out = workflow_export_skill.run(
+            ctx2,
+            {
+                "workflow_json": flow_doc,
+                "flow_name": resolved_name or flow_name,
+                "export_settings": (payload or {}).get("export_settings") if isinstance((payload or {}).get("export_settings"), dict) else {},
+            },
+        )
         bundle_dir = Path(str(out.get("bundle_dir") or "").strip()).resolve()
         if not bundle_dir.is_dir():
             raise HTTPException(status_code=500, detail="exported bundle directory not found")

@@ -543,7 +543,20 @@ function syncDraftFromProfile(profile) {
 }
 
 async function api(ctx, path, options = {}) {
-  return ctx.apiJson(path, options);
+  const appState = (ctx?.getState?.() || ctx?.state || {});
+  const auth = appState?.auth || {};
+  const ui = appState?.ui || {};
+  const baseHeaders = {
+    "X-Gui-Enabled-Plugins": "collab_chat,setup_wizard,model_deck,llama_server_manager",
+  };
+  if (auth?.token) baseHeaders.Authorization = `Bearer ${auth.token}`;
+  if (auth?.alias) baseHeaders["X-User-Alias"] = auth.alias;
+  if (ui?.activePid) baseHeaders["X-Project-Id"] = ui.activePid;
+  if (ui?.activeSid) baseHeaders["X-Session-Id"] = ui.activeSid;
+  return ctx.apiJson(path, {
+    ...options,
+    headers: { ...baseHeaders, ...(options.headers || {}) },
+  });
 }
 
 function currentBootstrapKey(ctx) {

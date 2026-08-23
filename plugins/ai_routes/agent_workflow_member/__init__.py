@@ -193,10 +193,19 @@ class AgentWorkflowMemberRoute(BaseRoute):
         return ""
 
     def _extract_target_path(self, user_text: str) -> str:
-        m = re.search(r"([A-Za-z0-9_./\\-]+\.(?:py|js|ts|tsx|jsx|json|md|html|css))", str(user_text or ""))
-        if not m:
+        raw = str(user_text or "")
+        if not raw.strip():
             return ""
-        return str(m.group(1) or "").strip().replace("\\", "/")
+        explicit_patterns = [
+            r"\b(?:file|path|target file|repo file)\s+[`'\"]?([A-Za-z0-9_./\\-]+\.(?:py|js|ts|tsx|jsx|json|md|html|css|rs|toml|ya?ml|ini|cfg))[`'\"]?",
+            r"[`'\"]([A-Za-z0-9_./\\-]+\.(?:py|js|ts|tsx|jsx|json|md|html|css|rs|toml|ya?ml|ini|cfg))[`'\"]",
+        ]
+        for pattern in explicit_patterns:
+            m = re.search(pattern, raw, flags=re.IGNORECASE)
+            if not m:
+                continue
+            return str(m.group(1) or "").strip().replace("\\", "/")
+        return ""
 
     def _tool_error_codes(self, row: Dict[str, Any]) -> List[str]:
         if not isinstance(row, dict):
@@ -277,9 +286,43 @@ class AgentWorkflowMemberRoute(BaseRoute):
     def _infer_repo_probe_path(self, user_text: str) -> str:
         raw = str(user_text or "")
         low = raw.lower()
+        ignored_literals = {
+            "node.js",
+            "nodejs",
+            "express",
+            "flask",
+            "rust",
+            "c#",
+            ".net",
+            "dotnet",
+        }
+        # Prefer exact user-named repo folder literals before any generic plugin probing.
+        exact_folder_patterns = [
+            r"\brepo folder\s+([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*)\b",
+            r"\bfolder\s+([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*)\b",
+            r"\bin the repo folder\s+([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*)\b",
+            r"\bcalled\s+([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*)\b",
+        ]
+        for pattern in exact_folder_patterns:
+            m_folder = re.search(pattern, raw, flags=re.IGNORECASE)
+            if not m_folder:
+                continue
+            candidate = str(m_folder.group(1) or "").strip().replace("\\", "/").strip("/")
+            if candidate and candidate.lower() not in ignored_literals and re.match(r"^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*$", candidate):
+                return candidate
         explicit = self._extract_target_path(raw)
         if explicit:
             return explicit
+        for token in re.findall(r"[A-Za-z0-9_.-]+", raw):
+            token_low = token.lower()
+            if (
+                len(token) >= 4
+                and "-" in token
+                and token_low not in ignored_literals
+                and token_low not in {"read-only", "analysis-only"}
+                and not token_low.startswith(("http", "www"))
+            ):
+                return token
         codeish: List[str] = []
         for m in re.finditer(r"`([^`]+)`|\"([^\"]+)\"|'([^']+)'", raw):
             val = str(next((g for g in m.groups() if g), "")).strip().replace("\\", "/").strip("/")
@@ -300,7 +343,11 @@ class AgentWorkflowMemberRoute(BaseRoute):
         return ""
 
     def _pick_repo_probe_candidate(self, user_text: str, probe_results: List[Dict[str, Any]]) -> str:
-        terms = [t for t in re.findall(r"[A-Za-z0-9_/-]+", str(user_text or "").lower()) if len(t) >= 2]
+        raw = str(user_text or "")
+        low_user = raw.lower()
+        terms = [t for t in re.findall(r"[A-Za-z0-9_/-]+", low_user) if len(t) >= 2]
+        exact_hint = str(self._infer_repo_probe_path(raw) or "").strip().replace("\\", "/").strip("/").lower()
+        plugin_intent = "plugin" in low_user or "plugins" in low_user
         best_path = ""
         best_score = -1
         for row in probe_results:
@@ -314,11 +361,20 @@ class AgentWorkflowMemberRoute(BaseRoute):
                     continue
                 low = rel.lower()
                 score = 0
-                if "/plugin/" in f"/{low}" or low.startswith("plugin/"):
+                if exact_hint:
+                    if low == exact_hint or low.startswith(exact_hint + "/"):
+                        score += 20
+                    if low.endswith("/" + exact_hint):
+                        score += 12
+                if ("/plugin/" in f"/{low}" or low.startswith("plugin/")) and plugin_intent:
                     score += 2
-                if low.endswith("/plugin.js") or low.endswith("/manifest.json"):
+                elif "/plugin/" in f"/{low}" or low.startswith("plugin/"):
+                    score -= 4
+                if (low.endswith("/plugin.js") or low.endswith("/manifest.json")) and plugin_intent:
                     score += 3
-                if "i18n" in low or "lang" in low or "locale" in low:
+                elif low.endswith("/plugin.js") or low.endswith("/manifest.json"):
+                    score -= 3
+                if ("i18n" in low or "lang" in low or "locale" in low) and plugin_intent:
                     score += 6
                 for term in terms:
                     if term and term in low:
@@ -330,23 +386,149 @@ class AgentWorkflowMemberRoute(BaseRoute):
             return best_path[: -len("/manifest.json")]
         if best_path.lower().endswith("/plugin.js"):
             return best_path[: -len("/plugin.js")]
-        return best_path
+        if exact_hint and (best_score <= 0 or not best_path):
+            return exact_hint
+        return best_path or exact_hint
+
+    def _repo_edit_request_already_satisfied(
+        self,
+        *,
+        summary: str,
+        analysis_text: str,
+        response_text: str,
+        handoff_text: str,
+        actions: List[str],
+        tool_results: List[Dict[str, Any]],
+    ) -> bool:
+        read_rows = [
+            tr for tr in (tool_results or [])
+            if isinstance(tr, dict)
+            and bool(tr.get("ok"))
+            and str(tr.get("skill") or "").strip() == "repo.read"
+        ]
+        if not read_rows:
+            return False
+        combined = "\n".join(
+            [
+                str(summary or "").strip(),
+                str(analysis_text or "").strip(),
+                str(response_text or "").strip(),
+                str(handoff_text or "").strip(),
+                "\n".join(str(a or "").strip() for a in (actions or []) if str(a or "").strip()),
+            ]
+        ).lower()
+        satisfied_markers = [
+            "already implemented",
+            "already present",
+            "already satisfied",
+            "requested improvements are already implemented",
+            "none required",
+            "no files were changed",
+            "changed files: none",
+            "no further action needed",
+        ]
+        return any(marker in combined for marker in satisfied_markers)
+
+    def _repo_probe_read_candidates(self, user_text: str, candidate_probe_path: str, probe_results: List[Dict[str, Any]]) -> List[str]:
+        candidate = str(candidate_probe_path or "").strip().replace("\\", "/").strip("/")
+        if not candidate:
+            return []
+        # If the candidate is already a concrete file path, read it directly.
+        if re.search(r"\.(?:py|js|ts|tsx|jsx|json|md|html|css|rs|toml|ya?ml|ini|cfg|cs|java|go)$", candidate, flags=re.IGNORECASE):
+            return [candidate]
+        raw = str(user_text or "")
+        exact_hint = str(self._infer_repo_probe_path(raw) or "").strip().replace("\\", "/").strip("/")
+        preferred_names: List[str] = []
+        low_user = raw.lower()
+        if "cargo.toml" in low_user:
+            preferred_names.append("cargo.toml")
+        if "package.json" in low_user:
+            preferred_names.append("package.json")
+        if "src/main.rs" in low_user:
+            preferred_names.append("src/main.rs")
+        if "src/main.py" in low_user:
+            preferred_names.append("src/main.py")
+        if "src/index.js" in low_user:
+            preferred_names.append("src/index.js")
+        if "program.cs" in low_user:
+            preferred_names.append("Program.cs")
+        if "main.go" in low_user:
+            preferred_names.append("main.go")
+        repo_files: List[str] = []
+        for row in probe_results:
+            if not isinstance(row, dict):
+                continue
+            data = row.get("data") if isinstance(row.get("data"), dict) else {}
+            files = data.get("files") if isinstance(data.get("files"), list) else []
+            for item in files[:800]:
+                rel = str(item or "").strip().replace("\\", "/").strip("/")
+                if rel:
+                    repo_files.append(rel)
+        seen: set[str] = set()
+        repo_files = [p for p in repo_files if not (p in seen or seen.add(p))]
+        scoped_files = [
+            p for p in repo_files
+            if p == candidate or p.startswith(candidate + "/")
+        ]
+        if exact_hint:
+            scoped_files = [
+                p for p in scoped_files
+                if p == exact_hint or p.startswith(exact_hint + "/")
+            ] or scoped_files
+        if not scoped_files:
+            return []
+        ordered: List[str] = []
+        for name in preferred_names:
+            target = f"{candidate.rstrip('/')}/{name}".strip("/")
+            for p in scoped_files:
+                if p.lower() == target.lower() and p not in ordered:
+                    ordered.append(p)
+        rank_patterns = [
+            r"/cargo\.toml$",
+            r"/package\.json$",
+            r"/src/main\.(rs|py|ts|js)$",
+            r"/src/index\.(ts|js)$",
+            r"/program\.cs$",
+            r"/main\.go$",
+            r"/lib\.(rs|py|ts|js)$",
+            r"\.(rs|py|ts|tsx|js|jsx|cs|go|java|toml|json|ya?ml|ini|cfg|md|html|css)$",
+        ]
+        for pattern in rank_patterns:
+            for p in scoped_files:
+                if p in ordered:
+                    continue
+                if re.search(pattern, "/" + p, flags=re.IGNORECASE):
+                    ordered.append(p)
+        return ordered[:4]
 
     def _resolve_target_repo_root(self, req: Any) -> str:
         ext = getattr(req, "ext", None)
-        if not isinstance(ext, dict):
+        if isinstance(ext, dict):
+            rps = ext.get("router_plugin_settings")
+            if isinstance(rps, dict):
+                aw = rps.get("agent_workflow")
+                if isinstance(aw, dict):
+                    tr = str(aw.get("target_repo_root") or "").strip()
+                    if tr:
+                        return tr
+            tr2 = str(ext.get("agent_workflow_target_repo_root") or "").strip()
+            if tr2:
+                return tr2
+            tr3 = str(ext.get("target_repo_root") or "").strip()
+            if tr3:
+                return tr3
+        user_text = self._extract_user_text(req)
+        original_request = str(self._extract_original_request(user_text) or "").strip()
+        inferred = str(self._infer_repo_probe_path(original_request) or self._infer_repo_probe_path(user_text) or "").strip().replace("\\", "/").strip("/")
+        if not inferred:
             return ""
-        rps = ext.get("router_plugin_settings")
-        if isinstance(rps, dict):
-            aw = rps.get("agent_workflow")
-            if isinstance(aw, dict):
-                tr = str(aw.get("target_repo_root") or "").strip()
-                if tr:
-                    return tr
-        tr2 = str(ext.get("agent_workflow_target_repo_root") or "").strip()
-        if tr2:
-            return tr2
-        return str(ext.get("target_repo_root") or "").strip()
+        if re.search(r"\.(?:py|js|ts|tsx|jsx|json|md|html|css|rs|toml|ya?ml|ini|cfg)$", inferred, flags=re.IGNORECASE):
+            inferred = inferred.rsplit("/", 1)[0] if "/" in inferred else ""
+        if not inferred:
+            return ""
+        if inferred.lower().startswith("data/agent_workflow/repo/"):
+            return inferred
+        return f"data/agent_workflow/repo/{inferred}"
 
     def _extract_original_request(self, user_text: str) -> str:
         raw = str(user_text or "").strip()
@@ -930,38 +1112,98 @@ class AgentWorkflowMemberRoute(BaseRoute):
                     return {"route_id": self.route_id, "ok": False, "error": "canceled"}
                 text = "".join(parts).strip()
             else:
-                if self.core.chat_llm is None:
-                    deck_runner = ModelDeckRunner(
-                        core=self.core,
-                        settings=dict(self.core.settings or {}),
-                        model_type="text_llm",
-                        slot=f"{self.route_id}_chat",
-                        prefer_worker=False,
-                    )
-                    if getattr(deck_runner, "error", None):
-                        return {"route_id": self.route_id, "ok": False, "error": f"chat_model_unavailable:{deck_runner.error}"}
-                    pres = deck_runner.plan(
-                        messages=messages,
-                        params={
-                            "max_new_tokens": max_tokens,
-                            "temperature": temp,
-                            "top_p": 0.95,
-                            "cancel_cb": cancel_cb,
-                        },
-                    )
-                    if not isinstance(pres, dict) or not pres.get("ok"):
-                        return {"route_id": self.route_id, "ok": False, "error": f"model_error:{(pres or {}).get('error') if isinstance(pres, dict) else pres}"}
-                    text = self._extract_text((pres or {}).get("raw", "")).strip()
-                else:
-                    if _is_canceled():
-                        return {"route_id": self.route_id, "ok": False, "error": "canceled"}
-                    resp = self._chat_with_optional_cancel(
-                        messages=messages,
-                        max_tokens=max_tokens,
-                        temp=temp,
-                        cancel_cb=cancel_cb,
-                    )
-                    text = self._extract_text(resp).strip()
+                hidden_stream_parts: List[str] = []
+                hidden_stream_started_at = time.monotonic()
+                hidden_stream_timed_out = False
+                if stream_max_seconds > 0:
+                    try:
+                        if self.core.chat_llm is None:
+                            deck_runner = ModelDeckRunner(
+                                core=self.core,
+                                settings=dict(self.core.settings or {}),
+                                model_type="text_llm",
+                                slot=f"{self.route_id}_chat",
+                                prefer_worker=False,
+                            )
+                            if getattr(deck_runner, "error", None):
+                                return {"route_id": self.route_id, "ok": False, "error": f"chat_model_unavailable:{deck_runner.error}"}
+                            def _on_hidden_piece(piece: str) -> None:
+                                nonlocal hidden_stream_parts
+                                if _is_canceled():
+                                    return
+                                if stream_max_seconds > 0 and (time.monotonic() - hidden_stream_started_at) >= stream_max_seconds:
+                                    return
+                                p = str(piece or "")
+                                if p:
+                                    hidden_stream_parts.append(p)
+                            sres = deck_runner.stream(
+                                messages=messages,
+                                params={
+                                    "max_new_tokens": max_tokens,
+                                    "temperature": temp,
+                                    "top_p": 0.95,
+                                    "token_chunk_size": 1,
+                                    "cancel_cb": cancel_cb,
+                                },
+                                token_cb=_on_hidden_piece,
+                            )
+                            if isinstance(sres, dict) and sres.get("ok"):
+                                raw = str((sres or {}).get("raw") or "").strip()
+                                if raw and not hidden_stream_parts:
+                                    hidden_stream_parts.append(raw)
+                        else:
+                            for piece in self._iter_stream_chat(
+                                messages=messages,
+                                max_tokens=max_tokens,
+                                temp=temp,
+                            ):
+                                if _is_canceled():
+                                    break
+                                if stream_max_seconds > 0 and (time.monotonic() - hidden_stream_started_at) >= stream_max_seconds:
+                                    hidden_stream_timed_out = True
+                                    break
+                                p = str(piece or "")
+                                if p:
+                                    hidden_stream_parts.append(p)
+                        if hidden_stream_timed_out:
+                            self._emit_diag({"member_stream": f"{self._role_display(role)}: hidden stream guard reached ({stream_max_seconds}s); finalizing node"})
+                        text = "".join(hidden_stream_parts).strip()
+                    except Exception:
+                        text = ""
+                if not text:
+                    if self.core.chat_llm is None:
+                        if deck_runner is None:
+                            deck_runner = ModelDeckRunner(
+                                core=self.core,
+                                settings=dict(self.core.settings or {}),
+                                model_type="text_llm",
+                                slot=f"{self.route_id}_chat",
+                                prefer_worker=False,
+                            )
+                        if getattr(deck_runner, "error", None):
+                            return {"route_id": self.route_id, "ok": False, "error": f"chat_model_unavailable:{deck_runner.error}"}
+                        pres = deck_runner.plan(
+                            messages=messages,
+                            params={
+                                "max_new_tokens": max_tokens,
+                                "temperature": temp,
+                                "top_p": 0.95,
+                                "cancel_cb": cancel_cb,
+                            },
+                        )
+                        if not isinstance(pres, dict) or not pres.get("ok"):
+                            return {"route_id": self.route_id, "ok": False, "error": f"model_error:{(pres or {}).get('error') if isinstance(pres, dict) else pres}"}
+                        text = self._extract_text((pres or {}).get("raw", "")).strip()
+                    else:
+                        if _is_canceled():
+                            return {"route_id": self.route_id, "ok": False, "error": "canceled"}
+                        resp = self._chat_with_optional_cancel(
+                            messages=messages,
+                            max_tokens=max_tokens,
+                            temp=temp,
+                            cancel_cb=cancel_cb,
+                        )
+                        text = self._extract_text(resp).strip()
             self._emit_diag({"member_stream": f"{self._role_display(role)}: model response received"})
         except Exception as exc:
             # Fallback to non-streaming chat when stream path is requested but unavailable.
@@ -1075,6 +1317,9 @@ class AgentWorkflowMemberRoute(BaseRoute):
                                         break
                             else:
                                 path_c = str(params_c.get("path") or params_c.get("target") or params_c.get("file_path") or "").strip().replace("\\", "/")
+                            if create_intent and not edit_intent and path_c:
+                                safe_calls.append(c)
+                                continue
                             if path_c:
                                 deferred_repo_paths.append(path_c)
                             dropped += 1
@@ -1233,7 +1478,14 @@ class AgentWorkflowMemberRoute(BaseRoute):
                 recover_results = self._merge_repo_read_chunks(recover_results, allowed_skills, req)
                 if recover_results:
                     tool_results.extend(recover_results)
-        if not tool_results and repo_scope_intent and any(s in allowed_skills for s in ["repo.tree", "repo.read"]):
+        final_summary_role = role in {"release", "release_summary"}
+
+        if (
+            not tool_results
+            and repo_scope_intent
+            and not final_summary_role
+            and any(s in allowed_skills for s in ["repo.tree", "repo.read"])
+        ):
             probe_path = self._infer_repo_probe_path(user_text)
             auto_calls: List[Dict[str, Any]] = []
             if "repo.tree" in allowed_skills:
@@ -1242,13 +1494,17 @@ class AgentWorkflowMemberRoute(BaseRoute):
                 self._emit_diag({"member_stream": f"{self._role_display(role)}: auto repo probe for {probe_path or 'plugin'}"})
                 auto_probe_results = self._run_tool_calls(auto_calls[:1], allowed_skills, req)
                 candidate_probe_path = self._pick_repo_probe_candidate(user_text, auto_probe_results) or probe_path
+                exact_probe_path = str(self._infer_repo_probe_path(user_text) or "").strip().replace("\\", "/").strip("/")
+                candidate_probe_norm = str(candidate_probe_path or "").strip().replace("\\", "/").strip("/")
+                candidate_matches_request = (
+                    not exact_probe_path
+                    or candidate_probe_norm == exact_probe_path
+                    or candidate_probe_norm.startswith(exact_probe_path + "/")
+                )
                 if "repo.read" in allowed_skills and candidate_probe_path:
                     read_calls: List[Dict[str, Any]] = []
-                    if re.search(r"\.(?:py|js|ts|tsx|jsx|json|md|html|css)$", candidate_probe_path, flags=re.IGNORECASE):
-                        read_calls.append({"skill": "repo.read", "params": {"path": candidate_probe_path, "max_chars": 6000}})
-                    else:
-                        read_calls.append({"skill": "repo.read", "params": {"path": f"{candidate_probe_path.rstrip('/')}/plugin.js", "max_chars": 6000}})
-                        read_calls.append({"skill": "repo.read", "params": {"path": f"{candidate_probe_path.rstrip('/')}/manifest.json", "max_chars": 3000}})
+                    for read_path in self._repo_probe_read_candidates(user_text, candidate_probe_path, auto_probe_results):
+                        read_calls.append({"skill": "repo.read", "params": {"path": read_path, "max_chars": 12000}})
                     auto_probe_results.extend(self._run_tool_calls(read_calls[:2], allowed_skills, req))
                 auto_probe_results = self._merge_repo_read_chunks(auto_probe_results, allowed_skills, req)
                 if auto_probe_results:
@@ -1272,10 +1528,32 @@ class AgentWorkflowMemberRoute(BaseRoute):
                             cfv = str(cf or "").strip().replace("\\", "/")
                             if cfv:
                                 changed_write_files.append(cfv)
-                    if not actions:
+                    if not actions and candidate_matches_request:
                         actions = [f"Inspect repo scope: {candidate_probe_path or probe_path or 'plugin'}"]
-                    if not summary:
+                    if not summary and candidate_matches_request:
                         summary = f"Inspected repo scope '{candidate_probe_path or probe_path or 'plugin'}' to locate the requested implementation area."
+
+        already_satisfied_repo_edit = (
+            repo_scope_intent
+            and build_role
+            and write_capable
+            and not write_ok
+            and self._repo_edit_request_already_satisfied(
+                summary=summary,
+                analysis_text=analysis_text,
+                response_text=response_text,
+                handoff_text=handoff_text,
+                actions=actions,
+                tool_results=tool_results,
+            )
+        )
+        if already_satisfied_repo_edit:
+            self._emit_diag({"member_stream": f"{self._role_display(role)}: verified request already satisfied; skipping repo-edit fallback"})
+            write_ok = True
+            if not actions:
+                actions = ["No repo edit required; verified the requested behavior in the exact target file."]
+            if not handoff_text:
+                handoff_text = "Proceed with verification and final summary; no code change was required."
 
         if repo_scope_intent and build_role and write_capable and not write_ok:
             self._emit_diag({"member_stream": f"{self._role_display(role)}: retrying repo-scope execution with stricter tool-call contract"})
@@ -1487,6 +1765,7 @@ class AgentWorkflowMemberRoute(BaseRoute):
             not tool_results
             and "repo.read" in allowed_skills
             and role_for_review in reviewer_roles
+            and not final_summary_role
             and not (create_intent and no_files_written_yet)
         ):
             tgt = self._extract_target_path(user_text)
@@ -1531,6 +1810,24 @@ class AgentWorkflowMemberRoute(BaseRoute):
 
         if not summary:
             summary = text.splitlines()[0].strip() if text else ""
+        if final_summary_role:
+            plan_text = ""
+            analysis_text = ""
+            bug_findings = []
+            fix_plan = []
+            actions = []
+            handoff_text = ""
+        response_low_final = str(response_text or "").strip().lower()
+        final_summary_structured = bool(
+            final_summary_role
+            and response_low_final
+            and "target folder:" in response_low_final
+            and "verified files:" in response_low_final
+        )
+        if final_summary_structured:
+            if summary and summary.lower().startswith("inspected repo scope"):
+                summary = str(response_text or "").splitlines()[0].strip() or summary
+            tool_results = []
         if summary or actions:
             self._emit_diag(
                 {
@@ -1549,7 +1846,11 @@ class AgentWorkflowMemberRoute(BaseRoute):
         skill_calls = [s for s in skill_calls if s]
         activity = {
             "role": self._role_display(role),
-            "did": summary or f"Processed node for role {role}.",
+            "did": (
+                (str(response_text or "").splitlines()[0].strip() if final_summary_structured else "")
+                or summary
+                or f"Processed node for role {role}."
+            ),
             "plan": plan_text,
             "analysis": analysis_text,
             "response": response_text,
@@ -1571,7 +1872,7 @@ class AgentWorkflowMemberRoute(BaseRoute):
         if activity["response"]:
             lines.append(f"response: {activity['response']}")
         lines.append(f"did: {activity['did']}")
-        if activity["actions"]:
+        if activity["actions"] and str(activity["role"] or "").strip().lower() != "release_summary":
             lines.append("actions:")
             for a in activity["actions"]:
                 lines.append(f"- {a}")
@@ -1585,7 +1886,7 @@ class AgentWorkflowMemberRoute(BaseRoute):
                 lines.append(f"- {f}")
         if activity["skills_invoked"]:
             lines.append("skills_invoked: " + ", ".join(activity["skills_invoked"]))
-        if tool_results:
+        if tool_results and str(activity["role"] or "").strip().lower() != "release_summary":
             lines.append("skill_results:")
             for tr in tool_results[:6]:
                 if not isinstance(tr, dict):
@@ -1615,11 +1916,23 @@ class AgentWorkflowMemberRoute(BaseRoute):
                 if warnings0:
                     warn_note = " warnings=" + ",".join(str(x or "") for x in warnings0[:2] if str(x or "").strip())
                 lines.append(f"- {skill}: {'ok' if ok else 'failed'}{note}{warn_note}")
-        if activity["handoff"]:
+        if activity["handoff"] and str(activity["role"] or "").strip().lower() != "release_summary":
             lines.append(f"handoff: {activity['handoff']}")
         report_text = "\n".join(lines).strip()
-        if report_text:
+        structured_response_text = str(activity["response"] or "").strip()
+        structured_response_low = structured_response_text.lower()
+        if (
+            structured_response_text
+            and "target folder:" in structured_response_low
+            and "verified files:" in structured_response_low
+        ):
+            text = structured_response_text
+        elif final_summary_role and structured_response_text:
+            text = str(activity["response"] or "").strip()
+        elif report_text:
             text = report_text
+        if final_summary_structured:
+            text = structured_response_text
         self._emit_diag(
             {
                 "member_stream": f"{self._role_display(role)}: handoff prepared",
@@ -1789,6 +2102,43 @@ class AgentWorkflowMemberRoute(BaseRoute):
                 params["target_repo_root"] = target_repo_root
             if original_request and not str(params.get("request_title") or "").strip():
                 params["request_title"] = original_request
+            original_low = str(original_request or user_text or "").lower()
+            analysis_only_request = bool(
+                re.search(
+                    r"\b(analysis-only|analysis only|read-only|review only|without editing|without modifying|do not edit|do not modify|don't edit|don't modify|do not change|don't change|summarize|propose(?:\s+a)?\s+fix\s+before\s+editing)\b",
+                    original_low,
+                    flags=re.IGNORECASE,
+                )
+            )
+            explicit_no_modify_request = bool(
+                re.search(
+                    r"\b(do not modify|don't modify|do not edit|don't edit|without modifying|without editing|read-only|review only)\b",
+                    original_low,
+                    flags=re.IGNORECASE,
+                )
+            )
+            explicit_edit_request = bool(
+                re.search(
+                    r"\b(create|implement|write|patch|modify|edit|change|update|add|insert|rebind|document|comment)\b",
+                    original_low,
+                    flags=re.IGNORECASE,
+                )
+            )
+            if skill == "git.commit" and ((analysis_only_request and not explicit_edit_request) or explicit_no_modify_request):
+                out.append(
+                    {
+                        "ok": True,
+                        "skill": skill,
+                        "data": {
+                            "root": str(params.get("target_repo_root") or target_repo_root or "").strip(),
+                            "committed": False,
+                            "skipped": True,
+                            "reason": "analysis_only_no_commit",
+                        },
+                        "warnings": [],
+                    }
+                )
+                continue
             if skill not in allowed:
                 out.append({"ok": False, "skill": skill, "error": "skill_not_allowed"})
                 continue

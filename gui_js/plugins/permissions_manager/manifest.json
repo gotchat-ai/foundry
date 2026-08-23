@@ -3,5 +3,6 @@
   "name": "Permissions",
   "kind": "ui",
   "description": "Manage roles, plugin access, and delegated enterprise permissions.",
-  "entry": "plugin.js"
+  "entry": "plugin.js",
+  "category": "Permissions"
 }

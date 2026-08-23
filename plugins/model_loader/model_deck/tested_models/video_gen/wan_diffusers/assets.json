@@ -1,0 +1,16 @@
+{
+  "python_bin": "python",
+  "script_path": "${LLMLOADER2_ROOT}/tools/run_wan_video.py",
+  "_asset_sources": {
+    "model_path": {
+      "type": "huggingface",
+      "repo_id": "Wan-AI/Wan2.1-T2V-1.3B",
+      "url": "https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B"
+    },
+    "video_vae_path": {
+      "type": "huggingface",
+      "repo_id": "Wan-AI/Wan2.1-T2V-1.3B",
+      "url": "https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B"
+    }
+  }
+}
