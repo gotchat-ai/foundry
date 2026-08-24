@@ -99,6 +99,28 @@ Use the matching stop script for your operating system whenever you want to shut
 - macOS: `./stop_setup_wizard.sh`
 - Linux: `./stop_setup_wizard.sh`
 
+## Plugins Packages
+
+Essential Plugins included in this version (15)
+
+- Agent Flow: Workflow designer
+- Agent Workflow: Setting Repo and importing dev workflows
+- AI Jobs: AI requested jobs management
+- Auth Project: Project and session management for users. Remote collab.
+- Chat Style Renderer: Basic rendering of AI assistant output
+- CrispASR Runtime Management: Manage ASR and TTS Speech llm runtime
+- Language: This is the basic language plugin, future plugins can adapt to this structure
+- llama Server Management: Manage LLama server for different GPU or CPU and settings
+- Model Deck: Manage your GGUF llm, for each type of llms
+- Permission Management: Set level of permissions for user
+- Router Status Render: Frontend renderer for worflow status
+- Setup Wizard: In chat first time setup wizard to ensure proper setup
+- Skill Settings: Plugin that list the settings for a skill
+- theme demo: Basic plugin that allows customization of the chat gui interface 
+- Workflow Exchange: Discover workflows and download over the network 
+ 
+
+
 ## Changelog
 
 ### 1.0.3
@@ -106,7 +128,7 @@ Use the matching stop script for your operating system whenever you want to shut
 - File changes
 - Refactored `app.py`
 - Improved video/image LLM support
-- Added workflow capability based on the ComfyUI-GGUF loader, running with an independent node lifecycle
+- Added video/image LLM workflow capability based on the ComfyUI-GGUF loader, running with an independent node lifecycle
 
 ### 1.0.2
 
