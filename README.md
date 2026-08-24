@@ -1,0 +1,115 @@
+# GotChat Foundry Framework Release
+
+GotChat Foundry is the core framework release for running the GotChat local AI application stack. It includes the main app server, setup wizard, plugin runtime, model deck, local model loader support, and bundled framework resources.
+
+Version: `1.0.3`  
+License: Apache 2.0  
+Contributors: thy.nguyen
+
+## Quick Start
+
+Clone or unpack this folder, then run the setup wizard for your operating system.
+
+### Windows
+
+1. Open this folder in File Explorer.
+2. Right-click `start_setup_wizard.ps1`.
+3. Select **Run with PowerShell**.
+4. Follow the setup wizard prompts.
+
+If Windows asks for permission, allow the script to run. The setup wizard prepares the local environment and starts the application services.
+
+To stop the system on Windows:
+
+1. Right-click `stop_setup_wizard.ps1`.
+2. Select **Run with PowerShell**.
+
+### macOS
+
+Open Terminal in this folder and run:
+
+```bash
+chmod +x ./start_setup_wizard.sh
+./start_setup_wizard.sh
+```
+
+To stop the system on macOS:
+
+```bash
+chmod +x ./stop_setup_wizard.sh
+./stop_setup_wizard.sh
+```
+
+### Linux
+
+Open a terminal in this folder and run:
+
+```bash
+chmod +x ./start_setup_wizard.sh
+./start_setup_wizard.sh
+```
+
+To stop the system on Linux:
+
+```bash
+chmod +x ./stop_setup_wizard.sh
+./stop_setup_wizard.sh
+```
+
+## In-Chat Setup Wizard
+
+After the application is running, GotChat also includes an in-chat setup wizard. Use it to confirm that the initial system pieces are working on your PC, including service startup, model deck visibility, model loading, and basic chat/runtime behavior.
+
+This is useful after first install, after moving the app to a new machine, or after adding/updating plugins.
+
+## Example Media
+
+The files below live in `readme_resources/` so the README can use stable relative links on GitHub.
+
+### Workflow Demo
+
+[Watch Workflow Demo](readme_resources/coding_workflow.mp4)
+
+Example workflow of it going into a selected repo and creating the files.
+
+### Model Deck Loaded State
+
+![Model Deck loaded state](readme_resources/model-deck-loaded.png)
+
+This image shows the Model Deck panel with the main text model and default text model loaded, while the multimodal/VLM entry is present but stopped. It is a useful reference for confirming that the model deck plugin is visible and reporting model state correctly.
+
+## Installation Notes
+
+The setup wizard is the recommended first-run path. It helps prepare the environment, checks core runtime expectations, and starts the services needed by the app.
+
+Before running a release update, back up any local data, model configuration, or custom plugins that you need to preserve.
+
+## Requirements
+
+- Windows, macOS, or Linux host
+- Modern web browser for the local app UI
+- Sufficient CPU, RAM, and storage for the selected local models and plugins
+- Compatible backend/runtime components for this release line
+
+## Stopping the System
+
+Use the matching stop script for your operating system whenever you want to shut down the local services cleanly:
+
+- Windows: right-click `stop_setup_wizard.ps1` and select **Run with PowerShell**
+- macOS: `./stop_setup_wizard.sh`
+- Linux: `./stop_setup_wizard.sh`
+
+## Changelog
+
+### 1.0.3
+
+- File changes
+- Refactored `app.py`
+- Improved video/image LLM support
+- Added workflow capability based on the ComfyUI-GGUF loader, running with an independent node lifecycle
+
+### 1.0.2
+
+- Updated README content
+- Added `vllm_backend_2.py`
+- Added a newline after the `import torch` line

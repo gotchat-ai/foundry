@@ -3,7 +3,7 @@
 Name: GotChat Foundry Framework Release
 Contributors: thy.nguyen
 type: framework
-Version: 1.0.0
+Version: 1.0.3
 License: Apache 2.0
 
 Core framework release for the GotChat Foundry platform.
@@ -38,7 +38,12 @@ Model Deck 2
 This framework release should be deployed with compatible backend services, CMS components, and runtime dependencies for the same release line.
 
 == Changelog ==
-= 1.0.0 =
+= 1.0.3 =
+- File changes
+- Refractored app.py
+- improve video/image llm and added workflow capability to it (base on ComfyUI-GGUF loader but running off its own independent node lifecycle) 
+
+= 1.0.2 =
 - Made some changes to readme
 - added vllm_backend_2.py file
 - added a newline after import torch line
