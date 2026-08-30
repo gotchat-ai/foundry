@@ -1156,6 +1156,33 @@ function ensureStyles() {
 .md-scrollbar { position: sticky; bottom: 0; height: 12px; overflow-x: auto; overflow-y: hidden; background: rgba(var(--panel-rgb), 0.85); border-top: 1px solid rgba(var(--ink-rgb), 0.08); }
 .md-scrollbar-inner { height: 1px; }
 .md-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.model-deck-root button,
+.router-modal[data-model-deck-modal="1"] button,
+.mdhf-modal button {
+  border-radius: 999px;
+  padding: 8px 14px;
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--line) 72%);
+  background: color-mix(in srgb, var(--panel) 88%, white 12%);
+  color: var(--ui-ink);
+  font-weight: 600;
+}
+.model-deck-root button.primary,
+.router-modal[data-model-deck-modal="1"] button.primary,
+.mdhf-modal button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-ink, white);
+}
+.model-deck-root button.secondary,
+.router-modal[data-model-deck-modal="1"] button.secondary,
+.mdhf-modal button.secondary {
+  background: color-mix(in srgb, var(--accent) 12%, var(--panel) 88%);
+}
+.model-deck-root button.ghost,
+.router-modal[data-model-deck-modal="1"] button.ghost,
+.mdhf-modal button.ghost {
+  background: transparent;
+}
 .md-action-select { min-width: 140px; }
 .md-inline { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
 .md-muted { color: var(--ui-muted); }
@@ -1190,6 +1217,24 @@ function ensureStyles() {
 }
 .md-collapsible-section > summary + * {
   margin-top: 10px;
+}
+.md-more-section {
+  margin-top: 10px;
+}
+.md-more-section > .field,
+.md-more-section > label.field {
+  margin-top: 10px;
+}
+.md-workflow-picker {
+  display: grid;
+  gap: 8px;
+  min-width: min(100%, 420px);
+}
+.md-workflow-picker-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
 }
 .md-split { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
 .md-mobile-label { display: none; }
@@ -1991,11 +2036,12 @@ function renderDeckPopover(ctx) {
       const entryKey = deckEntryKey(entry);
       const pendingAction = deckPending.get(entryKey);
       const running = isRunning(entry);
-      btn.textContent = running ? "Stop" : "Play";
+      const isWorkflowCached = String(entry.backend_mode || "").toLowerCase() === "workflow";
+      btn.textContent = running ? (isWorkflowCached ? "Release cached worker" : "Stop") : "Play";
       if (pendingAction) {
         btn.disabled = true;
         btn.classList.add("pending");
-        btn.textContent = pendingAction === "start" ? "Loading" : "Stopping";
+        btn.textContent = pendingAction === "start" ? "Loading" : (isWorkflowCached ? "Releasing" : "Stopping");
       }
       btn.addEventListener("click", async (event) => {
         event.stopPropagation();
@@ -2567,7 +2613,8 @@ function renderPanel(container, ctx) {
       let actionBtn = null;
       if (supports && main.persist) {
         const actionKey = getProcessActionKey("main", main.type_id);
-        actionBtn = buildProcessActionButton(loaded ? "Stop" : "Play", actionKey);
+        const label = loaded && String(main.backend_mode || "").toLowerCase() === "workflow" ? "Release cached worker" : (loaded ? "Stop" : "Play");
+        actionBtn = buildProcessActionButton(label, actionKey);
         actionBtn.addEventListener("click", () => void toggleProcess("main", main.type_id, loaded, actionKey));
       }
       addRow(
@@ -2595,7 +2642,8 @@ function renderPanel(container, ctx) {
       let actionBtn = null;
       if (supports && entry.persist) {
         const actionKey = getProcessActionKey("default", entry.type_id);
-        actionBtn = buildProcessActionButton(loaded ? "Stop" : "Play", actionKey);
+        const label = loaded && String(entry.backend_mode || "").toLowerCase() === "workflow" ? "Release cached worker" : (loaded ? "Stop" : "Play");
+        actionBtn = buildProcessActionButton(label, actionKey);
         actionBtn.addEventListener("click", () => void toggleProcess("default", entry.type_id, loaded, actionKey));
       }
       addRow(
@@ -3012,10 +3060,22 @@ function renderPanel(container, ctx) {
     let managedServersLoadedAt = 0;
     let workflowTrainingArtifacts = [];
     let selectedCompatManifestId = String(model?.settings?.model_deck_compat_manifest_id || "").trim();
+    let selectedModelWorkflowFlowName = String(model?.settings?.model_workflow_flow_name || "").trim();
+    let selectedModelWorkflowId = String(model?.settings?.model_workflow_id || model?.settings?.agent_flow_default_workflow_id || "").trim();
+    let attachedModelWorkflowRows = Array.isArray(model?.settings?.model_workflow_attached_flows)
+      ? model.settings.model_workflow_attached_flows.map((row) => ({
+        name: String(row?.name || row?.flow_name || "").trim(),
+        workflow_id: String(row?.workflow_id || row?.id || "").trim(),
+      })).filter((row) => row.name)
+      : [];
     let lastDownloadedHfRepoId = String(model?.settings?.hf_source_repo_id || "").trim();
     let lastDownloadedHfFilename = String(model?.settings?.hf_source_filename || "").trim();
     let hfSearchModeOverride = "";
     let requestCompatRefresh = () => {};
+    let readWorkflowPickerSelection = () => ({
+      name: selectedModelWorkflowFlowName,
+      workflow_id: selectedModelWorkflowId,
+    });
     const workflowTrainingEnabled = isWorkflowTrainingPluginEnabled(ctx);
 
     const modal = createModal(model ? "Edit model" : "Add model");
@@ -3053,10 +3113,100 @@ function renderPanel(container, ctx) {
     const entries = [];
     const entriesByKey = {};
     let searchBtn = null;
+    let hfSearchModeField = null;
     function setAllEntriesDisplay(key, displayValue) {
       for (const entry of entries) {
         if (entry?.key === key && entry?.wrap) entry.wrap.style.display = displayValue;
       }
+    }
+    function isMediaModelType() {
+      return typeId === "image_gen" || typeId === "video_gen";
+    }
+    function setEntryDisplay(key, displayValue) {
+      const entry = entriesByKey[key];
+      if (entry?.wrap) entry.wrap.style.display = displayValue;
+    }
+    function makeMoreSettingsSection(title = "More settings") {
+      const details = document.createElement("details");
+      details.className = "md-card md-collapsible-section md-more-section";
+      details.open = false;
+      details.style.padding = "10px";
+      const summary = document.createElement("summary");
+      summary.textContent = title;
+      details.appendChild(summary);
+      return details;
+    }
+    function moveExistingEntriesIntoSection(section, keys) {
+      if (!section || !Array.isArray(keys)) return 0;
+      let moved = 0;
+      for (const key of keys) {
+        const entry = entriesByKey[key];
+        if (!entry?.wrap || entry.wrap.parentElement === section) continue;
+        section.appendChild(entry.wrap);
+        moved += 1;
+      }
+      if (moved > 0 && !section.parentElement) settingsWrap.appendChild(section);
+      return moved;
+    }
+    function moveMediaEntriesAfterModelBackendIntoMore(section) {
+      if (!section || !isMediaModelType()) return 0;
+      let seenModelBackend = false;
+      let moved = 0;
+      for (const entry of entries) {
+        const key = String(entry?.key || "").trim();
+        if (!key) continue;
+        if (key === "model_backend") {
+          seenModelBackend = true;
+          continue;
+        }
+        if (!seenModelBackend) continue;
+        if (!entry?.wrap || entry.wrap.parentElement === section) continue;
+        section.appendChild(entry.wrap);
+        moved += 1;
+      }
+      if (moved > 0 && !section.parentElement) settingsWrap.appendChild(section);
+      return moved;
+    }
+    function forceHideMediaAdvancedFields() {
+      if (!isMediaModelType()) return;
+      const config = typeId === "image_gen" ? imageRuntimeConfig : (typeId === "video_gen" ? videoRuntimeConfig : null);
+      const keys = new Set([
+        "image_command_mode",
+        "image_template_preset",
+        "video_command_mode",
+        "workflow_loader_mode",
+        "workflow_execution_backend",
+        "comfyui_runtime_root",
+        "comfyui_gguf_vendor_root",
+      ]);
+      if (config) {
+        keys.add(config.templateKey);
+        keys.add(config.assetsKey);
+        keys.add(config.paramsKey);
+        keys.add(config.extraArgsKey);
+      }
+      for (const key of keys) {
+        setAllEntriesDisplay(key, "none");
+      }
+    }
+    function cleanMediaEditorLabel(key, labelText) {
+      const raw = String(labelText || key || "");
+      const keyText = String(key || "");
+      const renamed = {
+        ltx_video_only: "Video-only sampling",
+        use_wan: "Force pipeline",
+        use_wan_vae: "Load VAE subfolder",
+        wan_vae_subfolder: "VAE subfolder",
+        diffusers_pipeline_class: "Pipeline class name",
+        diffusers_transformer_class: "Transformer class name",
+        gguf_path: "GGUF path",
+        image_command_mode: "Execution mode",
+        video_command_mode: "Execution mode",
+      };
+      const base = renamed[keyText] || raw;
+      return isMediaModelType()
+        ? base.replace(/\s*\((?:diffusers|diffusers gguf|gguf_cli|sd_cpp)\)\s*/ig, "").trim()
+        : base;
     }
     function getDeckSearchQuery() {
       const candidates = [
@@ -3936,6 +4086,7 @@ function renderPanel(container, ctx) {
           updateSearchButtonLabel();
         });
         settingsHead.appendChild(searchModeField.wrap);
+        hfSearchModeField = searchModeField;
       }
       searchBtn = document.createElement("button");
       searchBtn.type = "button";
@@ -3963,7 +4114,7 @@ function renderPanel(container, ctx) {
       if (!field || typeof field !== "object") continue;
       const key = String(field.key || "").trim();
       if (!key) continue;
-      const label = String(field.label || key);
+      const label = cleanMediaEditorLabel(key, String(field.label || key));
       const type = String(field.type || "str").toLowerCase();
       const value = model?.settings?.[key];
       let defaultValue = value !== undefined ? value : field.default ?? "";
@@ -4039,6 +4190,130 @@ function renderPanel(container, ctx) {
           mainGpuFormEntry = formEntry;
         }
       }
+    }
+
+    const mediaWorkflowMoreSection = isMediaModelType() ? makeMoreSettingsSection("More settings") : null;
+    const mediaDefaultMoreSection = mediaWorkflowMoreSection;
+    const videoWorkflowMoreKeys = [
+      "workflow_node_lifecycle_policy",
+      "workflow_node_timeout_s",
+      "workflow_node_timeout_seconds",
+      "native_transformer_offload",
+      "native_gguf_execution_mode",
+      "native_lazy_quantized_packed_device",
+      "native_transformer_gpu_slots",
+      "width",
+      "height",
+      "frames",
+      "fps",
+      "video_codec",
+      "steps",
+      "guidance_scale",
+      "cfg_scale",
+      "seed",
+      "negative_prompt",
+    ];
+    const videoDefaultMoreKeys = [
+      "video_template_preset",
+      "video_command_mode",
+      "model_id",
+      "diffusers_pipeline_class",
+      "diffusers_transformer_class",
+      "device",
+      "gpu_selection_mode",
+      "main_gpu",
+      "dtype",
+      "enable_model_cpu_offload",
+      "enable_sequential_cpu_offload",
+      "gguf_path",
+      "width",
+      "height",
+      "frames",
+      "fps",
+      "video_codec",
+      "steps",
+      "guidance_scale",
+      "cfg_scale",
+      "seed",
+      "negative_prompt",
+      "ltx_video_only",
+      "use_wan",
+      "use_wan_vae",
+      "wan_vae_subfolder",
+      "wan_vae_dtype",
+      "gemma_max_tokens",
+      "gemma_max_prompt_tokens",
+      "allow_eager_gemma_gpu",
+      "allow_legacy_eager_gemma_gpu_load",
+    ];
+    const imageDefaultMoreKeys = [
+      "image_template_preset",
+      "image_command_mode",
+      "model_id",
+      "backend",
+      "model_path",
+      "diffusers_pipeline_class",
+      "diffusers_transformer_class",
+      "text_encoder_path",
+      "vae_path",
+      "clip_path",
+      "clip_l_path",
+      "clip_g_path",
+      "t5xxl_path",
+      "t5_path",
+      "gguf_path",
+      "gguf_filename",
+      "use_unet",
+      "sdxl_unet_path",
+      "sdxl_unet_repo",
+      "sdxl_unet_filename",
+      "sdxl_base_model",
+      "sdxl_variant",
+      "sdxl_timestep_spacing",
+      "hf_token",
+      "dtype",
+      "device",
+      "gpu_selection_mode",
+      "main_gpu",
+      "max_sequence_length",
+      "low_cpu_mem_usage",
+      "cli_path",
+      "cli_args",
+      "output_ext",
+      "n_threads",
+      "n_gpu_layers",
+      "sdcpp_kwargs",
+      "timeout_s",
+      "steps",
+      "cfg_scale",
+      "guidance_scale",
+      "width",
+      "height",
+      "sampler",
+      "seed",
+      "negative_prompt",
+    ];
+    const imageWorkflowMoreKeys = [
+      "workflow_node_lifecycle_policy",
+      "workflow_node_timeout_s",
+      "workflow_node_timeout_seconds",
+      "steps",
+      "cfg_scale",
+      "guidance_scale",
+      "width",
+      "height",
+      "sampler",
+      "seed",
+      "negative_prompt",
+    ];
+    if (typeId === "video_gen") {
+      moveMediaEntriesAfterModelBackendIntoMore(mediaWorkflowMoreSection);
+      moveExistingEntriesIntoSection(mediaWorkflowMoreSection, videoWorkflowMoreKeys);
+      moveExistingEntriesIntoSection(mediaDefaultMoreSection, videoDefaultMoreKeys);
+    } else if (typeId === "image_gen") {
+      moveMediaEntriesAfterModelBackendIntoMore(mediaWorkflowMoreSection);
+      moveExistingEntriesIntoSection(mediaWorkflowMoreSection, imageWorkflowMoreKeys);
+      moveExistingEntriesIntoSection(mediaDefaultMoreSection, imageDefaultMoreKeys);
     }
 
     async function applySharedFieldEnhancers() {
@@ -5198,8 +5473,47 @@ function renderPanel(container, ctx) {
       openWorkflowBtn.className = "secondary";
       openWorkflowBtn.textContent = "Open workflow in Agent Flow";
       compatOpenWorkflowBtn = openWorkflowBtn;
+      const workflowPicker = document.createElement("div");
+      workflowPicker.className = "md-workflow-picker";
+      const workflowSelectField = createSelectField(
+        "Default workflow for this model",
+        [{ value: "", label: "No model workflow selected yet" }],
+        selectedModelWorkflowFlowName
+      );
+      const workflowPickerRow = document.createElement("div");
+      workflowPickerRow.className = "md-workflow-picker-row";
+      const workflowRefreshBtn = document.createElement("button");
+      workflowRefreshBtn.type = "button";
+      workflowRefreshBtn.className = "secondary";
+      workflowRefreshBtn.textContent = "Refresh workflows";
+      const workflowCreateBtn = document.createElement("button");
+      workflowCreateBtn.type = "button";
+      workflowCreateBtn.className = "secondary";
+      workflowCreateBtn.textContent = "Create new workflow";
+      const workflowAddExistingBtn = document.createElement("button");
+      workflowAddExistingBtn.type = "button";
+      workflowAddExistingBtn.className = "secondary";
+      workflowAddExistingBtn.textContent = "Add existing workflow";
+      workflowPickerRow.appendChild(workflowRefreshBtn);
+      workflowPickerRow.appendChild(workflowCreateBtn);
+      workflowPickerRow.appendChild(workflowAddExistingBtn);
+      workflowPicker.appendChild(workflowSelectField.wrap);
+      workflowPicker.appendChild(workflowPickerRow);
       const status = document.createElement("div");
       status.className = "field-help";
+      const workflowReadinessDetails = document.createElement("details");
+      workflowReadinessDetails.className = "md-card md-collapsible-section";
+      workflowReadinessDetails.open = true;
+      workflowReadinessDetails.style.padding = "10px";
+      workflowReadinessDetails.style.display = "none";
+      const workflowReadinessSummary = document.createElement("summary");
+      workflowReadinessSummary.textContent = "Workflow readiness";
+      const workflowReadinessBody = document.createElement("div");
+      workflowReadinessBody.style.display = "grid";
+      workflowReadinessBody.style.gap = "6px";
+      workflowReadinessBody.style.marginTop = "10px";
+      workflowReadinessDetails.appendChild(workflowReadinessSummary);
+      workflowReadinessDetails.appendChild(workflowReadinessBody);
       compatDynamicAssetSection = document.createElement("details");
       compatDynamicAssetSection.className = "md-card md-collapsible-section";
       compatDynamicAssetSection.open = false;
@@ -5252,13 +5566,16 @@ function renderPanel(container, ctx) {
       card.appendChild(title);
       card.appendChild(hint);
       card.appendChild(top);
+      card.appendChild(workflowPicker);
       card.appendChild(status);
+      card.appendChild(workflowReadinessDetails);
       card.appendChild(compatDynamicAssetSection);
       card.appendChild(reqDetails);
       settingsWrap.appendChild(card);
 
       let manifests = [];
       let refreshTimer = null;
+      let workflowRows = [];
 
       function isWorkflowCompatManifest(manifest) {
         if (!manifest || typeof manifest !== "object") return false;
@@ -5287,6 +5604,283 @@ function renderPanel(container, ctx) {
         refreshTimer = window.setTimeout(() => { void refreshStatus(); }, 250);
       }
       requestCompatRefresh = scheduleRefresh;
+
+      function currentDeckModelId() {
+        return String(model?.model_id || modelIdField?.input?.value || "").trim();
+      }
+
+      function syncWorkflowPickerVisibility() {
+        const showWorkflow = getModelBackendValue() === "workflow";
+        workflowPicker.style.display = showWorkflow ? "" : "none";
+      }
+
+      function updateWorkflowSelectOptions(rows) {
+        workflowRows = Array.isArray(rows) ? rows : [];
+        const current = String(selectedModelWorkflowFlowName || entriesByKey["model_workflow_flow_name"]?.input?.value || "").trim();
+        const currentId = String(selectedModelWorkflowId || entriesByKey["model_workflow_id"]?.input?.value || entriesByKey["agent_flow_default_workflow_id"]?.input?.value || "").trim();
+        workflowSelectField.input.innerHTML = "";
+        workflowSelectField.input.appendChild(new Option(workflowRows.length ? "Select model workflow..." : "No model workflows found yet", ""));
+        const seen = new Set();
+        const idsByName = new Map();
+        const namesById = new Map();
+        for (const row of workflowRows) {
+          const name = String(row?.name || "").trim();
+          if (!name || seen.has(name)) continue;
+          seen.add(name);
+          const workflowId = String(row?.workflow_id || "").trim();
+          idsByName.set(name, workflowId);
+          if (workflowId) namesById.set(workflowId, name);
+          const opt = new Option(name, name);
+          if (workflowId) opt.dataset.workflowId = workflowId;
+          workflowSelectField.input.appendChild(opt);
+        }
+        attachedModelWorkflowRows = attachedModelWorkflowRows
+          .map((row) => ({
+            name: String(row?.name || "").trim(),
+            workflow_id: String(row?.workflow_id || "").trim(),
+          }))
+          .filter((row) => row.name && (seen.has(row.name) || (row.workflow_id && namesById.has(row.workflow_id))));
+        const resolvedById = currentId ? namesById.get(currentId) || "" : "";
+        const resolvedName = resolvedById || (current && seen.has(current) ? current : "");
+        if (resolvedName) {
+          workflowSelectField.input.value = resolvedName;
+          selectedModelWorkflowFlowName = resolvedName;
+          selectedModelWorkflowId = idsByName.get(resolvedName) || currentId || "";
+          if (entriesByKey["model_workflow_flow_name"]?.input) {
+            entriesByKey["model_workflow_flow_name"].input.value = selectedModelWorkflowFlowName;
+          }
+          if (entriesByKey["model_workflow_id"]?.input) {
+            entriesByKey["model_workflow_id"].input.value = selectedModelWorkflowId;
+          }
+          if (entriesByKey["agent_flow_default_workflow_id"]?.input) {
+            entriesByKey["agent_flow_default_workflow_id"].input.value = selectedModelWorkflowId;
+          }
+        } else if (current || currentId) {
+          selectedModelWorkflowFlowName = "";
+          selectedModelWorkflowId = "";
+          workflowSelectField.input.value = "";
+          if (entriesByKey["model_workflow_flow_name"]?.input) {
+            entriesByKey["model_workflow_flow_name"].input.value = "";
+          }
+          if (entriesByKey["model_workflow_id"]?.input) {
+            entriesByKey["model_workflow_id"].input.value = "";
+          }
+          if (entriesByKey["agent_flow_default_workflow_id"]?.input) {
+            entriesByKey["agent_flow_default_workflow_id"].input.value = "";
+          }
+        }
+      }
+
+      function syncSelectedWorkflowFromPicker() {
+        const pickerValue = String(workflowSelectField.input?.value || "").trim();
+        const opt = workflowSelectField.input?.selectedOptions && workflowSelectField.input.selectedOptions[0];
+        const optWorkflowId = String(opt?.dataset?.workflowId || "").trim();
+        if (pickerValue || optWorkflowId) {
+          selectedModelWorkflowFlowName = pickerValue;
+          selectedModelWorkflowId = optWorkflowId;
+        }
+        if (entriesByKey["model_workflow_flow_name"]?.input) {
+          entriesByKey["model_workflow_flow_name"].input.value = selectedModelWorkflowFlowName;
+        }
+        if (entriesByKey["model_workflow_id"]?.input) {
+          entriesByKey["model_workflow_id"].input.value = selectedModelWorkflowId;
+        }
+        if (entriesByKey["agent_flow_default_workflow_id"]?.input) {
+          entriesByKey["agent_flow_default_workflow_id"].input.value = selectedModelWorkflowId;
+        }
+        return {
+          name: selectedModelWorkflowFlowName,
+          workflow_id: selectedModelWorkflowId,
+        };
+      }
+      readWorkflowPickerSelection = syncSelectedWorkflowFromPicker;
+
+      function renderWorkflowReadiness(payload) {
+        if (getModelBackendValue() !== "workflow") {
+          workflowReadinessDetails.style.display = "none";
+          workflowReadinessBody.innerHTML = "";
+          return;
+        }
+        workflowReadinessDetails.style.display = "";
+        workflowReadinessBody.innerHTML = "";
+        const ready = !!payload?.ready;
+        const statusText = String(payload?.summary || (ready ? "Workflow ready." : "Workflow needs attention."));
+        workflowReadinessSummary.textContent = ready ? "Workflow readiness — ready" : "Workflow readiness — needs attention";
+        const head = document.createElement("div");
+        head.style.fontWeight = "600";
+        head.style.color = ready ? "var(--success, #0f766e)" : "var(--warning, #a16207)";
+        head.textContent = statusText;
+        workflowReadinessBody.appendChild(head);
+        const assets = Array.isArray(payload?.assets) ? payload.assets : [];
+        if (!assets.length) {
+          const empty = document.createElement("div");
+          empty.className = "field-help";
+          empty.textContent = String(payload?.status || "") === "not_selected"
+            ? "Select or create a workflow for this model to check its assets."
+            : "No workflow asset manifest was found. The workflow may still run, but the app cannot pre-check its files yet.";
+          workflowReadinessBody.appendChild(empty);
+          return;
+        }
+        const list = document.createElement("div");
+        list.style.display = "grid";
+        list.style.gap = "5px";
+        for (const row of assets) {
+          const item = document.createElement("div");
+          item.style.border = "1px solid var(--border)";
+          item.style.borderRadius = "10px";
+          item.style.padding = "7px 9px";
+          item.style.background = "var(--panel)";
+          const found = !!row?.exists;
+          const required = !!row?.required;
+          const label = String(row?.label || row?.key || "Asset");
+          const key = String(row?.key || "");
+          const origin = String(row?.origin || "");
+          const source = row?.source && typeof row.source === "object" ? row.source : {};
+          const sourceUrl = String(source?.url || row?.source_url || "");
+          const path = String(row?.expanded_path || row?.value || "");
+          const titleLine = document.createElement("div");
+          titleLine.style.fontWeight = "600";
+          titleLine.textContent = `${found ? "✓" : (required ? "✗" : "–")} ${label}${key ? ` (${key})` : ""}`;
+          const meta = document.createElement("div");
+          meta.className = "field-help";
+          meta.textContent = `${required ? "Required" : "Optional"}${origin ? ` · ${origin}` : ""}${path ? ` · ${path}` : ""}`;
+          item.appendChild(titleLine);
+          item.appendChild(meta);
+          if (!found && sourceUrl) {
+            const sourceLink = document.createElement("a");
+            sourceLink.href = sourceUrl;
+            sourceLink.target = "_blank";
+            sourceLink.rel = "noopener";
+            sourceLink.textContent = "Open asset source";
+            sourceLink.className = "field-help";
+            item.appendChild(sourceLink);
+          }
+          list.appendChild(item);
+        }
+        workflowReadinessBody.appendChild(list);
+      }
+
+      let workflowReadinessTimer = null;
+      function scheduleWorkflowReadinessRefresh() {
+        if (workflowReadinessTimer) window.clearTimeout(workflowReadinessTimer);
+        workflowReadinessTimer = window.setTimeout(() => { void refreshWorkflowReadiness(); }, 350);
+      }
+
+      async function refreshWorkflowReadiness() {
+        if (getModelBackendValue() !== "workflow") {
+          renderWorkflowReadiness(null);
+          return;
+        }
+        const selection = syncSelectedWorkflowFromPicker();
+        try {
+          renderWorkflowReadiness({ ready: false, summary: "Checking selected workflow assets...", assets: [] });
+          const activePid = String(ctx?.state?.ui?.activePid || "default").trim() || "default";
+          const payload = await apiJson(ctx, "/v1/model_deck/model/workflow/readiness", {
+            method: "POST",
+            body: {
+              type_id: typeId,
+              model_id: currentDeckModelId(),
+              pid: activePid,
+              workflow_name: String(selection?.name || ""),
+              workflow_id: String(selection?.workflow_id || ""),
+              manifest_id: selectedManifestId(),
+              settings: snapshotEditorSettings(),
+            },
+            headers: { "X-Gui-Enabled-Plugins": "collab_chat,agent_flow,model_deck,agent_workflow_member" },
+          });
+          renderWorkflowReadiness(payload);
+        } catch (err) {
+          renderWorkflowReadiness({
+            ready: false,
+            summary: String(err?.message || err || "Workflow readiness check failed"),
+            assets: [],
+          });
+        }
+      }
+
+      function flowMatchesMediaType(name, flow) {
+        if (!flow || typeof flow !== "object") return false;
+        const meta = flow.metadata && typeof flow.metadata === "object" ? flow.metadata : {};
+        const deckMeta = meta.model_deck && typeof meta.model_deck === "object" ? meta.model_deck : {};
+        const deckType = String(deckMeta.type_id || "").trim();
+        if (deckType) return deckType === String(typeId || "").trim();
+        const category = String(flow.category || "").trim().toLowerCase();
+        const low = String(name || "").trim().toLowerCase();
+        if (typeId === "image_gen") {
+          return category === "models" && (low.startsWith("models / image /") || low.includes(" image "));
+        }
+        if (typeId === "video_gen") {
+          return category === "models" && low.startsWith("models /") && !low.startsWith("models / image /");
+        }
+        return false;
+      }
+
+      function mergeAttachedWorkflowRows(rows, flows, ids) {
+        const base = Array.isArray(rows) ? rows.slice() : [];
+        const byName = new Map(base.map((row) => [String(row?.name || "").trim(), row]).filter(([name]) => name));
+        attachedModelWorkflowRows = attachedModelWorkflowRows
+          .map((row) => ({ name: String(row?.name || "").trim(), workflow_id: String(row?.workflow_id || "").trim() }))
+          .filter((row) => row.name && flows[row.name] && flowMatchesMediaType(row.name, flows[row.name]));
+        for (const row of attachedModelWorkflowRows) {
+          if (!byName.has(row.name)) {
+            base.push({ name: row.name, workflow_id: row.workflow_id || String(ids?.[row.name] || "") });
+            byName.set(row.name, row);
+          }
+        }
+        return base;
+      }
+
+      async function refreshModelWorkflowList() {
+        if (getModelBackendValue() !== "workflow") {
+          updateWorkflowSelectOptions([]);
+          syncWorkflowPickerVisibility();
+          return;
+        }
+        syncWorkflowPickerVisibility();
+        const activePid = String(ctx?.state?.ui?.activePid || "default").trim() || "default";
+        const activeSid = String(ctx?.state?.ui?.activeSid || "main").trim() || "main";
+        try {
+          workflowRefreshBtn.disabled = true;
+          const payload = await apiJson(ctx, `/v1/projects/${encodeURIComponent(activePid)}/sessions/${encodeURIComponent(activeSid)}/agent_flow/flows`, {
+            headers: { "X-Gui-Enabled-Plugins": "collab_chat,agent_flow,model_deck,agent_workflow_member" },
+          });
+          const flows = payload?.flows && typeof payload.flows === "object" ? payload.flows : {};
+          const ids = payload?.flow_ids_by_name && typeof payload.flow_ids_by_name === "object" ? payload.flow_ids_by_name : {};
+          const rawModelIdText = currentDeckModelId();
+          const modelIdText = rawModelIdText.toLowerCase();
+          const saved = String(selectedModelWorkflowFlowName || "").trim();
+          const legacyOwnedPrefix = modelIdText ? `models / ${modelIdText} /` : "";
+          let rows = Object.keys(flows).filter((name) => {
+            const flow = flows[name] && typeof flows[name] === "object" ? flows[name] : {};
+            const meta = flow.metadata && typeof flow.metadata === "object" ? flow.metadata : {};
+            const deckMeta = meta.model_deck && typeof meta.model_deck === "object" ? meta.model_deck : {};
+            const deckType = String(deckMeta.type_id || "").trim();
+            const deckModel = String(deckMeta.model_id || "").trim();
+            const low = String(name || "").toLowerCase();
+            if (saved && name === saved) return true;
+            if (deckType && deckModel) {
+              return deckType === String(typeId || "").trim() && deckModel === rawModelIdText;
+            }
+            // Older model-owned flows may not have metadata yet, but the
+            // generated name is still exact: Models / <model id> / ...
+            if (legacyOwnedPrefix && low.startsWith(legacyOwnedPrefix)) return true;
+            return false;
+          }).sort((a, b) => a.localeCompare(b)).map((name) => ({ name, workflow_id: ids[name] || "" }));
+          rows = mergeAttachedWorkflowRows(rows, flows, ids).sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")));
+          updateWorkflowSelectOptions(rows);
+          await refreshWorkflowReadiness();
+        } catch (err) {
+          updateWorkflowSelectOptions([]);
+          status.textContent = String(err?.message || err || "Workflow list failed to load");
+          renderWorkflowReadiness({
+            ready: false,
+            summary: String(err?.message || err || "Workflow list failed to load"),
+            assets: [],
+          });
+        } finally {
+          workflowRefreshBtn.disabled = false;
+        }
+      }
 
       function renderStatus(payload) {
         const rawPayload = payload || null;
@@ -5317,6 +5911,7 @@ function renderPanel(container, ctx) {
         applyBtn.disabled = !manifest;
         uninstallAllBtn.disabled = !manifest;
         openWorkflowBtn.disabled = !hasOpenableWorkflowTarget(manifest);
+        syncWorkflowPickerVisibility();
         syncWorkflowModelLoaderVisibility();
         const requirements = Array.isArray(payload?.requirements) ? payload.requirements : [];
         const missingCount = requirements.filter((row) => !row?.installed).length;
@@ -5468,11 +6063,113 @@ function renderPanel(container, ctx) {
         selectedCompatManifestId = selectedManifestId();
         void refreshStatus();
       });
+      workflowSelectField.input.addEventListener("change", () => {
+        syncSelectedWorkflowFromPicker();
+        void refreshWorkflowReadiness();
+      });
+      workflowRefreshBtn.addEventListener("click", () => { void refreshModelWorkflowList(); });
+      workflowAddExistingBtn.addEventListener("click", async () => {
+        const activePid = String(ctx?.state?.ui?.activePid || "default").trim() || "default";
+        const activeSid = String(ctx?.state?.ui?.activeSid || "main").trim() || "main";
+        try {
+          workflowAddExistingBtn.disabled = true;
+          const payload = await apiJson(ctx, `/v1/projects/${encodeURIComponent(activePid)}/sessions/${encodeURIComponent(activeSid)}/agent_flow/flows`, {
+            headers: { "X-Gui-Enabled-Plugins": "collab_chat,agent_flow,model_deck,agent_workflow_member" },
+          });
+          const flows = payload?.flows && typeof payload.flows === "object" ? payload.flows : {};
+          const ids = payload?.flow_ids_by_name && typeof payload.flow_ids_by_name === "object" ? payload.flow_ids_by_name : {};
+          const listed = new Set(workflowRows.map((row) => String(row?.name || "").trim()).filter(Boolean));
+          const candidates = Object.keys(flows)
+            .filter((name) => !listed.has(name) && flowMatchesMediaType(name, flows[name]))
+            .sort((a, b) => a.localeCompare(b))
+            .map((name) => ({ value: name, label: name, workflow_id: String(ids[name] || "") }));
+          if (!candidates.length) {
+            toast(ctx, "No additional compatible workflows found for this model type.", true);
+            return;
+          }
+          const picker = createModal("Add existing workflow");
+          const hint = document.createElement("div");
+          hint.className = "field-help";
+          hint.textContent = "Only existing workflows compatible with this image/video model type are shown. Selecting one attaches it to this model; Save persists the association.";
+          const pickField = createSelectField("Existing workflow", candidates, candidates[0]?.value || "");
+          picker.body.appendChild(hint);
+          picker.body.appendChild(pickField.wrap);
+          const accepted = await picker.open(() => {
+            const name = String(pickField.input.value || "").trim();
+            if (!name) return false;
+            const opt = candidates.find((row) => row.value === name) || null;
+            const workflowId = String(opt?.workflow_id || ids[name] || "").trim();
+            attachedModelWorkflowRows = attachedModelWorkflowRows.filter((row) => String(row?.name || "").trim() !== name);
+            attachedModelWorkflowRows.push({ name, workflow_id: workflowId });
+            selectedModelWorkflowFlowName = name;
+            selectedModelWorkflowId = workflowId;
+            updateWorkflowSelectOptions(mergeAttachedWorkflowRows(workflowRows, flows, ids));
+            workflowSelectField.input.value = name;
+            if (entriesByKey["model_workflow_flow_name"]?.input) entriesByKey["model_workflow_flow_name"].input.value = name;
+            if (entriesByKey["model_workflow_id"]?.input) entriesByKey["model_workflow_id"].input.value = workflowId;
+            return true;
+          });
+          if (accepted) {
+            await refreshWorkflowReadiness();
+            toast(ctx, `Attached workflow ${selectedModelWorkflowFlowName}. Save the model to keep it.`);
+          }
+        } catch (err) {
+          toast(ctx, String(err?.message || err || "Add existing workflow failed"), true);
+        } finally {
+          workflowAddExistingBtn.disabled = false;
+        }
+      });
+      workflowCreateBtn.addEventListener("click", async () => {
+        let manifest = currentStatus?.manifest || null;
+        try {
+          workflowCreateBtn.disabled = true;
+          if (!manifest) {
+            await refreshStatus();
+            manifest = currentStatus?.manifest || null;
+          }
+          if (!manifest?.workflow_json) {
+            toast(ctx, "Select a workflow compatibility profile before creating a model workflow.", true);
+            return;
+          }
+          const activePid = String(ctx?.state?.ui?.activePid || "default").trim() || "default";
+          const editorModelId = currentDeckModelId();
+          if (!editorModelId) {
+            toast(ctx, "Save or enter a Model ID before creating a private workflow.", true);
+            return;
+          }
+          const ensured = await apiJson(ctx, "/v1/model_deck/model/workflow/ensure", {
+            method: "POST",
+            body: {
+              type_id: typeId,
+              model_id: editorModelId,
+              pid: activePid,
+              template_flow_name: String(manifest?.workflow_json?.active_flow || manifest?.workflow_json?.default_flow || manifest?.workflow_json?.flow_name || ""),
+              force_new: true,
+              settings: snapshotEditorSettings(),
+            },
+            headers: { "X-Gui-Enabled-Plugins": "collab_chat,agent_flow,model_deck,agent_workflow_member" },
+          });
+          selectedModelWorkflowFlowName = String(ensured?.flow_name || "");
+          selectedModelWorkflowId = String(ensured?.workflow_id || "");
+          if (entriesByKey["model_workflow_flow_name"]?.input) entriesByKey["model_workflow_flow_name"].input.value = selectedModelWorkflowFlowName;
+          if (entriesByKey["model_workflow_template_flow_name"]?.input) entriesByKey["model_workflow_template_flow_name"].input.value = String(ensured?.template_flow_name || "");
+          await refreshModelWorkflowList();
+          if (selectedModelWorkflowFlowName) workflowSelectField.input.value = selectedModelWorkflowFlowName;
+          await refreshWorkflowReadiness();
+          toast(ctx, `${ensured?.created ? "Created" : "Using"} model workflow ${selectedModelWorkflowFlowName || ""}`.trim());
+        } catch (err) {
+          toast(ctx, String(err?.message || err || "Create workflow failed"), true);
+        } finally {
+          workflowCreateBtn.disabled = false;
+        }
+      });
       if (entriesByKey["model_backend"]?.input && typeof entriesByKey["model_backend"].input.addEventListener === "function") {
         entriesByKey["model_backend"].input.addEventListener("change", () => {
           void (async () => {
             await refreshCatalog();
             await refreshStatus();
+            await refreshModelWorkflowList();
+            await refreshWorkflowReadiness();
           })();
         });
       }
@@ -5506,6 +6203,15 @@ function renderPanel(container, ctx) {
             const msg = "No tested profile is selected or matched yet.";
             status.textContent = msg;
             toast(ctx, msg, true);
+            return;
+          }
+          const selectedFlow = String(workflowSelectField.input.value || selectedModelWorkflowFlowName || "").trim();
+          if (selectedFlow) {
+            const selectedOpt = workflowSelectField.input.selectedOptions && workflowSelectField.input.selectedOptions[0];
+            const opened = await openNamedWorkflowInAgentFlow(selectedFlow, String(selectedOpt?.dataset?.workflowId || selectedModelWorkflowId || ""));
+            status.textContent = opened
+              ? `Opened Agent Flow for ${selectedFlow}.`
+              : `Prepared ${selectedFlow}, but Agent Flow did not open. Open the Agent Flow panel manually and select this workflow.`;
             return;
           }
           if (!(manifest?.workflow_json && Object.keys(manifest.workflow_json || {}).length)) {
@@ -5543,9 +6249,13 @@ function renderPanel(container, ctx) {
           if (entriesByKey["model_workflow_flow_name"]?.input) {
             entriesByKey["model_workflow_flow_name"].input.value = String(ensured?.flow_name || "");
           }
+          selectedModelWorkflowFlowName = String(ensured?.flow_name || "");
+          selectedModelWorkflowId = String(ensured?.workflow_id || "");
           if (entriesByKey["model_workflow_template_flow_name"]?.input) {
             entriesByKey["model_workflow_template_flow_name"].input.value = String(ensured?.template_flow_name || "");
           }
+          await refreshModelWorkflowList();
+          await refreshWorkflowReadiness();
           const opened = await openNamedWorkflowInAgentFlow(String(ensured?.flow_name || ""), String(ensured?.workflow_id || ""));
           status.textContent = opened
             ? `Opened Agent Flow for ${String(ensured?.flow_name || manifest.label || manifest.id || "workflow")}.`
@@ -5600,6 +6310,8 @@ function renderPanel(container, ctx) {
         if (entry?.input && typeof entry.input.addEventListener === "function") {
           entry.input.addEventListener("change", scheduleRefresh);
           entry.input.addEventListener("input", scheduleRefresh);
+          entry.input.addEventListener("change", scheduleWorkflowReadinessRefresh);
+          entry.input.addEventListener("input", scheduleWorkflowReadinessRefresh);
         }
       }
 
@@ -5608,6 +6320,8 @@ function renderPanel(container, ctx) {
         try {
           await refreshCatalog();
           await refreshStatus();
+          await refreshModelWorkflowList();
+          await refreshWorkflowReadiness();
         } catch (err) {
           status.textContent = String(err?.message || err || "Compatibility profile failed to load");
           reqList.innerHTML = "";
@@ -5782,34 +6496,46 @@ function renderPanel(container, ctx) {
     function syncCustomRuntimeModeVisibility(config) {
       if (!config || typeId !== config.typeId) return;
       syncModelBackendCompatibilityFields();
-      const modeEntry = entriesByKey[config.modeKey];
       syncExecutionModeForBackend(config);
-      const modeValue = String(modeEntry?.input?.value || "standard").trim().toLowerCase();
       const showWorkflow = getModelBackendValue() === "workflow";
-      const showCustom = modeValue === "advanced" && !showWorkflow;
-      for (const key of [config.presetKey, config.templateKey, config.assetsKey, config.paramsKey, config.extraArgsKey]) {
+      for (const key of [config.templateKey, config.assetsKey, config.paramsKey, config.extraArgsKey]) {
         const entry = entriesByKey[key];
         if (!entry?.wrap) continue;
-        entry.wrap.style.display = showCustom ? "" : "none";
+        entry.wrap.style.display = "none";
+      }
+      if (entriesByKey[config.presetKey]?.wrap) {
+        entriesByKey[config.presetKey].wrap.style.display = showWorkflow ? "none" : "";
       }
       if (entriesByKey[config.modeKey]?.wrap) {
-        entriesByKey[config.modeKey].wrap.style.display = showWorkflow ? "none" : "";
+        entriesByKey[config.modeKey].wrap.style.display = "none";
       }
       if (compatDynamicAssetSection) {
         const selectedManifest = compatManifestCache.get(String(selectedCompatManifestId || "").trim()) || null;
         const runtimeProfile = selectedManifest?.runtime_profile && typeof selectedManifest.runtime_profile === "object" ? selectedManifest.runtime_profile : null;
         const runtimeKind = String(runtimeProfile?.kind || "").trim().toLowerCase();
-        const showCompatAssets = compatDynamicAssetEntries.length && (runtimeKind === "internal_workflow" || showCustom);
+        const showCompatAssets = compatDynamicAssetEntries.length && runtimeKind === "internal_workflow";
         compatDynamicAssetSection.style.display = showCompatAssets ? "" : "none";
       }
       syncWorkflowModelLoaderVisibility();
+      forceHideMediaAdvancedFields();
     }
 
     function syncWorkflowModelLoaderVisibility() {
       if (typeId !== "image_gen" && typeId !== "video_gen") return;
       syncModelBackendCompatibilityFields();
       const showWorkflow = getModelBackendValue() === "workflow";
+      if (hfSearchModeField?.wrap) hfSearchModeField.wrap.style.display = showWorkflow ? "none" : "";
+      if (searchBtn) searchBtn.style.display = showWorkflow ? "none" : "";
+      if (mediaWorkflowMoreSection) mediaWorkflowMoreSection.style.display = "";
       for (const key of ["workflow_node_lifecycle_policy", "workflow_node_timeout_s"]) {
+        setAllEntriesDisplay(key, showWorkflow ? "" : "none");
+      }
+      for (const key of [
+        "native_transformer_offload",
+        "native_gguf_execution_mode",
+        "native_lazy_quantized_packed_device",
+        "native_transformer_gpu_slots",
+      ]) {
         setAllEntriesDisplay(key, showWorkflow ? "" : "none");
       }
       for (const key of ["workflow_loader_mode", "workflow_execution_backend", "comfyui_runtime_root", "comfyui_gguf_vendor_root"]) {
@@ -5819,8 +6545,10 @@ function renderPanel(container, ctx) {
         compatOpenWorkflowBtn.style.display = showWorkflow ? "" : "none";
         compatOpenWorkflowBtn.disabled = !showWorkflow || !hasOpenableWorkflowTarget(currentStatus?.manifest || null);
       }
+      if (typeof syncWorkflowPickerVisibility === "function") syncWorkflowPickerVisibility();
       syncDefaultBackendFieldVisibility();
       syncVideoWanVisibility();
+      forceHideMediaAdvancedFields();
     }
 
     function syncDefaultBackendFieldVisibility() {
@@ -5829,13 +6557,17 @@ function renderPanel(container, ctx) {
       const keys = typeId === "video_gen"
         ? [
           "model_id",
+          "video_command_mode",
+          "video_template_preset",
           "diffusers_pipeline_class",
           "diffusers_transformer_class",
           "enable_model_cpu_offload",
           "enable_sequential_cpu_offload",
           "gguf_path",
           "gemma_max_tokens",
+          "gemma_max_prompt_tokens",
           "allow_eager_gemma_gpu",
+          "allow_legacy_eager_gemma_gpu_load",
         ]
         : [
           "model_id",
@@ -5879,16 +6611,12 @@ function renderPanel(container, ctx) {
           "n_gpu_layers",
           "sdcpp_kwargs",
           "timeout_s",
-          "steps",
-          "cfg_scale",
-          "width",
-          "height",
           "sampler",
-          "seed",
         ];
       for (const key of keys) {
         setAllEntriesDisplay(key, showWorkflow ? "none" : "");
       }
+      forceHideMediaAdvancedFields();
     }
 
     function syncVideoWanVisibility() {
@@ -5977,6 +6705,7 @@ function renderPanel(container, ctx) {
       requirementsMap: VIDEO_PRESET_REQUIREMENTS_TEXT,
       installMap: VIDEO_PRESET_INSTALL_TEXT,
     };
+    forceHideMediaAdvancedFields();
 
     if (entriesByKey["backend"]?.input) {
       entriesByKey["backend"].input.addEventListener("change", () => {
@@ -6530,9 +7259,10 @@ function renderPanel(container, ctx) {
     }
     syncImageGenBackendVisibility();
 
-    const customWrap = document.createElement("div");
-    customWrap.className = "md-card";
-    const customTitle = document.createElement("div");
+    const customWrap = document.createElement(typeId === "image_gen" ? "details" : "div");
+    customWrap.className = typeId === "image_gen" ? "md-card md-collapsible-section" : "md-card";
+    if (typeId === "image_gen") customWrap.open = false;
+    const customTitle = document.createElement(typeId === "image_gen" ? "summary" : "div");
     customTitle.textContent = "Custom settings (JSON)";
     customTitle.style.fontWeight = "600";
     const customArea = document.createElement("textarea");
@@ -6544,10 +7274,14 @@ function renderPanel(container, ctx) {
     function shouldShowCustom() {
       if (typeId === "text_llm" || typeId === "vlm") return true;
       if (typeId === "image_gen") {
+        if (getModelBackendValue() === "workflow") return false;
         const backend = entries.find((e) => e.key === "backend")?.input?.value;
         return String(backend || "").toLowerCase() === "diffusers";
       }
       return false;
+    }
+    function syncCustomWrapVisibility() {
+      customWrap.style.display = shouldShowCustom() ? "block" : "none";
     }
 
     function isForeignCustomSettingForType(key) {
@@ -6561,6 +7295,10 @@ function renderPanel(container, ctx) {
         "minimax_",
         "mochi_",
         "video_",
+        "i2v_",
+        "t2v_",
+        "high_noise_",
+        "low_noise_",
       ];
       const imageOnlyPrefixes = [
         "image_",
@@ -6576,18 +7314,28 @@ function renderPanel(container, ctx) {
         "wespeaker_",
       ];
       const workflowKeys = new Set([
+        "agent_flow_default_workflow_id",
         "model_workflow_backend",
+        "model_workflow_attached_flows",
+        "model_workflow_flow_name",
+        "model_workflow_id",
         "workflow_loader_mode",
         "workflow_node_lifecycle_policy",
+        "workflow_node_timeout_s",
         "workflow_execution_backend",
         "workflow_node_timeout_seconds",
         "workflow_model_loader_id",
         "workflow_model_id",
         "model_deck_compat_manifest_id",
       ]);
+      const internalKeys = new Set([
+        "llama_server_managed_id",
+      ]);
       const videoOnlyKeys = new Set([
         "fps",
         "frames",
+        "prompt",
+        "negative_prompt",
         "video_codec",
         "use_wan",
         "use_wan_vae",
@@ -6598,7 +7346,14 @@ function renderPanel(container, ctx) {
         "gemma_text_encoding_device",
         "gemma_max_prompt_tokens",
         "allow_legacy_eager_gemma_gpu_load",
+        "texture_stability_note",
+        "regression_test_note",
+        "default_prompt",
+        "use_default_when_blank",
+        "sampler_name",
+        "scheduler",
       ]);
+      if (internalKeys.has(lower)) return true;
       if (typeId === "text_llm" || typeId === "vlm") {
         if (workflowKeys.has(lower) || videoOnlyKeys.has(lower)) return true;
         if (videoOnlyPrefixes.some((prefix) => lower.startsWith(prefix))) return true;
@@ -6607,6 +7362,7 @@ function renderPanel(container, ctx) {
         return false;
       }
       if (typeId === "image_gen") {
+        if (getModelBackendValue() === "default" && workflowKeys.has(lower)) return true;
         if (videoOnlyKeys.has(lower)) return true;
         if (videoOnlyPrefixes.some((prefix) => lower.startsWith(prefix))) return true;
         if (speechOnlyPrefixes.some((prefix) => lower.startsWith(prefix))) return true;
@@ -6620,22 +7376,38 @@ function renderPanel(container, ctx) {
       return false;
     }
 
+    function removeForeignCustomSettingsForType(settings) {
+      if (!settings || typeof settings !== "object" || Array.isArray(settings)) return settings;
+      for (const key of Object.keys(settings)) {
+        if (isForeignCustomSettingForType(key) && !(key in entriesByKey)) {
+          delete settings[key];
+        }
+      }
+      return settings;
+    }
+
+    function shouldHideSettingFromCustomJson(key) {
+      const lower = String(key || "").trim().toLowerCase();
+      if (["llama_server_managed_id", "hf_source_repo_id", "hf_source_filename"].includes(lower)) return true;
+      return isForeignCustomSettingForType(key);
+    }
+
     const knownKeys = new Set(entries.map((e) => e.key));
     if (model?.settings && typeof model.settings === "object") {
       const extra = {};
       for (const [k, v] of Object.entries(model.settings)) {
-        if (isForeignCustomSettingForType(k)) continue;
+        if (shouldHideSettingFromCustomJson(k)) continue;
         if (!knownKeys.has(k)) extra[k] = v;
       }
       if (Object.keys(extra).length) {
         customArea.value = JSON.stringify(extra, null, 2);
       }
     }
-    customWrap.style.display = shouldShowCustom() ? "block" : "none";
+    syncCustomWrapVisibility();
     entries.forEach((entry) => {
-      if (entry.key === "backend") {
+      if (entry.key === "backend" || entry.key === "model_backend") {
         entry.input.addEventListener("change", () => {
-          customWrap.style.display = shouldShowCustom() ? "block" : "none";
+          syncCustomWrapVisibility();
         });
       }
     });
@@ -6790,7 +7562,7 @@ function renderPanel(container, ctx) {
       syncCompatAssetJsonFromDynamicFields();
       const settings = {};
       for (const entry of entries) {
-        if (typeId === "image_gen" && entry.wrap && entry.wrap.style.display === "none") continue;
+        if ((typeId === "image_gen" || typeId === "video_gen") && entry.wrap && entry.wrap.style.display === "none" && !entry.persistWhenHidden) continue;
         const val = readFieldValue(entry.type, entry.input);
         if (val !== undefined) settings[entry.key] = val;
       }
@@ -6842,16 +7614,57 @@ function renderPanel(container, ctx) {
       } else {
         delete settings.model_deck_compat_manifest_id;
       }
+      if ((typeId === "image_gen" || typeId === "video_gen") && getModelBackendValue() === "workflow") {
+        const workflowSelection = readWorkflowPickerSelection();
+        const selectedWorkflow = String(workflowSelection?.name || selectedModelWorkflowFlowName || entriesByKey["model_workflow_flow_name"]?.input?.value || "").trim();
+        const selectedWorkflowId = String(workflowSelection?.workflow_id || selectedModelWorkflowId || entriesByKey["model_workflow_id"]?.input?.value || entriesByKey["agent_flow_default_workflow_id"]?.input?.value || "").trim();
+        if (selectedWorkflow) {
+          settings.model_workflow_flow_name = selectedWorkflow;
+        } else {
+          delete settings.model_workflow_flow_name;
+        }
+        if (selectedWorkflowId) {
+          settings.model_workflow_id = selectedWorkflowId;
+          settings.agent_flow_default_workflow_id = selectedWorkflowId;
+        } else {
+          delete settings.model_workflow_id;
+          delete settings.agent_flow_default_workflow_id;
+        }
+        const attachedRows = attachedModelWorkflowRows
+          .map((row) => ({
+            name: String(row?.name || "").trim(),
+            workflow_id: String(row?.workflow_id || "").trim(),
+          }))
+          .filter((row) => row.name);
+        if (selectedWorkflow && !attachedRows.some((row) => row.name === selectedWorkflow)) {
+          attachedRows.push({ name: selectedWorkflow, workflow_id: selectedWorkflowId });
+        }
+        if (attachedRows.length) {
+          settings.model_workflow_attached_flows = attachedRows;
+        } else {
+          delete settings.model_workflow_attached_flows;
+        }
+        settings.workflow_loader_mode = "workflow_model_loader";
+        settings.workflow_execution_backend = "native_graph";
+      } else if (typeId === "image_gen" || typeId === "video_gen") {
+        delete settings.model_workflow_flow_name;
+        delete settings.model_workflow_id;
+        delete settings.model_workflow_attached_flows;
+        delete settings.agent_flow_default_workflow_id;
+        settings.workflow_loader_mode = "checkpoint_runner";
+      }
       if (lastDownloadedHfRepoId) settings.hf_source_repo_id = lastDownloadedHfRepoId;
       else delete settings.hf_source_repo_id;
       if (lastDownloadedHfFilename) settings.hf_source_filename = lastDownloadedHfFilename;
       else delete settings.hf_source_filename;
+      removeForeignCustomSettingsForType(settings);
       const requiredErrors = [];
       for (const field of fields) {
         if (!field || typeof field !== "object") continue;
         if (!field.required) continue;
         const key = String(field.key || "").trim();
         if (!key) continue;
+        if ((typeId === "image_gen" || typeId === "video_gen") && entriesByKey[key]?.wrap?.style.display === "none") continue;
         const value = settings[key];
         if (value === undefined || value === null || value === "") {
           requiredErrors.push(field.label || key);

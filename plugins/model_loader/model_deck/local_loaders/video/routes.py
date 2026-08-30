@@ -36,6 +36,14 @@ _STATE: Dict[str, Any] = {
 }
 _PIPELINE: Optional[Any] = None
 _LAST_KEY: Optional[str] = None
+_INVALID_MODEL_REF_VALUES = {"", "none", "null", "undefined", "nan"}
+
+
+def _clean_model_ref(value: Any) -> str:
+    text = str(value or "").strip()
+    if text.lower() in _INVALID_MODEL_REF_VALUES:
+        return ""
+    return text
 
 
 def _teardown_pipeline(pipe: Any) -> None:
@@ -404,7 +412,7 @@ def _settings_key(settings: Dict[str, Any]) -> str:
 
 
 def _normalize_model_id(model_id: str) -> str:
-    mid = str(model_id or "").strip()
+    mid = _clean_model_ref(model_id)
     if not mid:
         return mid
     if os.path.exists(mid):

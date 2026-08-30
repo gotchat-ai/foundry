@@ -155,6 +155,14 @@ class RagMessageService:
             else:
                 msgs = self._budget_messages_for_stream(raw_msgs, keep_pairs=2, skip_system=skip_system)
 
+            diag["context"] = {
+                "mode": ctx_mode,
+                "summarize": bool(ctx_summarize),
+                "raw_message_count": len(raw_msgs or []),
+                "selected_message_count": len(msgs or []),
+                "skip_system": bool(skip_system),
+            }
+
             if not self._has_user_content(msgs) and self._has_user_content(raw_msgs):
                 if ctx_mode in ("since_last_assistant", "since_last_ai", "since_last_reply"):
                     msgs = self._tail_from_last_user(raw_msgs, keep_pairs=2, skip_system=skip_system)
@@ -172,6 +180,9 @@ class RagMessageService:
                         summary_tokens_cap=ctx_cap,
                         skip_system=skip_system,
                     )
+                    diag.setdefault("context", {})["summary_applied"] = True
+                else:
+                    diag.setdefault("context", {})["summary_applied"] = False
 
             base_tokens = self._tok_msgs(msgs)
             headroom = int(ctx) - int(cfg["reserve_tokens"]) - int(getattr(body, "max_tokens", None) or SETTINGS.get("max_tokens", 2048))
@@ -186,6 +197,13 @@ class RagMessageService:
                 librag_cap = int(librag_cap * scale)
 
             user_rag = self._user_rag_getter()
+            diag["budgets"] = {
+                "ctx": int(ctx),
+                "base_tokens": int(base_tokens),
+                "headroom": int(headroom),
+                "user_rag_cap": int(urag_cap),
+                "lib_rag_cap": int(librag_cap),
+            }
             if cfg["urag"]["enable"] and (user_rag is not None):
                 urag_cfg = dict(cfg["urag"])
                 ext = body.ext or {}
@@ -271,6 +289,14 @@ class RagMessageService:
                 extra_urag, urag_used_ids = self._extend_context_with_userrag_budgeted(msgs, urag_cfg)
                 if extra_urag:
                     msgs = msgs[:-1] + extra_urag + [msgs[-1]]
+                diag["user_rag"] = {
+                    "enabled": True,
+                    "extra_message_count": len(extra_urag or []),
+                    "used_ids_count": len(urag_used_ids or []),
+                    "repo_context_mode": bool(urag_cfg.get("repo_context_mode")),
+                }
+            else:
+                diag["user_rag"] = {"enabled": False, "reason": "disabled_or_unavailable"}
 
             #LIB-RAG expansion (budgeted)
             lib_cfg = {
@@ -288,6 +314,11 @@ class RagMessageService:
             extra_lib, lib_note_ids_budgeted = self._extend_context_with_librag_budgeted(msgs, lib_cfg, sid, diag) if cfg["librag"]["enable"] else ([], [])
             if extra_lib:
                 msgs = msgs[:-1] + extra_lib + [msgs[-1]]
+            diag["lib_rag"] = {
+                "enabled": bool(cfg["librag"]["enable"]),
+                "budgeted_extra_message_count": len(extra_lib or []),
+                "budgeted_note_ids_count": len(lib_note_ids_budgeted or []),
+            }
 
             if cfg["librag"]["enable"]:
                 lib_cfg = {
@@ -303,8 +334,28 @@ class RagMessageService:
                 extra, lib_note_ids, libs_selected = self._extend_context_with_librag_gated(msgs, lib_cfg, sid, diag)
                 if extra:
                     msgs = msgs[:-1] + extra + [msgs[-1]]
+                diag["lib_rag"]["gated_extra_message_count"] = len(extra or [])
+                diag["lib_rag"]["gated_note_ids_count"] = len(lib_note_ids or [])
+                diag["lib_rag"]["libs_selected_count"] = len(libs_selected or [])
 
             msgs = _ensure_last_user(msgs)
+            diag["final_message_count"] = len(msgs or [])
+            try:
+                diag["final_tokens"] = int(self._tok_msgs(msgs))
+            except Exception:
+                pass
+            try:
+                app_state = self._app_state_getter()
+                history = getattr(app_state, "rag_message_diag_history", None)
+                if not isinstance(history, list):
+                    history = []
+                    setattr(app_state, "rag_message_diag_history", history)
+                history.append(diag)
+                if len(history) > 50:
+                    del history[:-50]
+                setattr(app_state, "rag_message_last_diag", diag)
+            except Exception:
+                pass
         except Exception as e:
             print(e)
             msgs = []

@@ -1,4 +1,5 @@
 import sys
+import os
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -225,6 +226,44 @@ class AiJobRoutes:
         except Exception:
             pass
         try:
+            import gc
+
+            gc.collect()
+        except Exception:
+            pass
+        try:
+            if os.name == "nt":
+                import ctypes  # type: ignore
+
+                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                psapi = ctypes.WinDLL("psapi", use_last_error=True)
+                kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+                for dll_name in ("ucrtbase", "msvcrt"):
+                    try:
+                        crt = ctypes.CDLL(dll_name)
+                        heapmin = getattr(crt, "_heapmin", None)
+                        if callable(heapmin):
+                            heapmin()
+                            break
+                    except Exception:
+                        pass
+                try:
+                    kernel32.GetProcessHeap.restype = ctypes.c_void_p
+                    heap = kernel32.GetProcessHeap()
+                    if heap:
+                        kernel32.HeapCompact.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+                        kernel32.HeapCompact.restype = ctypes.c_size_t
+                        kernel32.HeapCompact(ctypes.c_void_p(heap), 0)
+                except Exception:
+                    pass
+                psapi.EmptyWorkingSet(ctypes.c_void_p(kernel32.GetCurrentProcess()))
+            elif sys.platform.startswith("linux"):
+                import ctypes  # type: ignore
+
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass
+        try:
             import torch
 
             if hasattr(torch, "xpu") and torch.xpu.is_available():
@@ -314,6 +353,12 @@ class AiJobRoutes:
             cancelled = self._cancelled_jobs_getter()
             if isinstance(cancelled, dict):
                 cancelled[job_id] = True
+        except Exception:
+            pass
+        try:
+            mgr = getattr(getattr(app, "state", None), "model_workflow_process_manager", None)
+            if mgr is not None and hasattr(mgr, "terminate"):
+                mgr.terminate(job_id)
         except Exception:
             pass
 

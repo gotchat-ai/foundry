@@ -75,6 +75,18 @@ class ChatStreamService:
         )
         if _sid:
             sid = _sid
+        try:
+            # Make the resolved browser/API session visible to downstream
+            # context/RAG builders.  They call get_sid(body), so keeping this
+            # only in a local variable made memory archive/search drift to the
+            # default session for some request shapes.
+            if _sid:
+                setattr(body, "sid", _sid)
+                setattr(body, "session_id", _sid)
+            if pid:
+                setattr(body, "pid", pid)
+        except Exception:
+            pass
 
         try:
             route_id_raw = str(getattr(body, "route_id", None) or "").strip().lower()
@@ -1077,12 +1089,29 @@ class ChatStreamService:
 
                         if evt == "token":
                             text = data["text"] if isinstance(data, dict) and "text" in data else data
-                            yield env["sse"]("token", {"text": str(text)})
+                            text_piece = str(text)
+                            text_acc.append(text_piece)
+                            yield env["sse"]("token", {"text": text_piece})
                             await asyncio.sleep(0)
                             continue
 
                         if evt == "router":
                             route_payload = data.get("router_result") if isinstance(data, dict) else None
+                            try:
+                                router_text = ""
+                                if isinstance(route_payload, dict):
+                                    router_text = str(
+                                        route_payload.get("text")
+                                        or route_payload.get("message")
+                                        or route_payload.get("content")
+                                        or route_payload.get("result_text")
+                                        or route_payload.get("response")
+                                        or ""
+                                    )
+                                if router_text:
+                                    text_acc.append(router_text)
+                            except Exception:
+                                pass
                             yield env["sse"]("router", {
                                 "router_result": route_payload,
                                 "model": body.model,
@@ -1091,7 +1120,7 @@ class ChatStreamService:
                             continue
 
                         if evt == "error":
-                            yield env["sse"]("diag", {"turn_id": turn_id, "error": str(text or "model_error"), "msg_id": msg_id})
+                            yield env["sse"]("diag", {"turn_id": turn_id, "error": str(data or "model_error"), "msg_id": msg_id})
                             yield env["sse"]("done", {"turn_id": turn_id, "ok": False, "msg_id": msg_id})
                             break
 

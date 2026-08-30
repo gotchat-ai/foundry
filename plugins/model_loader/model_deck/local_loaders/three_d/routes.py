@@ -18,6 +18,14 @@ _STATE: Dict[str, Any] = {
     "device": None,
 }
 _PIPELINE: Optional[Any] = None
+_INVALID_MODEL_REF_VALUES = {"", "none", "null", "undefined", "nan"}
+
+
+def _clean_model_ref(value: Any) -> str:
+    text = str(value or "").strip()
+    if text.lower() in _INVALID_MODEL_REF_VALUES:
+        return ""
+    return text
 
 
 def _resolve_device(settings: Dict[str, Any]) -> str:
@@ -53,8 +61,7 @@ def load(request: Request, settings: Dict[str, Any]) -> Dict[str, Any]:
     if backend not in ("tripo", "triposr"):
         raise HTTPException(400, f"unsupported backend: {backend}")
 
-    model_id = settings.get("model_id") or settings.get("model")
-    model_id = str(model_id or "").strip()
+    model_id = _clean_model_ref(settings.get("model_id") or settings.get("model"))
     if not model_id:
         raise HTTPException(400, "model_id required")
 

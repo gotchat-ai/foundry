@@ -6118,8 +6118,8 @@ function renderPanel(container, ctx) {
     const btnClearCache = document.createElement("button");
     btnClearCache.type = "button";
     btnClearCache.className = "secondary";
-    btnClearCache.textContent = "Stop / clear model cache";
-    btnClearCache.title = "Clear cached prompt encoder/model workflow resources.";
+    btnClearCache.textContent = "Release cached worker";
+    btnClearCache.title = "Stop the keyed workflow worker and release its cached prompt/model resources.";
     const actionStatus = document.createElement("div");
     actionStatus.className = "muted";
     actionStatus.style.fontSize = "12px";
@@ -6157,7 +6157,7 @@ function renderPanel(container, ctx) {
       const isClear = String(actionName || "").toLowerCase().includes("clear") || String(actionName || "").toLowerCase().includes("stop");
       const targetBtn = isClear ? btnClearCache : btnPrecache;
       targetBtn.disabled = true;
-      actionStatus.textContent = isClear ? "Clearing model workflow cache..." : "Warming workflow prompt encoder cache...";
+      actionStatus.textContent = isClear ? "Releasing cached workflow worker..." : "Warming workflow prompt encoder cache...";
       try {
         const body = {
           action: actionName,
@@ -6180,8 +6180,9 @@ function renderPanel(container, ctx) {
         } else if (nested?.prompt_context || nested?.data?.prompt_context) {
           const promptCtx = nested.prompt_context || nested.data.prompt_context || {};
           actionStatus.textContent = `Prompt encoder ${promptCtx.status || "warmed"}.`;
-        } else if (result?.removed_count !== undefined || nested?.removed_count !== undefined) {
-          actionStatus.textContent = `Cleared ${Number(result.removed_count ?? nested.removed_count ?? 0)} cached source-conditioning resource(s).`;
+        } else if (res?.released_cached_worker !== undefined || result?.removed_count !== undefined || nested?.removed_count !== undefined) {
+          const released = res?.released_cached_worker ? "released" : "not running";
+          actionStatus.textContent = `Cached worker ${released}; cleared ${Number(result.removed_count ?? nested.removed_count ?? 0)} stale cache resource(s).`;
         } else {
           actionStatus.textContent = reason ? String(reason) : "Node action completed.";
         }

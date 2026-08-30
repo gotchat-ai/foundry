@@ -77,7 +77,19 @@ class ChatContextService:
                 if content:
                     last_assistant_idx = idx
                     break
-        recent = tail[last_assistant_idx:] if last_assistant_idx >= 0 else tail
+        if last_assistant_idx >= 0:
+            start = last_assistant_idx
+            # "Last assistant message" is only useful if it also carries the
+            # user turn that produced that assistant reply.  Otherwise a
+            # follow-up like "what did I just ask?" sees the assistant answer
+            # but loses the actual prior user question.
+            for idx in range(last_assistant_idx - 1, -1, -1):
+                if tail[idx].get("role") == "user" and str(tail[idx].get("content") or "").strip():
+                    start = idx
+                    break
+            recent = tail[start:]
+        else:
+            recent = tail
         return recent if skip_system else (sys_msgs + recent)
 
     def _summarize_older_messages(

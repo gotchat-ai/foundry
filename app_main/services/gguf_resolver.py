@@ -7,6 +7,13 @@ from urllib.parse import urlparse
 from fastapi import HTTPException
 from huggingface_hub import hf_hub_download
 
+_INVALID_MODEL_ID_VALUES = {"", "none", "null", "undefined", "nan"}
+
+
+def _clean_model_ref(value: Any) -> str:
+    text = str(value or "").strip()
+    return "" if text.lower() in _INVALID_MODEL_ID_VALUES else text
+
 
 class GGUFResolverService:
     """Resolve GGUF references, cache metadata, and serve GGUF info responses."""
@@ -31,11 +38,15 @@ class GGUFResolverService:
         return self._settings_getter() or {}
 
     def looks_like_gguf_id(self, value: str) -> bool:
+        value = _clean_model_ref(value)
         if not value:
             return False
         return ".gguf" in value.lower()
 
     def parse_hf_url(self, url: str) -> tuple[str, str]:
+        url = _clean_model_ref(url)
+        if not url:
+            raise ValueError("empty Hugging Face GGUF URL")
         parsed = urlparse(url)
         parts = parsed.path.strip("/").split("/")
         if len(parts) < 3:
@@ -71,6 +82,9 @@ class GGUFResolverService:
         return str(path)
 
     def parse_hf_gguf_url_like_vllama(self, url: str) -> tuple[str, str]:
+        url = _clean_model_ref(url)
+        if not url:
+            raise ValueError("empty Hugging Face GGUF URL")
         parsed = urlparse(url)
         parts = parsed.path.strip("/").split("/")
         if len(parts) < 3:
@@ -87,7 +101,7 @@ class GGUFResolverService:
         return repo_id, filename
 
     def looks_like_hf_gguf_ref(self, value: str) -> bool:
-        text = (value or "").strip()
+        text = _clean_model_ref(value)
         if not text or ".gguf" not in text.lower():
             return False
         if text.startswith("http://") or text.startswith("https://"):
@@ -126,6 +140,8 @@ class GGUFResolverService:
         return [os.path.abspath(root) for root in roots if root]
 
     def resolve_from_cache(self, repo_id: str, filename: str) -> Optional[str]:
+        repo_id = _clean_model_ref(repo_id)
+        filename = _clean_model_ref(filename)
         if not repo_id or not filename:
             return None
         model_dir = "models--" + repo_id.replace("/", "--")
@@ -182,7 +198,7 @@ class GGUFResolverService:
         return None
 
     def resolve_gguf_path(self, model_id: str) -> str:
-        text = (model_id or "").strip()
+        text = _clean_model_ref(model_id)
         if not text:
             raise RuntimeError("empty GGUF model id")
 
@@ -321,7 +337,7 @@ class GGUFResolverService:
                     pass
 
     def model_gguf_info(self, req: Any, response_cls: Callable[..., Any]) -> Any:
-        model_id = (req.model_id or "").strip()
+        model_id = _clean_model_ref(getattr(req, "model_id", ""))
         if not model_id:
             raise HTTPException(400, "model_id required")
         n_layers, file_size, warning = self.get_cached_gguf_info(model_id)

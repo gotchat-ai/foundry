@@ -10,6 +10,14 @@ from typing import Any, Dict, Optional
 from fastapi import HTTPException, Request
 
 GGUF_PLUGIN_ID = "model_loader.gguf"
+_INVALID_MODEL_REF_VALUES = {"", "none", "null", "undefined", "nan"}
+
+
+def _clean_model_ref(value: Any) -> str:
+    text = str(value or "").strip()
+    if text.lower() in _INVALID_MODEL_REF_VALUES:
+        return ""
+    return text
 
 try:
     from llama_cpp import (
@@ -63,8 +71,7 @@ def _gguf_get_n_layers_via_llama_cpp(model_path: str) -> Optional[int]:
 
 
 def _resolve_model_path(settings: Dict[str, Any], request: Optional[Request], app: Optional[Any] = None) -> Optional[str]:
-    model_id = settings.get("model_path") or settings.get("model_id") or settings.get("model")
-    model_id = str(model_id or "").strip()
+    model_id = _clean_model_ref(settings.get("model_path") or settings.get("model_id") or settings.get("model"))
     if not model_id:
         return None
     local_path = Path(model_id).expanduser()
@@ -426,8 +433,7 @@ def _gguf_total_layers_from_metadata(model_id: str, model_path: Optional[str], a
 
 
 def map_gguf_settings(settings: Dict[str, Any], *, require_mmproj: bool = False, request: Optional[Request] = None) -> Dict[str, Any]:
-    model_id = settings.get("model_path") or settings.get("model_id") or settings.get("model")
-    model_id = str(model_id or "").strip()
+    model_id = _clean_model_ref(settings.get("model_path") or settings.get("model_id") or settings.get("model"))
     if not model_id:
         raise HTTPException(400, "model_path required")
 

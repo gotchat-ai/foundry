@@ -36,7 +36,7 @@ def load_settings(path: str | None = None) -> Dict[str, Any]:
 
         "enable_summarize": True,
         "enable_rag": True,
-        "embed_model": None,
+        "embed_model": "sentence-transformers/all-MiniLM-L6-v2",
 
         "enable_user_rag": True,
         "rag_dir": None,

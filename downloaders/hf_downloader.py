@@ -13,6 +13,16 @@ class HFDownloadResult:
     skipped: bool = False
     error: Optional[str] = None
 
+
+_INVALID_HF_REF_VALUES = {"", "none", "null", "undefined", "nan"}
+
+
+def _clean_hf_ref(value: Optional[str]) -> str:
+    text = str(value or "").strip()
+    if text.lower() in _INVALID_HF_REF_VALUES:
+        return ""
+    return text
+
 def _is_404_error(exc: Exception) -> bool:
     """Best-effort 404 detection without relying on specific HF exception classes."""
     try:
@@ -44,6 +54,12 @@ def safe_hf_download(
     - supports fresh downloads via force_download
     - gracefully treats 404 as a non-fatal skip (e.g., generation_config.json may be absent)
     """
+    repo_id = _clean_hf_ref(repo_id)
+    filename = _clean_hf_ref(filename)
+    if not repo_id:
+        return HFDownloadResult(path=None, ok=False, error="invalid Hugging Face repo_id")
+    if not filename:
+        return HFDownloadResult(path=None, ok=False, error="invalid Hugging Face filename")
     try:
         p = hf_hub_download(
             repo_id=repo_id,

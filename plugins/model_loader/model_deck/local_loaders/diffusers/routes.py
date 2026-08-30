@@ -36,6 +36,14 @@ _STATE: Dict[str, Any] = {
 }
 _PIPELINE: Optional[Any] = None
 _LAST_KEY: Optional[str] = None
+_INVALID_MODEL_REF_VALUES = {"", "none", "null", "undefined", "nan"}
+
+
+def _clean_model_ref(value: Any) -> str:
+    text = str(value or "").strip()
+    if text.lower() in _INVALID_MODEL_REF_VALUES:
+        return ""
+    return text
 
 
 def _teardown_pipeline(pipe: Any) -> None:
@@ -388,7 +396,7 @@ def _resolve_gguf_path_setting(request: Optional[Request], settings: Dict[str, A
         raise HTTPException(500, "server_app_missing for gguf download; provide a local gguf_path")
 
     try:
-        gguf_filename = str(settings.get("gguf_filename") or "").strip() or None
+        gguf_filename = _clean_model_ref(settings.get("gguf_filename")) or None
         return _resolve_gguf_path(app, gguf_path, gguf_filename)
     except Exception as exc:
         raise HTTPException(500, f"gguf resolve failed: {exc}") from exc
@@ -405,8 +413,8 @@ def _resolve_unet_path_setting(
         if p.is_file():
             return str(p.resolve())
 
-    repo_id = str(settings.get("sdxl_unet_repo") or "").strip()
-    filename = str(settings.get("sdxl_unet_filename") or "").strip()
+    repo_id = _clean_model_ref(settings.get("sdxl_unet_repo"))
+    filename = _clean_model_ref(settings.get("sdxl_unet_filename"))
     if not repo_id or not filename:
         return ""
     try:
@@ -457,11 +465,10 @@ def load(request: Request, settings: Dict[str, Any]) -> Dict[str, Any]:
     if backend != "diffusers":
         raise HTTPException(400, f"unsupported backend: {backend}")
 
-    model_id = settings.get("model_id") or settings.get("model") or settings.get("gguf_path")
-    model_id = str(model_id or "").strip()
+    model_id = _clean_model_ref(settings.get("model_id") or settings.get("model") or settings.get("gguf_path"))
 
-    base_model_id = str(settings.get("base_model_id") or "").strip()
-    control_model_id = str(settings.get("control_model_id") or "").strip()
+    base_model_id = _clean_model_ref(settings.get("base_model_id"))
+    control_model_id = _clean_model_ref(settings.get("control_model_id"))
     use_control = bool(base_model_id or control_model_id)
     if use_control and (not base_model_id or not control_model_id):
         raise HTTPException(400, "base_model_id and control_model_id required for control")
@@ -568,7 +575,7 @@ def load(request: Request, settings: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as exc:
             raise HTTPException(500, f"load failed: {exc}") from exc
     elif use_sdxl_unet:
-        base_model_id = str(settings.get("sdxl_base_model") or model_id or "stabilityai/stable-diffusion-xl-base-1.0").strip()
+        base_model_id = _clean_model_ref(settings.get("sdxl_base_model")) or model_id or "stabilityai/stable-diffusion-xl-base-1.0"
         variant = str(settings.get("sdxl_variant") or "").strip() or None
         timestep_spacing = str(settings.get("sdxl_timestep_spacing") or "").strip()
         try:

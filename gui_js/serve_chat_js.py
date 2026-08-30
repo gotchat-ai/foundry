@@ -90,8 +90,8 @@ class ChatJsHandler(SimpleHTTPRequestHandler):
                         chunk = stream.readline()
                         if not chunk:
                             break
-                        self.wfile.write(chunk)
-                        self.wfile.flush()
+                        if not self._safe_write(chunk, flush=True):
+                            return
                     return
                 payload = resp.read()
                 payload = self._rewrite_proxy_payload(payload, content_type)
@@ -100,7 +100,7 @@ class ChatJsHandler(SimpleHTTPRequestHandler):
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
-                self.wfile.write(payload)
+                self._safe_write(payload)
         except urllib.error.HTTPError as exc:
             content_type = exc.headers.get("Content-Type", "text/plain")
             is_sse = "text/event-stream" in str(content_type or "").lower()
@@ -117,8 +117,8 @@ class ChatJsHandler(SimpleHTTPRequestHandler):
                     chunk = stream.readline()
                     if not chunk:
                         break
-                    self.wfile.write(chunk)
-                    self.wfile.flush()
+                    if not self._safe_write(chunk, flush=True):
+                        return
                 return
             payload = exc.read() if exc.fp else b""
             payload = self._rewrite_proxy_payload(payload, content_type)
@@ -128,15 +128,27 @@ class ChatJsHandler(SimpleHTTPRequestHandler):
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             if payload:
-                self.wfile.write(payload)
+                self._safe_write(payload)
         except Exception as exc:
             msg = f"backend proxy failed for {target}: {exc}".encode("utf-8")
-            self.send_response(502)
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Content-Type", "text/plain")
-            self.send_header("Content-Length", str(len(msg)))
-            self.end_headers()
-            self.wfile.write(msg)
+            try:
+                self.send_response(502)
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(msg)))
+                self.end_headers()
+                self._safe_write(msg)
+            except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+                return
+
+    def _safe_write(self, payload: bytes, *, flush: bool = False) -> bool:
+        try:
+            self.wfile.write(payload)
+            if flush:
+                self.wfile.flush()
+            return True
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            return False
 
     def _proxy_client_service(self):
         return self._proxy_request("http://127.0.0.1:8766")
@@ -285,7 +297,7 @@ class ChatJsHandler(SimpleHTTPRequestHandler):
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
         self.end_headers()
-        self.wfile.write(payload)
+        self._safe_write(payload)
 
     def do_GET(self):
         if self.path.startswith(self.CLIENT_PROXY_PATH):

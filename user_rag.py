@@ -16,6 +16,14 @@ CHAT_KIND_USER = "chat_user"
 CHAT_KIND_ASSISTANT = "chat_assistant"
 CHAT_KIND_CODE = "chat_assistant_code"
 CHAT_KIND_SUMMARY = "chat_summary"
+DEFAULT_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+
+
+def _normalize_embed_model(value: Optional[str]) -> str:
+    text = str(value or "").strip()
+    if not text or text.lower() in {"none", "null", "undefined"}:
+        return DEFAULT_EMBED_MODEL
+    return text
 
 
 def _chunk_text(text: str, chunk_chars: int = 600, overlap: int = 120) -> List[str]:
@@ -45,7 +53,7 @@ class UserRagManager:
     with optional topics and summary checkpoints.
     """
     def __init__(self, embed_model: str = "sentence-transformers/all-MiniLM-L6-v2", base_dir: Optional[str] = None, cold_base_dir: Optional[str] = None, autosave: bool = True):
-        self.embed_model = embed_model
+        self.embed_model = _normalize_embed_model(embed_model)
         self._stores: Dict[str, RagStore] = {}
         self.autosave = autosave
         self._topics: Dict[str, Dict[str, int]] = {}  # sid -> topic -> count

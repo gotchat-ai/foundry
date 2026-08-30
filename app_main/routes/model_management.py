@@ -7,6 +7,14 @@ from uuid import uuid4
 from fastapi import HTTPException
 
 
+_INVALID_HF_ID_VALUES = {"", "none", "null", "undefined", "nan"}
+
+
+def _clean_hf_id(value: Any) -> str:
+    text = str(value or "").strip()
+    return "" if text.lower() in _INVALID_HF_ID_VALUES else text
+
+
 class ModelManagementRoutes:
     """Implementation for model unload route/job helpers."""
 
@@ -202,7 +210,7 @@ class ModelManagementRoutes:
         - For GGUF ids, resolve them to a local GGUF path.
         - For non-GGUF ids, keep the Hugging Face snapshot download flow.
         """
-        model_id = (req.model_id or "").strip()
+        model_id = _clean_hf_id(getattr(req, "model_id", ""))
         if not model_id:
             raise HTTPException(400, "model_id required")
 
@@ -223,12 +231,12 @@ class ModelManagementRoutes:
 
         try:
             local_path = snapshot_download(
-                repo_id=req.model_id,
+                repo_id=model_id,
                 revision=req.revision,
                 allow_patterns=req.allow_patterns,
                 ignore_patterns=req.ignore_patterns,
             )
-            return {"ok": True, "model_id": req.model_id, "path": local_path}
+            return {"ok": True, "model_id": model_id, "path": local_path}
         except Exception as exc:
             raise HTTPException(400, f"download failed: {exc}")
 
@@ -300,7 +308,7 @@ class ModelManagementRoutes:
             req_map = {**req_map, **extra_kwargs}
 
         settings = self._settings_getter() or {}
-        repo_id = pick(req_map, "repo_id", "model_id", "model", "hf_repo", "model_repo")
+        repo_id = _clean_hf_id(pick(req_map, "repo_id", "model_id", "model", "hf_repo", "model_repo"))
         revision = pick(req_map, "revision", "branch", default="main")
         cache_dir = pick(req_map, "cache_dir", "models_cache_dir", default=settings.get("hf_cache_dir"))
         local_only = bool(pick(req_map, "local_files_only", "localOnly", default=False))

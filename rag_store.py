@@ -3,6 +3,15 @@ import numpy as np
 import os, json
 from runtime_cuda import cuda_runtime_enabled
 
+DEFAULT_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+
+
+def _normalize_embed_model(value: str) -> str:
+    text = str(value or "").strip()
+    if not text or text.lower() in {"none", "null", "undefined"}:
+        return DEFAULT_EMBED_MODEL
+    return text
+
 def _patch_transformers_generation_mixin() -> None:
     """
     Compatibility shim for environments where `GenerationMixin` is not exposed at
@@ -38,7 +47,8 @@ def _try_local_snapshot(model_name: str, cache_dir: str) -> Optional[str]:
 class Embedder:
     def __init__(self, model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
         _patch_transformers_generation_mixin()
-        self.model_name = model_name
+        self.model_name = _normalize_embed_model(model_name)
+        model_name = self.model_name
         cache_dir = _hf_cache_root()
         local_snapshot = _try_local_snapshot(model_name, cache_dir) if cache_dir else None
         local_only = bool(local_snapshot)
@@ -363,6 +373,13 @@ class RagStore:
             # Ensure shape matches ids/docs count; otherwise rebuild from text
             if self.matrix.shape[0] != len(self.ids):
                 self._reembed_all()
+            else:
+                # Reattach persisted vectors to their docs.  Without this,
+                # a later add() calls _rebuild(), sees old docs with vec=None,
+                # and silently drops the whole prior hot-memory set.
+                for i, did in enumerate(self.ids):
+                    if did in self.docs:
+                        self.docs[did]["vec"] = self.matrix[i]
         else:
             self._reembed_all()
 

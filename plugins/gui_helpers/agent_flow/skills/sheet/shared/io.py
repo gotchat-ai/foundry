@@ -51,18 +51,30 @@ def _resolve_input_path(file: str) -> Path:
                 return cand
     roots = [
         cwd,
+        cwd / "llmloader2",
         cwd / "data",
+        cwd / "llmloader2" / "data",
+        cwd / "data" / "uploads",
+        cwd / "llmloader2" / "data" / "uploads",
         cwd / "data" / "agent_workflow" / "repo",
+        cwd / "llmloader2" / "data" / "agent_workflow" / "repo",
         cwd / "generated",
+        cwd / "llmloader2" / "generated",
     ]
     # Also probe a couple of parent roots in case service CWD is nested.
     for p in list(cwd.parents)[:3]:
         roots.extend(
             [
                 p,
+                p / "llmloader2",
                 p / "data",
+                p / "llmloader2" / "data",
+                p / "data" / "uploads",
+                p / "llmloader2" / "data" / "uploads",
                 p / "data" / "agent_workflow" / "repo",
+                p / "llmloader2" / "data" / "agent_workflow" / "repo",
                 p / "generated",
+                p / "llmloader2" / "generated",
             ]
         )
     # De-duplicate while preserving order.

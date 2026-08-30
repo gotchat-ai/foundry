@@ -702,6 +702,7 @@ body {
   line-height: 1.45;
 }
 
+
 .bubble.typing {
   min-width: 60px;
 }
@@ -1593,6 +1594,23 @@ body {
   cursor: pointer;
 }
 
+.plugin-local-install-section {
+  border: 1px dashed var(--border);
+  border-radius: 12px;
+  padding: 12px;
+  margin-bottom: 14px;
+  background: rgba(var(--panel-rgb), 0.75);
+}
+
+.plugin-local-install-section h3 {
+  margin: 0 0 6px;
+}
+
+.plugin-local-install-card {
+  grid-template-columns: 1fr;
+  margin-top: 10px;
+}
+
 .plugin-card:hover {
   background: rgba(var(--panel-rgb), 0.85);
   box-shadow: 0 0 0 1px rgba(var(--ink-rgb), 0.08);
@@ -1623,6 +1641,21 @@ body {
   gap: 8px;
   flex-wrap: wrap;
   margin-top: 6px;
+}
+
+.plugin-restricted-badge {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 4px 8px;
+  background: rgba(245, 158, 11, 0.16);
+  color: #b45309;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.plugin-restricted-card {
+  border-left: 3px solid #f59e0b;
 }
 
 .plugin-search-input {
@@ -2021,6 +2054,21 @@ body {
     max-height: none;
     overflow-y: visible;
     overflow-x: visible;
+  }
+
+  #menu-gui-sub .menu-sub-level2 {
+    max-height: none;
+    overflow-y: visible;
+    overflow-x: visible;
+  }
+
+  #menu-gui-sub .menu-sub-level2-scroll {
+    max-height: min(72dvh, calc(100dvh - 24px));
+    overflow-y: auto;
+    overflow-x: visible;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+    touch-action: pan-y;
   }
 
   .plugin-table {
@@ -2589,4 +2637,5 @@ select option {
 .toolbar-roster.clickable {
   cursor: pointer;
 }
+
 

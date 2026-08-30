@@ -9,6 +9,7 @@ import inspect
 import re
 import subprocess
 import shutil
+import sys
 import threading
 import uuid
 from contextlib import contextmanager
@@ -38,6 +39,7 @@ from pydantic import BaseModel, Field
 from plugins.gui_helpers._framework.utils import require_gui_plugin_enabled
 from plugins.gui_helpers._framework.services import register_plugin_service
 from plugins.model_loader.model_deck import compat_registry
+from plugins.gui_helpers.agent_flow.model_workflow_process import ModelWorkflowProcessManager
 
 
 GUI_PLUGIN_ID = "model_deck"
@@ -74,6 +76,34 @@ def _clear_process_meta(app: Any, slot: str) -> None:
         return
     meta = _process_meta_map(app)
     meta.pop(slot, None)
+
+
+def _model_workflow_error_message(result: Any, fallback: str = "workflow operation failed") -> str:
+    """Extract the actionable nested error from worker-backed workflow results."""
+    if not isinstance(result, dict):
+        return str(fallback)
+    candidates: list[Any] = [
+        result.get("error"),
+        result.get("detail"),
+        result.get("message"),
+    ]
+    data = result.get("data")
+    if isinstance(data, dict):
+        candidates.extend([data.get("error"), data.get("detail"), data.get("message")])
+        tail = data.get("worker_log_tail")
+        if isinstance(tail, list) and tail:
+            candidates.append(" | ".join(str(x) for x in tail[-6:]))
+    nested = result.get("result")
+    if isinstance(nested, dict):
+        candidates.append(nested.get("error"))
+        nested_data = nested.get("data")
+        if isinstance(nested_data, dict):
+            candidates.extend([nested_data.get("error"), nested_data.get("detail"), nested_data.get("message")])
+    for item in candidates:
+        text = str(item or "").strip()
+        if text:
+            return text[:2000]
+    return str(fallback)
 
 
 def _get_data_dir(app: Any) -> str:
@@ -764,6 +794,7 @@ def _load_deck(app: Any) -> Dict[str, Any]:
     before = json.dumps(data, sort_keys=True)
     _cleanup_legacy_workflow_training_entries(data)
     _migrate_legacy_speech_type(data)
+    _normalize_deck(data)
     after = json.dumps(data, sort_keys=True)
     if before != after:
         try:
@@ -982,6 +1013,17 @@ class EnsureModelWorkflowRequest(BaseModel):
     model_id: str
     pid: Optional[str] = "default"
     template_flow_name: Optional[str] = None
+    force_new: bool = False
+    settings: Dict[str, Any] = Field(default_factory=dict)
+
+
+class WorkflowReadinessRequest(BaseModel):
+    type_id: str
+    model_id: Optional[str] = None
+    pid: Optional[str] = "default"
+    workflow_name: Optional[str] = None
+    workflow_id: Optional[str] = None
+    manifest_id: Optional[str] = None
     settings: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -997,7 +1039,151 @@ def _looks_like_deck_type_entry(value: Any) -> bool:
     return any(key in value for key in ("type_id", "label", "notes", "default_model_id", "main_model_id", "models"))
 
 
+_DECK_ROOT_KEYS = {"version", "updated_ts", "types"}
+
+
+_VIDEO_SETTING_PREFIXES = (
+    "wan_",
+    "ltx_",
+    "hunyuan_",
+    "minimax_",
+    "mochi_",
+    "video_",
+    "i2v_",
+    "t2v_",
+    "high_noise_",
+    "low_noise_",
+)
+
+
+_IMAGE_SETTING_PREFIXES = (
+    "image_",
+    "flux_",
+    "sdxl_",
+    "zimage_",
+)
+
+
+_SPEECH_SETTING_PREFIXES = (
+    "speech_",
+    "asr_",
+    "tts_",
+    "wesep_",
+    "wespeaker_",
+)
+
+
+_VIDEO_ONLY_SETTING_KEYS = {
+    "fps",
+    "frames",
+    "prompt",
+    "negative_prompt",
+    "video_codec",
+    "use_wan",
+    "use_wan_vae",
+    "wan_vae_subfolder",
+    "wan_vae_dtype",
+    "ltx_video_only",
+    "native_transformer_offload",
+    "gemma_text_encoding_device",
+    "gemma_max_prompt_tokens",
+    "allow_legacy_eager_gemma_gpu_load",
+    "texture_stability_note",
+    "regression_test_note",
+    "default_prompt",
+    "use_default_when_blank",
+    "sampler_name",
+    "scheduler",
+}
+
+
+_WORKFLOW_SETTING_KEYS = {
+    "agent_flow_default_workflow_id",
+    "model_workflow_backend",
+    "model_workflow_attached_flows",
+    "model_workflow_flow_name",
+    "model_workflow_id",
+    "model_workflow_bindings",
+    "workflow_loader_mode",
+    "workflow_node_lifecycle_policy",
+    "workflow_node_timeout_s",
+    "workflow_execution_backend",
+    "workflow_node_timeout_seconds",
+    "workflow_model_loader_id",
+    "workflow_model_id",
+    "model_deck_compat_manifest_id",
+}
+
+
+_MODEL_TOP_LEVEL_KEYS = {"model_id", "loader_id", "settings", "persist", "lazy", "tags"}
+
+
+def _is_foreign_model_setting(type_id: str, key: str, settings: Optional[Dict[str, Any]] = None) -> bool:
+    tid = str(type_id or "").strip()
+    lower = str(key or "").strip().lower()
+    if not lower:
+        return True
+    if tid in ("text_llm", "vlm"):
+        if lower in _WORKFLOW_SETTING_KEYS or lower in _VIDEO_ONLY_SETTING_KEYS:
+            return True
+        if any(lower.startswith(prefix) for prefix in _VIDEO_SETTING_PREFIXES):
+            return True
+        if any(lower.startswith(prefix) for prefix in _IMAGE_SETTING_PREFIXES):
+            return True
+        if any(lower.startswith(prefix) for prefix in _SPEECH_SETTING_PREFIXES):
+            return True
+        return False
+    if tid == "image_gen":
+        backend = str((settings or {}).get("model_backend") or (settings or {}).get("backend_mode") or "").strip().lower()
+        if backend != "workflow" and lower in _WORKFLOW_SETTING_KEYS:
+            return True
+        if lower in _VIDEO_ONLY_SETTING_KEYS:
+            return True
+        if any(lower.startswith(prefix) for prefix in _VIDEO_SETTING_PREFIXES):
+            return True
+        if any(lower.startswith(prefix) for prefix in _SPEECH_SETTING_PREFIXES):
+            return True
+        return False
+    if tid == "video_gen":
+        if any(lower.startswith(prefix) for prefix in _IMAGE_SETTING_PREFIXES):
+            return True
+        if any(lower.startswith(prefix) for prefix in _SPEECH_SETTING_PREFIXES):
+            return True
+        return False
+    if lower in _WORKFLOW_SETTING_KEYS or lower in _VIDEO_ONLY_SETTING_KEYS:
+        return True
+    if any(lower.startswith(prefix) for prefix in _VIDEO_SETTING_PREFIXES):
+        return True
+    if any(lower.startswith(prefix) for prefix in _IMAGE_SETTING_PREFIXES):
+        return True
+    return False
+
+
+def _sanitize_model_settings_for_type(type_id: str, settings: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(settings, dict):
+        return {}
+    out = dict(settings)
+    for key in list(out.keys()):
+        if _is_foreign_model_setting(type_id, key, out):
+            out.pop(key, None)
+    return out
+
+
+def _sanitize_model_record_for_type(type_id: str, model: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(model, dict):
+        return {}
+    # DeckModel only has these top-level fields. Runtime/profile/workflow
+    # controls belong in settings; keeping extra top-level fields is what made
+    # old Wan/LTX tuning bleed into unrelated editors.
+    out = {key: model.get(key) for key in _MODEL_TOP_LEVEL_KEYS if key in model}
+    out["settings"] = _sanitize_model_settings_for_type(str(type_id), dict(out.get("settings") or {}))
+    return out
+
+
 def _normalize_deck(deck: Dict[str, Any]) -> Dict[str, Any]:
+    for key in list(deck.keys()):
+        if key not in _DECK_ROOT_KEYS:
+            deck.pop(key, None)
     if "types" not in deck or not isinstance(deck["types"], dict):
         deck["types"] = {}
     else:
@@ -1006,6 +1192,18 @@ def _normalize_deck(deck: Dict[str, Any]) -> Dict[str, Any]:
             for tid, t in deck["types"].items()
             if _looks_like_deck_type_entry(t)
         }
+        for tid, t in deck["types"].items():
+            if not isinstance(t, dict):
+                continue
+            models = t.get("models")
+            if not isinstance(models, list):
+                continue
+            for model in models:
+                if not isinstance(model, dict):
+                    continue
+                cleaned_model = _sanitize_model_record_for_type(str(tid), model)
+                model.clear()
+                model.update(cleaned_model)
     return deck
 
 
@@ -1130,7 +1328,7 @@ def _parse_json_dict(value: Any) -> Dict[str, Any]:
 def _hf_asset_source(repo_id: str, filename: str = "") -> Dict[str, Any]:
     repo_id = str(repo_id or "").strip()
     filename = str(filename or "").strip().replace("\\", "/")
-    if not repo_id:
+    if not repo_id or repo_id.lower() in {"none", "null", "undefined", "nan"}:
         return {}
     url = f"https://huggingface.co/{repo_id}"
     if filename:
@@ -1307,7 +1505,392 @@ def _hydrate_model_workflow_flow(flow: Dict[str, Any], model: Dict[str, Any], ty
     return hydrated
 
 
-def _ensure_model_workflow_for_deck_model(app: Any, type_id: str, model_id: str, pid: str = "default", template_flow_name: str = "", incoming_settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def _model_deck_models_dir_for_settings(app: Any, settings: Optional[Dict[str, Any]] = None) -> Path:
+    settings = settings or {}
+    for raw in (
+        settings.get("model_deck_models_dir"),
+        settings.get("models_dir"),
+        os.environ.get("MODEL_DECK_MODELS_DIR"),
+    ):
+        text = str(raw or "").strip()
+        if text:
+            return Path(os.path.expandvars(os.path.expanduser(text))).resolve()
+    if os.name == "nt":
+        d_models = Path("D:/models")
+        if d_models.is_dir():
+            return d_models.resolve()
+    root = getattr(getattr(app, "state", None), "workspace_root", None) or getattr(getattr(app, "state", None), "workdir", None)
+    return (Path(str(root or Path(__file__).resolve().parents[3])) / "data" / "models").resolve()
+
+
+def _expand_model_workflow_asset_path(app: Any, value: Any, settings: Optional[Dict[str, Any]] = None) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    settings = settings or {}
+    root = getattr(getattr(app, "state", None), "workspace_root", None) or getattr(getattr(app, "state", None), "workdir", None)
+    root_path = Path(str(root or Path(__file__).resolve().parents[3])).resolve()
+    data_dir = Path(str(getattr(getattr(app, "state", None), "data_dir", root_path / "data"))).resolve()
+    models_dir = _model_deck_models_dir_for_settings(app, settings)
+    replacements = {
+        "${MODEL_DECK_MODELS_DIR}": str(models_dir).replace("\\", "/"),
+        "$MODEL_DECK_MODELS_DIR": str(models_dir).replace("\\", "/"),
+        "${LLMLOADER2_ROOT}": str(root_path).replace("\\", "/"),
+        "$LLMLOADER2_ROOT": str(root_path).replace("\\", "/"),
+        "${APP_ROOT}": str(root_path).replace("\\", "/"),
+        "$APP_ROOT": str(root_path).replace("\\", "/"),
+        "${WORKSPACE_ROOT}": str(root_path).replace("\\", "/"),
+        "$WORKSPACE_ROOT": str(root_path).replace("\\", "/"),
+        "${MODEL_DECK_DATA_DIR}": str(data_dir).replace("\\", "/"),
+        "$MODEL_DECK_DATA_DIR": str(data_dir).replace("\\", "/"),
+    }
+    for token, replacement in replacements.items():
+        text = text.replace(token, replacement)
+    if text.startswith("modeldeck://models/"):
+        text = str(models_dir / text[len("modeldeck://models/") :])
+    elif text.startswith("modeldeck://data/"):
+        text = str(data_dir / text[len("modeldeck://data/") :])
+    return os.path.expandvars(os.path.expanduser(text))
+
+
+def _looks_like_local_asset_path(value: Any) -> bool:
+    text = str(value or "").strip()
+    if not text or text.startswith(("http://", "https://")):
+        return False
+    low = text.lower()
+    if any(token in text for token in ("${MODEL_DECK_MODELS_DIR}", "${LLMLOADER2_ROOT}", "${APP_ROOT}", "modeldeck://")):
+        return True
+    if any(low.endswith(ext) for ext in (".gguf", ".safetensors", ".ckpt", ".pt", ".pth", ".bin", ".onnx", ".json", ".yaml", ".yml", ".png", ".jpg", ".jpeg", ".webp", ".mp4", ".wav")):
+        return True
+    return bool(re.match(r"^[A-Za-z]:[\\/]", text) or text.startswith(("/", "\\")))
+
+
+def _workflow_asset_label(key: str, row: Optional[Dict[str, Any]] = None) -> str:
+    if row and str(row.get("label") or "").strip():
+        return str(row.get("label") or "").strip()
+    text = str(key or "").strip()
+    text = re.sub(r"_path$", "", text)
+    text = text.replace("_", " ").strip()
+    return text[:1].upper() + text[1:] if text else "Asset"
+
+
+def _workflow_slot_optional(key: str, row: Optional[Dict[str, Any]] = None) -> bool:
+    if row and "required" in row:
+        return not bool(row.get("required"))
+    low = str(key or "").lower()
+    return any(part in low for part in ("optional", "lora", "upscale", "interpolator", "rife"))
+
+
+def _workflow_asset_slot_key(key: str, row: Optional[Dict[str, Any]] = None, value: Any = None) -> bool:
+    """True for user-satisfiable workflow assets, false for ordinary knobs.
+
+    Workflow JSON carries both assets and settings. The readiness panel should
+    help the user satisfy files like GGUFs, VAEs, LoRAs, encoders, connectors,
+    and upscalers. It should not report sampler/cfg/device/lifecycle/script
+    fields as missing assets.
+    """
+    row = row or {}
+    low_key = str(key or "").strip().lower()
+    low_role = str(row.get("role") or "").strip().lower()
+    if not low_key or low_key.startswith("_"):
+        return False
+    if any(
+        tok in low_key
+        for tok in (
+            "script",
+            "runner",
+            "runtime_device",
+            "device",
+            "mode",
+            "cfg",
+            "sampler",
+            "scheduler",
+            "steps",
+            "timeout",
+            "lifecycle",
+            "offload",
+            "execution_backend",
+            "strength",
+            "sigmas",
+            "sigma",
+            "enabled",
+            "threshold",
+            "chunks",
+            "overlap",
+            "tile_size",
+            "temporal_size",
+            "vendor_root",
+            "python_bin",
+            "source_filename",
+        )
+    ):
+        return False
+    if low_key.endswith("_path") or low_key in {"gguf_path", "model_path", "vae_path"}:
+        return True
+    if row.get("patterns") or row.get("source_url") or row.get("url") or row.get("source"):
+        return True
+    if any(tok in low_role for tok in ("gguf", "lora", "vae", "upscaler", "encoder", "connector", "projection", "tokenizer", "safetensors", "checkpoint")):
+        return True
+    if isinstance(value, str) and _looks_like_local_asset_path(value):
+        return True
+    return False
+
+
+def _collect_workflow_values_and_sources(flow: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[str, Any], List[Dict[str, Any]]]:
+    values: Dict[str, Any] = {}
+    sources: Dict[str, Any] = {}
+    slots: List[Dict[str, Any]] = []
+
+    def add_slot(row: Any) -> None:
+        if isinstance(row, dict):
+            key = str(row.get("key") or row.get("slot") or row.get("id") or "").strip()
+            if key:
+                slots.append(dict(row, key=key))
+
+    def walk(value: Any) -> None:
+        if isinstance(value, dict):
+            for slot_key in ("asset_manifest", "asset_slots", "required_assets", "workflow_asset_manifest"):
+                raw_slots = value.get(slot_key)
+                if isinstance(raw_slots, list):
+                    for slot in raw_slots:
+                        add_slot(slot)
+            for source_key in ("_asset_sources", "asset_sources", "asset_source_urls"):
+                raw_sources = value.get(source_key)
+                parsed_sources = _parse_json_dict(raw_sources) if isinstance(raw_sources, str) else raw_sources
+                if isinstance(parsed_sources, dict):
+                    for key, source in parsed_sources.items():
+                        if source not in (None, "", [], {}):
+                            sources[str(key)] = source
+            for key, item in value.items():
+                key_text = str(key or "").strip()
+                if key_text.endswith("_source_url") and item not in (None, "", [], {}):
+                    asset_key = key_text[: -len("_source_url")]
+                    sources.setdefault(asset_key, {"type": "huggingface" if "huggingface.co/" in str(item) else "url", "url": str(item)})
+                if key_text.endswith("_path") or key_text in {"gguf_path", "model_path", "vae_path", "clip_path", "unet_path"}:
+                    if item not in (None, "", [], {}) and _looks_like_local_asset_path(item):
+                        values[key_text] = item
+                walk(item)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+
+    walk(flow if isinstance(flow, dict) else {})
+    deduped_slots: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in slots:
+        key = str(row.get("key") or "").strip()
+        if key and key not in seen:
+            deduped_slots.append(row)
+            seen.add(key)
+    return values, sources, deduped_slots
+
+
+def _workflow_rows_by_id_and_name(records: List[Dict[str, Any]]) -> tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+    by_name: Dict[str, Dict[str, Any]] = {}
+    by_id: Dict[str, Dict[str, Any]] = {}
+    for row in records:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("flow_name") or "").strip()
+        wid = str(row.get("workflow_id") or row.get("id") or "").strip()
+        if name:
+            by_name[name] = row
+        if wid:
+            by_id[wid] = row
+    return by_id, by_name
+
+
+def _legacy_project_workflow_record(app: Any, pid: str, workflow_name: str = "", workflow_id: str = "") -> tuple[Dict[str, Any], str, str]:
+    safe_pid = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(pid or "default").strip() or "default")
+    candidates: List[Path] = []
+    app_state = getattr(app, "state", None)
+    for attr in ("DATA_DIR", "data_dir", "llmloader_data_dir"):
+        value = getattr(app_state, attr, None)
+        if value:
+            candidates.append(Path(str(value)) / "projects" / "agent_flow" / f"{safe_pid}.json")
+    candidates.append(Path(os.getcwd()) / "data" / "projects" / "agent_flow" / f"{safe_pid}.json")
+    candidates.append(Path(__file__).resolve().parents[3] / "data" / "projects" / "agent_flow" / f"{safe_pid}.json")
+
+    seen_paths: set[str] = set()
+    for path in candidates:
+        try:
+            resolved_key = str(path.resolve())
+        except Exception:
+            resolved_key = str(path)
+        if resolved_key in seen_paths:
+            continue
+        seen_paths.add(resolved_key)
+        if not path.exists():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        flows = data.get("flows") if isinstance(data, dict) else {}
+        if not isinstance(flows, dict):
+            continue
+        for name, flow in flows.items():
+            if not isinstance(flow, dict):
+                continue
+            row_name = str(flow.get("flow_name") or name or "").strip()
+            wid = str(flow.get("workflow_id") or flow.get("id") or "").strip()
+            if (workflow_id and wid == workflow_id) or (workflow_name and row_name == workflow_name):
+                flow_copy = dict(flow)
+                if row_name and not flow_copy.get("flow_name"):
+                    flow_copy["flow_name"] = row_name
+                return flow_copy, row_name, wid or str(workflow_id or "").strip()
+    return {}, "", ""
+
+
+def _selected_workflow_record(app: Any, pid: str, workflow_name: str = "", workflow_id: str = "") -> tuple[Dict[str, Any], str, str]:
+    try:
+        from plugins.gui_helpers.agent_flow.skills.workflow import _workflow_store
+    except Exception as exc:
+        fallback = _legacy_project_workflow_record(app, pid, workflow_name, workflow_id)
+        if fallback[0]:
+            return fallback
+        raise HTTPException(status_code=503, detail=f"Agent Flow workflow store unavailable: {exc}") from exc
+    ctx = {"app": app, "pid": str(pid or "default").strip() or "default"}
+    records = _workflow_store.project_flow_records(ctx, str(pid or "default").strip() or "default")
+    by_id, by_name = _workflow_rows_by_id_and_name(records)
+    row: Dict[str, Any] = {}
+    if workflow_id and workflow_id in by_id:
+        row = by_id[workflow_id]
+    elif workflow_name and workflow_name in by_name:
+        row = by_name[workflow_name]
+    if not row:
+        fallback = _legacy_project_workflow_record(app, pid, workflow_name, workflow_id)
+        if fallback[0]:
+            return fallback
+        return {}, "", ""
+    return dict(row.get("flow_json") or {}), str(row.get("flow_name") or workflow_name or "").strip(), str(row.get("workflow_id") or row.get("id") or workflow_id or "").strip()
+
+
+def _build_model_workflow_readiness(app: Any, req: WorkflowReadinessRequest) -> Dict[str, Any]:
+    type_id = str(req.type_id or "").strip()
+    model_id = str(req.model_id or "").strip()
+    pid = str(req.pid or "default").strip() or "default"
+    incoming_settings = dict(req.settings or {})
+    deck = _ensure_defaults(_load_deck(app))
+    model: Dict[str, Any] = {}
+    if type_id and model_id:
+        try:
+            t = _get_type(deck, type_id)
+            found = _find_model_by_deck_or_runtime_id(t, model_id)
+            if isinstance(found, dict):
+                model = found
+        except Exception:
+            model = {}
+    model_settings = dict(model.get("settings") or {})
+    settings = {**model_settings, **incoming_settings}
+    workflow_name = str(req.workflow_name or settings.get("model_workflow_flow_name") or "").strip()
+    workflow_id = str(req.workflow_id or settings.get("model_workflow_id") or settings.get("agent_flow_default_workflow_id") or "").strip()
+    flow, resolved_name, resolved_id = _selected_workflow_record(app, pid, workflow_name, workflow_id)
+    if not flow:
+        return {
+            "ok": True,
+            "type_id": type_id,
+            "model_id": model_id,
+            "workflow_name": workflow_name,
+            "workflow_id": workflow_id,
+            "status": "missing_workflow" if (workflow_name or workflow_id) else "not_selected",
+            "ready": False,
+            "summary": "No workflow selected." if not (workflow_name or workflow_id) else "Selected workflow was not found.",
+            "assets": [],
+            "missing_assets": [],
+            "optional_missing_assets": [],
+            "source_urls": {},
+        }
+
+    manifest = compat_registry.match_manifest(type_id, settings, str(req.manifest_id or settings.get("model_deck_compat_manifest_id") or ""))
+    manifest_slots = []
+    manifest_sources: Dict[str, Any] = {}
+    if manifest:
+        runtime_profile = manifest.get("runtime_profile") if isinstance(manifest.get("runtime_profile"), dict) else {}
+        manifest_slots = [dict(row) for row in (runtime_profile.get("asset_slots") or []) if isinstance(row, dict)]
+        manifest_sources = _collect_asset_sources(manifest.get("assets_json") or {}, manifest.get("params_json") or {}, manifest)
+    workflow_values, workflow_sources, workflow_slots = _collect_workflow_values_and_sources(flow)
+    profile_assets, _profile_settings = _model_workflow_asset_and_setting_values(model, type_id)
+    profile_sources = _collect_asset_sources(profile_assets, settings)
+    bindings_all = settings.get("model_workflow_bindings")
+    bindings_all = bindings_all if isinstance(bindings_all, dict) else {}
+    binding_key = resolved_id or resolved_name
+    workflow_binding = bindings_all.get(binding_key) if isinstance(bindings_all.get(binding_key), dict) else {}
+    asset_bindings = workflow_binding.get("asset_bindings") if isinstance(workflow_binding.get("asset_bindings"), dict) else {}
+
+    slots_by_key: Dict[str, Dict[str, Any]] = {}
+    for row in [*manifest_slots, *workflow_slots]:
+        key = str(row.get("key") or row.get("slot") or row.get("id") or "").strip()
+        if key and key not in slots_by_key and _workflow_asset_slot_key(key, row):
+            slots_by_key[key] = dict(row, key=key)
+    for key, value in {**workflow_values, **asset_bindings, **profile_assets, **settings}.items():
+        if str(key).startswith("_"):
+            continue
+        if _workflow_asset_slot_key(str(key), slots_by_key.get(str(key)), value) and value not in (None, "", [], {}):
+            slots_by_key.setdefault(str(key), {"key": str(key), "required": False})
+
+    source_urls = {**manifest_sources, **workflow_sources, **profile_sources}
+    rows: List[Dict[str, Any]] = []
+    missing: List[str] = []
+    optional_missing: List[str] = []
+    for key in sorted(slots_by_key.keys()):
+        slot = slots_by_key[key]
+        candidates: List[tuple[str, Any]] = [
+            ("binding", asset_bindings.get(key)),
+            ("workflow", workflow_values.get(key)),
+            ("profile", profile_assets.get(key)),
+            ("settings", settings.get(key)),
+        ]
+        raw_value = ""
+        origin = ""
+        for item_origin, item_value in candidates:
+            if item_value not in (None, "", [], {}):
+                raw_value = str(item_value)
+                origin = item_origin
+                break
+        expanded = _expand_model_workflow_asset_path(app, raw_value, settings) if raw_value else ""
+        exists = bool(expanded and Path(expanded).exists())
+        required = not _workflow_slot_optional(key, slot)
+        status = "found" if exists else ("missing" if required else "optional_missing")
+        source = source_urls.get(key) or slot.get("source_url") or slot.get("url") or {}
+        row = {
+            "key": key,
+            "label": _workflow_asset_label(key, slot),
+            "required": bool(required),
+            "status": status,
+            "exists": exists,
+            "value": raw_value,
+            "expanded_path": expanded,
+            "origin": origin,
+            "source": source,
+            "patterns": list(slot.get("patterns") or []),
+            "role": str(slot.get("role") or ""),
+        }
+        rows.append(row)
+        if status == "missing":
+            missing.append(key)
+        elif status == "optional_missing":
+            optional_missing.append(key)
+
+    return {
+        "ok": True,
+        "type_id": type_id,
+        "model_id": model_id,
+        "workflow_name": resolved_name,
+        "workflow_id": resolved_id,
+        "manifest_id": str((manifest or {}).get("id") or req.manifest_id or settings.get("model_deck_compat_manifest_id") or ""),
+        "status": "ready" if not missing else "missing_assets",
+        "ready": not missing,
+        "summary": "Workflow ready: all required assets found." if not missing else f"Workflow needs {len(missing)} required asset(s).",
+        "assets": rows,
+        "missing_assets": missing,
+        "optional_missing_assets": optional_missing,
+        "source_urls": source_urls,
+        "binding_key": binding_key,
+    }
+
+
+def _ensure_model_workflow_for_deck_model(app: Any, type_id: str, model_id: str, pid: str = "default", template_flow_name: str = "", incoming_settings: Optional[Dict[str, Any]] = None, force_new: bool = False) -> Dict[str, Any]:
     try:
         from plugins.gui_helpers.agent_flow.skills.workflow import _workflow_store
     except Exception as exc:
@@ -1326,7 +1909,7 @@ def _ensure_model_workflow_for_deck_model(app: Any, type_id: str, model_id: str,
     default_flows = _workflow_store.load_default_flows(ctx)
     flows = dict(project_flows or {})
     saved_flow_name = str(settings.get("model_workflow_flow_name") or "").strip()
-    if saved_flow_name and isinstance(flows.get(saved_flow_name), dict):
+    if saved_flow_name and not force_new and isinstance(flows.get(saved_flow_name), dict):
         if isinstance(incoming_settings, dict) and incoming_settings:
             _save_deck(app, deck)
         records = _workflow_store.project_flow_records(ctx, str(pid or "default").strip() or "default")
@@ -1353,7 +1936,7 @@ def _ensure_model_workflow_for_deck_model(app: Any, type_id: str, model_id: str,
     if template_flow is None:
         raise HTTPException(status_code=404, detail=f"workflow template not found: {chosen_template}")
 
-    base_name = saved_flow_name or _model_workflow_name_for_model(str(type_id), str(model_id), chosen_template)
+    base_name = _model_workflow_name_for_model(str(type_id), str(model_id), chosen_template) if force_new else (saved_flow_name or _model_workflow_name_for_model(str(type_id), str(model_id), chosen_template))
     flow_name = base_name
     suffix = 2
     while flow_name in flows:
@@ -1414,6 +1997,8 @@ def _resolve_model_id_from_settings(settings: Dict[str, Any]) -> str:
         if val is None:
             continue
         s = str(val).strip()
+        if s.lower() in {"none", "null", "undefined", "nan"}:
+            continue
         if s:
             return s
     return ""
@@ -1421,7 +2006,7 @@ def _resolve_model_id_from_settings(settings: Dict[str, Any]) -> str:
 
 def _extract_hf_repo_id(value: Any) -> str:
     s = str(value or "").strip()
-    if not s:
+    if not s or s.lower() in {"none", "null", "undefined", "nan"}:
         return ""
     if os.path.exists(s):
         return ""
@@ -1439,6 +2024,9 @@ def _extract_hf_repo_id(value: Any) -> str:
 
 
 def _snapshot_download(repo_id: str, *, token: str = "", cache_dir: Optional[str] = None) -> str:
+    repo_id = str(repo_id or "").strip()
+    if not repo_id or repo_id.lower() in {"none", "null", "undefined", "nan"}:
+        raise HTTPException(status_code=400, detail="valid Hugging Face repo_id required")
     try:
         from huggingface_hub import snapshot_download
     except Exception as exc:
@@ -1521,6 +2109,12 @@ def _cleanup_incomplete_hf_download(repo_id: str, *, cache_dir: Optional[str] = 
 
 
 def _hf_hub_download(repo_id: str, filename: str, *, token: str = "", cache_dir: Optional[str] = None) -> str:
+    repo_id = str(repo_id or "").strip()
+    filename = str(filename or "").strip()
+    if not repo_id or repo_id.lower() in {"none", "null", "undefined", "nan"}:
+        raise HTTPException(status_code=400, detail="valid Hugging Face repo_id required")
+    if not filename or filename.lower() in {"none", "null", "undefined", "nan"}:
+        raise HTTPException(status_code=400, detail="valid Hugging Face filename required")
     try:
         from huggingface_hub import hf_hub_download
     except Exception as exc:
@@ -1664,7 +2258,7 @@ def _resolve_repo_file_sizes(api: Any, app: Any, repo_id: str, filenames: List[s
     repo_value = str(repo_id or "").strip()
     wanted = [str(name or "").strip() for name in filenames if str(name or "").strip()]
     sizes: Dict[str, Optional[int]] = {name: None for name in wanted}
-    if not repo_value or not wanted:
+    if not repo_value or repo_value.lower() in {"none", "null", "undefined", "nan"} or not wanted:
         return sizes
     token = _resolve_hf_token(app) or None
     try:
@@ -2384,6 +2978,8 @@ def _workflow_is_wan22_i2v(settings: Dict[str, Any], type_id: str = "") -> bool:
     )
     if "wan" in text and ("i2v" in text or "image" in text):
         return True
+    if any(marker in text for marker in ("ltx", "hunyuan", "hunyu", "minimax")):
+        return False
     # Some cloned split workflows expose the source encode knobs even when an
     # older profile id is still saved. Treat those as source-conditioning
     # capable as long as this is a video workflow.
@@ -2409,11 +3005,11 @@ def _workflow_is_wan22(settings: Dict[str, Any], type_id: str = "") -> bool:
     )
     if "wan" in text:
         return True
+    if any(marker in text for marker in ("ltx", "hunyuan", "hunyu", "minimax")):
+        return False
     return any(str(settings.get(key) or "").strip() for key in (
         "wan_prompt_encoder_cache_mode",
         "wan_prompt_encoder_persist",
-        "text_encoder_gguf_path",
-        "clip_gguf_path",
     ))
 
 
@@ -2451,6 +3047,77 @@ def _workflow_path_value(*sources: Dict[str, Any], keys: Tuple[str, ...]) -> str
             if value is not None and str(value).strip():
                 return str(value).strip()
     return ""
+
+
+def _model_workflow_cached_worker_key(type_id: str, model: Dict[str, Any]) -> str:
+    settings = dict((model or {}).get("settings") or {})
+    model_id = str((model or {}).get("model_id") or settings.get("model_id") or "").strip()
+    flow_name = str(
+        settings.get("model_workflow_flow_name")
+        or settings.get("workflow_flow_name")
+        or settings.get("model_workflow_template_flow_name")
+        or ""
+    ).strip()
+    return ModelWorkflowProcessManager.stable_cache_key(
+        pid="default",
+        sid="_model_deck",
+        flow_name=flow_name,
+        model_id="",
+        type_id="",
+    )
+
+
+def _model_workflow_process_manager(app: Any) -> ModelWorkflowProcessManager:
+    mgr = getattr(app.state, "model_workflow_process_manager", None)
+    if mgr is None:
+        workspace_root = str(Path(__file__).resolve().parents[3])
+        mgr = ModelWorkflowProcessManager(workspace_root=workspace_root, python_exe=sys.executable)
+        app.state.model_workflow_process_manager = mgr
+    return mgr
+
+
+def _model_workflow_start_cached_worker(app: Any, type_id: str, model: Dict[str, Any], *, reason: str = "") -> Dict[str, Any]:
+    """Start a keyed workflow worker even when a model has no standalone warm node.
+
+    This makes the Model Deck Play button consistently mean "keep a cached
+    worker alive for this model/workflow." The actual model/prompt resources
+    are still loaded by normal Agent Flow nodes only when their settings ask to
+    persist.
+    """
+    settings = dict((model or {}).get("settings") or {})
+    model_id = str((model or {}).get("model_id") or settings.get("model_id") or "").strip()
+    flow_name = str(settings.get("model_workflow_flow_name") or settings.get("model_workflow_template_flow_name") or "").strip()
+    worker_key = _model_workflow_cached_worker_key(type_id, model)
+    run_id = f"cached_worker:{type_id}:{model_id or flow_name or 'default'}"
+    mgr = _model_workflow_process_manager(app)
+    result = mgr.call_tool(
+        run_id,
+        worker_key=worker_key,
+        keep_alive=True,
+        tool_name="models.cleanup",
+        ctx={
+            "pid": "default",
+            "sid": "_model_deck",
+            "settings": settings,
+            "ext": {
+                "model_workflow_run_id": run_id,
+                "agent_flow_run_id": run_id,
+                "flow_name": flow_name,
+            },
+        },
+        params={"run_id": run_id, "settings": settings},
+        timeout_s=30,
+    )
+    return {
+        "ok": bool((result or {}).get("ok", True)),
+        "supported": True,
+        "skipped": False,
+        "model_id": model_id,
+        "flow_name": flow_name,
+        "cached_worker_key": worker_key,
+        "reason": reason or "cached worker started",
+        "result": result,
+    }
 
 
 def _model_workflow_precache_source_conditioning(app: Any, type_id: str, model: Dict[str, Any]) -> Dict[str, Any]:
@@ -2591,7 +3258,12 @@ def _model_workflow_warm_prompt_encoder(app: Any, type_id: str, model: Dict[str,
     if _workflow_is_hunyuan15(settings, type_id):
         return _model_workflow_warm_hunyuan_prompt_encoder(app, type_id, model)
     if not _workflow_is_wan22(settings, type_id):
-        return {"ok": True, "supported": False, "skipped": True, "reason": "workflow has no supported prompt encoder warmup"}
+        return _model_workflow_start_cached_worker(
+            app,
+            type_id,
+            model,
+            reason="workflow has no standalone prompt encoder warmup; cached worker is ready for the next graph run",
+        )
 
     asset_values, setting_values = _model_workflow_asset_and_setting_values(model, type_id)
     merged_settings = {**settings, **setting_values}
@@ -2621,8 +3293,6 @@ def _model_workflow_warm_prompt_encoder(app: Any, type_id: str, model: Dict[str,
     negative = str(merged_settings.get("negative_prompt") or "").strip()
 
     try:
-        from plugins.gui_helpers.agent_flow.skills.models import wan22_prompt_encoder
-
         run_id = f"prompt_warm:{type_id}:{model_id or 'default'}"
         ctx = {
             "app": app,
@@ -2640,13 +3310,24 @@ def _model_workflow_warm_prompt_encoder(app: Any, type_id: str, model: Dict[str,
             "prompt": warm_prompt,
             "negative_prompt": negative,
         }
-        result = wan22_prompt_encoder.run(ctx, params)
+        mgr = _model_workflow_process_manager(app)
+        worker_key = _model_workflow_cached_worker_key(type_id, model)
+        result = mgr.call_tool(
+            run_id,
+            worker_key=worker_key,
+            keep_alive=True,
+            tool_name="models.wan22_prompt_encoder",
+            ctx=ctx,
+            params=params,
+            timeout_s=0,
+        )
         return {
             "ok": bool((result or {}).get("ok")),
             "supported": True,
             "skipped": False,
             "model_id": model_id,
             "cache_mode": cache_mode,
+            "cached_worker_key": worker_key,
             "result": result,
         }
     except Exception as exc:
@@ -2695,6 +3376,7 @@ def _model_workflow_warm_hunyuan_prompt_encoder(app: Any, type_id: str, model: D
     if cache_mode not in {"cpu", "vram"}:
         cache_mode = "cpu"
     merged_settings["hunyuan_text_encoder_cache_mode"] = cache_mode
+    merged_settings["hunyuan_text_encoder_persist"] = True
     merged_settings["model_workflow_use_model_deck_default_assets"] = False
     merged_settings["use_model_deck_default_assets"] = False
     merged_assets.setdefault("clip1_path", clip1)
@@ -2703,8 +3385,6 @@ def _model_workflow_warm_hunyuan_prompt_encoder(app: Any, type_id: str, model: D
     negative = str(merged_settings.get("negative_prompt") or "").strip()
 
     try:
-        from plugins.gui_helpers.agent_flow.skills.models import hunyuan15_text_encoder
-
         run_id = f"prompt_warm:{type_id}:{model_id or 'default'}"
         ctx = {
             "app": app,
@@ -2722,13 +3402,24 @@ def _model_workflow_warm_hunyuan_prompt_encoder(app: Any, type_id: str, model: D
             "prompt": warm_prompt,
             "negative_prompt": negative,
         }
-        result = hunyuan15_text_encoder.run(ctx, params)
+        mgr = _model_workflow_process_manager(app)
+        worker_key = _model_workflow_cached_worker_key(type_id, model)
+        result = mgr.call_tool(
+            run_id,
+            worker_key=worker_key,
+            keep_alive=True,
+            tool_name="models.hunyuan15_text_encoder",
+            ctx=ctx,
+            params=params,
+            timeout_s=0,
+        )
         return {
             "ok": bool((result or {}).get("ok")),
             "supported": True,
             "skipped": False,
             "model_id": model_id,
             "cache_mode": cache_mode,
+            "cached_worker_key": worker_key,
             "result": result,
         }
     except Exception as exc:
@@ -3194,7 +3885,8 @@ def install(app) -> None:
                 settings = _reconcile_managed_llama_server_settings(app, settings)
             except Exception:
                 settings = dict(settings or {})
-            m["settings"] = settings
+        settings = _sanitize_model_settings_for_type(tid, settings)
+        m["settings"] = settings
         mid = str(m.get("model_id") or "").strip()
         if not mid:
             raise HTTPException(400, "model.model_id required")
@@ -3280,7 +3972,27 @@ def install(app) -> None:
             str(req.pid or "default").strip() or "default",
             str(req.template_flow_name or "").strip(),
             dict(req.settings or {}),
+            bool(req.force_new),
         )
+
+    @r.post("/v1/model_deck/model/workflow/readiness")
+    def model_workflow_readiness(request: Request, req: WorkflowReadinessRequest):
+        require_gui_plugin_enabled(request, gui_plugin_id=GUI_PLUGIN_ID)
+        _require_model_deck_permission(app, request, "model_deck.view", "Model Deck is not available for this user")
+        tid = str(req.type_id or "").strip()
+        if tid not in ("image_gen", "video_gen"):
+            return {
+                "ok": True,
+                "type_id": tid,
+                "status": "unsupported_type",
+                "ready": True,
+                "summary": "Workflow asset validation only applies to image/video workflow models.",
+                "assets": [],
+                "missing_assets": [],
+                "optional_missing_assets": [],
+                "source_urls": {},
+            }
+        return _build_model_workflow_readiness(app, req)
 
     @r.post("/v1/model_deck/model/set_default")
     def set_default(request: Request, req: SetDefaultRequest):
@@ -3470,7 +4182,26 @@ def install(app) -> None:
             loaded = False
             loaded_model_id = ""
             loaded_slot = ""
-            if loader_id in gguf_ids:
+            entry_pid: Optional[int] = None
+            if _is_workflow_backend_model(m) and str(tid) in {"video_gen", "image_gen"}:
+                supports = True
+                backend_mode = "workflow"
+                worker_key = _model_workflow_cached_worker_key(str(tid), m)
+                try:
+                    mgr = _model_workflow_process_manager(app)
+                    loaded = bool(mgr.has_worker(worker_key))
+                    worker_rows = mgr.list_workers() if hasattr(mgr, "list_workers") else []
+                    for worker_row in worker_rows:
+                        if str(worker_row.get("worker_key") or "") == worker_key:
+                            server_pid_for_entry = worker_row.get("pid")
+                            if isinstance(server_pid_for_entry, int):
+                                entry_pid = server_pid_for_entry
+                            break
+                except Exception:
+                    loaded = False
+                loaded_model_id = mid
+                configured_model_path = str(settings.get("model_workflow_flow_name") or configured_model_path or "").strip()
+            elif loader_id in gguf_ids:
                 supports = bool(gguf_loader)
                 if supports and gguf_loader is not None and backend_mode != "llama_server":
                     try:
@@ -3513,7 +4244,7 @@ def install(app) -> None:
                 "slot": loaded_slot or slot,
                 "loaded": loaded,
                 "supports_load": supports,
-                "pid": None if (backend_mode or "embedded") == "llama_server" else (server_pid if loaded else None),
+                "pid": None if (backend_mode or "embedded") == "llama_server" else ((entry_pid or server_pid) if loaded else None),
                 "backend_mode": backend_mode or "embedded",
                 "managed_server_id": managed_id or None,
                 "managed_server": managed_status,
@@ -3922,7 +4653,7 @@ def install(app) -> None:
             _set_process_meta(app, slot, phase="warming_prompt_encoder", error="", note="", backend_mode="workflow")
             res = _model_workflow_warm_prompt_encoder(app, type_id, m)
             if not bool((res or {}).get("ok", False)):
-                short_error = str((res or {}).get("error") or "workflow prompt encoder warmup failed")
+                short_error = _model_workflow_error_message(res, "workflow prompt encoder warmup failed")
                 _set_process_meta(app, slot, phase="failed", error=short_error, note="", backend_mode="workflow")
                 raise HTTPException(500, short_error)
             skipped = bool((res or {}).get("skipped"))
@@ -4199,11 +4930,28 @@ def install(app) -> None:
             _set_process_meta(app, slot, phase="stopping", error="", note="", backend_mode="workflow")
             source_res = _clear_model_workflow_precache(app, model=m, type_id=type_id)
             prompt_res = _clear_model_workflow_prompt_encoder_cache(app, type_id=type_id)
+            worker_key = _model_workflow_cached_worker_key(type_id, m)
+            worker_released = False
+            try:
+                mgr = _model_workflow_process_manager(app)
+                worker_released = bool(mgr.release_cached(worker_key))
+            except Exception:
+                worker_released = False
             source_count = int((source_res or {}).get("removed_count") or 0)
             prompt_count = int((prompt_res or {}).get("cache_entries") or 0)
-            note = f"cleared {prompt_count} prompt encoder cache(s), {source_count} source cache resource(s)"
+            note = f"released cached worker={worker_released}; cleared {prompt_count} prompt encoder cache(s), {source_count} source cache resource(s)"
             _set_process_meta(app, slot, phase="stopped", error="", note=note, backend_mode="workflow", loaded=False)
-            return {"ok": True, "slot": slot, "result": {"ok": True, "prompt_encoder": prompt_res, "source_conditioning": source_res}}
+            return {
+                "ok": True,
+                "slot": slot,
+                "result": {
+                    "ok": True,
+                    "cached_worker_key": worker_key,
+                    "cached_worker_released": worker_released,
+                    "prompt_encoder": prompt_res,
+                    "source_conditioning": source_res,
+                },
+            }
 
         if loader_id in _media_loader_ids():
             settings = dict((m or {}).get("settings") or {})

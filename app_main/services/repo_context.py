@@ -637,12 +637,69 @@ class RepoContextService:
             urag_cfg.setdefault("max_hit_chars", 12000)  # clamp any single hit
 
             try:
-                hits = user_rag.search(sid, query, k=k_total, max_chars=max_chars)
-
+                hot_hits = user_rag.search(sid, query, k=k_total, max_chars=max_chars)
             except Exception as e:
                 print(2342342323)
                 print(e)
-                return [], []
+                hot_hits = []
+            try:
+                cold_hits = user_rag.cold_search(
+                    sid,
+                    query,
+                    k=k_total,
+                    max_chars=max_chars,
+                    version_mode="",
+                )
+                # In normal chat-memory mode, use cold chat records too.  Repo
+                # cold context is handled by the repo-context branch and should
+                # not pollute ordinary conversation memory.
+                cold_hits = [
+                    h for h in (cold_hits or [])
+                    if str(((h.get("metadata") or {}).get("kind") or "")).lower().startswith("chat_")
+                ]
+            except Exception as e:
+                if "object has no attribute 'search'" not in str(e):
+                    print("[user_rag] cold chat search failed:", e)
+                cold_hits = []
+            try:
+                cold_store = user_rag._get_cold_store(sid)
+                recent_docs = []
+                iter_docs = getattr(cold_store, "iter_docs", None)
+                if callable(iter_docs):
+                    for doc in iter_docs():
+                        meta = doc.get("meta") or doc.get("metadata") or {}
+                        kind = str(meta.get("kind") or "").lower()
+                        if not kind.startswith("chat_"):
+                            continue
+                        text = str(doc.get("text") or "").strip()
+                        if not text:
+                            continue
+                        recent_docs.append(
+                            {
+                                "id": doc.get("id"),
+                                "score": 0.50,
+                                "text": text[:max_chars],
+                                "metadata": meta,
+                            }
+                        )
+                # Recent chat turns are important for Budget / Last Assistant
+                # context even when semantic search is unavailable or weak.
+                if recent_docs:
+                    cold_hits.extend(recent_docs[-8:])
+            except Exception as e:
+                print("[user_rag] recent cold chat fallback failed:", e)
+
+            hits = []
+            seen_hit_ids = set()
+            for h in list(hot_hits or []) + list(cold_hits or []):
+                doc_id = h.get("id") or h.get("doc_id")
+                key = doc_id or (str(h.get("text") or "")[:128])
+                if key in seen_hit_ids:
+                    continue
+                seen_hit_ids.add(key)
+                hits.append(h)
+            hits.sort(key=lambda h: float(h.get("score") or 0.0), reverse=True)
+            hits = hits[:k_total]
 
             if not hits:
                 return [], []
@@ -760,6 +817,28 @@ class RepoContextService:
                         blocks.append("Chat summary may not be neccessarly related the file witin the repo id. Conversation summary:\n" + chat_summary)
                         # blocks.append("You are an image analyzer. If a user attached an image path read it and analyze if for the user. Conversation summary:\n")
                         tokens_used += t
+                else:
+                    # Memory retrieval should not depend on the optional side
+                    # summarizer being loaded.  When summarization is
+                    # unavailable or returns empty, inject compact raw chat
+                    # snippets so Budget / Last Assistant modes can still
+                    # remember prior turns.
+                    raw_blocks = []
+                    remaining = max(0, extra_budget_tokens - tokens_used)
+                    per_hit_tokens = max(48, min(256, remaining // max(1, len(chat_hits))))
+                    for h in chat_hits:
+                        text = str(h.get("text") or "").strip()
+                        if not text:
+                            continue
+                        score = float(h.get("score") or 0.0)
+                        if self._count_tokens(tokenizer, text) > per_hit_tokens:
+                            text = text[: max(160, per_hit_tokens * 4)].rstrip()
+                        raw_blocks.append(f"[Memory {len(raw_blocks)+1}] score={score:.3f}\n{text}")
+                        tokens_used += self._count_tokens(tokenizer, text)
+                        if tokens_used >= extra_budget_tokens:
+                            break
+                    if raw_blocks:
+                        blocks.append("Relevant prior conversation memory:\n\n" + "\n\n".join(raw_blocks))
 
             if not blocks:
                 return [], []

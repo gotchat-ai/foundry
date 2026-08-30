@@ -8,6 +8,15 @@ from lib_rag import LibRAG
 from rag_store import RagStore
 from user_rag import UserRagManager
 
+DEFAULT_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+
+
+def _normalize_embed_model(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text or text.lower() in {"none", "null", "undefined"}:
+        return DEFAULT_EMBED_MODEL
+    return text
+
 
 @dataclass
 class RagRuntimeState:
@@ -38,7 +47,7 @@ class RagRuntime:
         user_rag_autosave: bool,
     ):
         self.settings = settings or {}
-        self.embed_model = embed_model
+        self.embed_model = _normalize_embed_model(embed_model)
         self.enable_rag = enable_rag
         self.rag_dir = rag_dir
         self.rag_autosave = rag_autosave

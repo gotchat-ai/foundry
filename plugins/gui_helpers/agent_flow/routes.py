@@ -5,6 +5,7 @@ import inspect
 import os
 import re
 import secrets
+import sys
 import threading
 import time
 import hashlib
@@ -35,6 +36,7 @@ from .skills.workflow._common import (
     _resolve_cross_env_generated_path,
 )
 from .skills.workflow import _workflow_store
+from .model_workflow_process import ModelWorkflowProcessManager
 
 
 GUI_PLUGIN_ID = "agent_flow"
@@ -76,11 +78,91 @@ class AgentFlowNodeActionRequest(BaseModel):
     ext: Dict[str, Any] = Field(default_factory=dict)
 
 
+def _truthy_setting(*values: Any) -> bool:
+    for value in values:
+        text = str(value or "").strip().lower()
+        if text in {"1", "true", "yes", "on", "enabled", "persist", "persistent", "keep", "vram", "gpu", "cpu"}:
+            return True
+    return False
+
+
+def _model_workflow_cache_key_from_parts(
+    *,
+    pid: str = "",
+    sid: str = "",
+    flow_name: str = "",
+    type_id: str = "",
+    model_id: str = "",
+    settings: Optional[Dict[str, Any]] = None,
+    params: Optional[Dict[str, Any]] = None,
+) -> str:
+    settings = settings if isinstance(settings, dict) else {}
+    params = params if isinstance(params, dict) else {}
+    explicit = (
+        settings.get("model_workflow_cached_worker_key")
+        or settings.get("workflow_cached_worker_key")
+        or params.get("model_workflow_cached_worker_key")
+        or params.get("workflow_cached_worker_key")
+        or ""
+    )
+    if str(explicit or "").strip():
+        return str(explicit or "").strip()
+    flow = str(
+        flow_name
+        or settings.get("model_workflow_flow_name")
+        or settings.get("workflow_flow_name")
+        or params.get("flow_name")
+        or params.get("model_workflow_flow_name")
+        or ""
+    ).strip()
+    # Flow names are stable and unique for Model Deck-owned workflows. Individual
+    # node params do not always carry the deck model_id, so including it here can
+    # make a warmed worker impossible to find during the later Agent Flow run.
+    return ModelWorkflowProcessManager.stable_cache_key(pid=pid, sid=sid, flow_name=flow, model_id="", type_id=type_id)
+
+
+def _model_workflow_wants_cached_worker(settings: Optional[Dict[str, Any]], params: Optional[Dict[str, Any]]) -> bool:
+    settings = settings if isinstance(settings, dict) else {}
+    params = params if isinstance(params, dict) else {}
+    values = [
+        settings.get("model_workflow_cached_worker"),
+        settings.get("workflow_cached_worker"),
+        settings.get("model_workflow_persist_worker"),
+        settings.get("workflow_persist_worker"),
+        params.get("model_workflow_cached_worker"),
+        params.get("workflow_cached_worker"),
+        params.get("model_workflow_persist_worker"),
+        params.get("workflow_persist_worker"),
+    ]
+    if _truthy_setting(*values):
+        return True
+    # Prompt/model persistence is an explicit opt-in to keep the worker alive.
+    return _truthy_setting(
+        settings.get("prompt_encoder_persist"),
+        settings.get("wan_prompt_encoder_persist"),
+        settings.get("hunyuan_prompt_encoder_persist"),
+        settings.get("hunyuan_text_encoder_persist"),
+        settings.get("minimax_text_encoder_persist"),
+        settings.get("model_persist"),
+        settings.get("transformer_persist"),
+        params.get("prompt_encoder_persist"),
+        params.get("wan_prompt_encoder_persist"),
+        params.get("model_persist"),
+        params.get("transformer_persist"),
+    )
+
+
 def install(app) -> None:
     if not hasattr(app.state, "agent_flow_runs"):
         app.state.agent_flow_runs = {}
     if not hasattr(app.state, "agent_flow_runs_lock"):
         app.state.agent_flow_runs_lock = threading.Lock()
+    if not hasattr(app.state, "model_workflow_process_manager"):
+        workspace_root = str(Path(__file__).resolve().parents[3])
+        app.state.model_workflow_process_manager = ModelWorkflowProcessManager(
+            workspace_root=workspace_root,
+            python_exe=sys.executable,
+        )
 
     skill_load_info = register_agent_flow_skills(app)
 
@@ -3211,6 +3293,16 @@ def install(app) -> None:
                 state["paused"] = False
                 state["pause_requested"] = False
                 state["status"] = "Canceled"
+                try:
+                    for step_state in state.get("steps") or []:
+                        if not isinstance(step_state, dict):
+                            continue
+                        if step_state.get("state") == "running":
+                            step_state["state"] = "canceled"
+                        elif step_state.get("state") in {None, "", "pending", "queued"}:
+                            step_state["state"] = "skipped"
+                except Exception:
+                    pass
                 _agent_flow_set_state(pid, sid, state, preserve_pause=False)
                 _publish_flow_status({"running": False, "paused": False, "pause_requested": False, "canceled": True})
 
@@ -4197,7 +4289,49 @@ def install(app) -> None:
                         "user_text": request_seed_text,
                         "original_request": request_seed_text,
                     }
-                    raw_res = aw_call(tool_name, tool_ctx, merged_params)
+                    if str(tool_name or "").startswith("models."):
+                        try:
+                            mgr = getattr(app.state, "model_workflow_process_manager", None)
+                            if mgr is None:
+                                workspace_root = str(Path(__file__).resolve().parents[3])
+                                mgr = ModelWorkflowProcessManager(workspace_root=workspace_root, python_exe=sys.executable)
+                                app.state.model_workflow_process_manager = mgr
+
+                            def _transition_model_progress(message: str, **extra: Any) -> None:
+                                text_msg = str(message or "").strip()
+                                if text_msg:
+                                    _publish_step_stream(f"[agent_flow] {label}: {text_msg}")
+
+                            _publish_step_stream(f"[agent_flow] {label}: model workflow worker dispatch -> {tool_name}")
+                            cache_key = _model_workflow_cache_key_from_parts(
+                                pid=pid,
+                                sid=sid,
+                                flow_name=flow_name,
+                                settings=settings if isinstance(settings, dict) else {},
+                                params=merged_params if isinstance(merged_params, dict) else {},
+                            )
+                            keep_worker = _model_workflow_wants_cached_worker(
+                                settings if isinstance(settings, dict) else {},
+                                merged_params if isinstance(merged_params, dict) else {},
+                            )
+                            if not keep_worker and cache_key and hasattr(mgr, "has_worker"):
+                                keep_worker = bool(mgr.has_worker(cache_key))
+                            worker_key_arg = cache_key if keep_worker else None
+                            raw_res = mgr.call_tool(
+                                run_id,
+                                worker_key=worker_key_arg,
+                                keep_alive=keep_worker,
+                                tool_name=tool_name,
+                                ctx=tool_ctx,
+                                params=merged_params,
+                                progress=_transition_model_progress,
+                                cancel_check=_is_canceled,
+                                timeout_s=0,
+                            )
+                        except Exception:
+                            raise
+                    else:
+                        raw_res = aw_call(tool_name, tool_ctx, merged_params)
                     if not isinstance(raw_res, dict):
                         raw_res = {"ok": False, "warnings": ["transition_action_invalid_result"], "data": {"result": raw_res}}
                     tr_row = {
@@ -6717,20 +6851,109 @@ def install(app) -> None:
 
                             tool_settings = dict(settings)
                             tool_settings["__agent_flow_progress_callback"] = _model_tool_progress
-                            raw_res = aw_call(
-                                tool_name,
-                                {
-                                    "app": app,
-                                    "pid": pid,
-                                    "sid": sid,
-                                    "settings": tool_settings,
-                                    "ext": dict(step_ext) if isinstance(step_ext, dict) else {},
-                                    "user_text": request_seed_text,
-                                    "original_request": request_seed_text,
-                                    "progress": _model_tool_progress,
-                                },
-                                merged_params,
-                            )
+                            tool_ctx = {
+                                "app": app,
+                                "pid": pid,
+                                "sid": sid,
+                                "settings": tool_settings,
+                                "ext": dict(step_ext) if isinstance(step_ext, dict) else {},
+                                "user_text": request_seed_text,
+                                "original_request": request_seed_text,
+                                "progress": _model_tool_progress,
+                            }
+                            worker_enabled = False
+                            model_settings_for_worker: Dict[str, Any] = {}
+                            if str(tool_name or "").startswith("models."):
+                                try:
+                                    model_settings_for_worker = merged_params.get("settings") if isinstance(merged_params.get("settings"), dict) else {}
+                                    disable_worker = str(
+                                        model_settings_for_worker.get("model_workflow_process_worker")
+                                        or model_settings_for_worker.get("workflow_process_worker")
+                                        or merged_params.get("model_workflow_process_worker")
+                                        or ""
+                                    ).strip().lower() in {"0", "false", "no", "off", "disabled", "inline"}
+                                    worker_enabled = not disable_worker
+                                except Exception:
+                                    worker_enabled = True
+                            if worker_enabled:
+                                mgr = getattr(app.state, "model_workflow_process_manager", None)
+                                if mgr is None:
+                                    workspace_root = str(Path(__file__).resolve().parents[3])
+                                    mgr = ModelWorkflowProcessManager(workspace_root=workspace_root, python_exe=sys.executable)
+                                    app.state.model_workflow_process_manager = mgr
+                                _publish_step_stream(f"[agent_flow] {label}: model workflow worker dispatch -> {tool_name}")
+                                timeout_raw = (
+                                    model_settings_for_worker.get("workflow_node_timeout_seconds")
+                                    or model_settings_for_worker.get("workflow_node_timeout")
+                                    or merged_params.get("workflow_node_timeout_seconds")
+                                    or merged_params.get("workflow_node_timeout")
+                                    or 0
+                                )
+                                try:
+                                    timeout_s = float(timeout_raw or 0)
+                                except Exception:
+                                    timeout_s = 0.0
+                                raw_res = mgr.call_tool(
+                                    run_id,
+                                    worker_key=(
+                                        _model_workflow_cache_key_from_parts(
+                                            pid=pid,
+                                            sid=sid,
+                                            flow_name=flow_name,
+                                            settings=model_settings_for_worker,
+                                            params=merged_params if isinstance(merged_params, dict) else {},
+                                        )
+                                        if (
+                                            _model_workflow_wants_cached_worker(
+                                                model_settings_for_worker,
+                                                merged_params if isinstance(merged_params, dict) else {},
+                                            )
+                                            or (
+                                                hasattr(mgr, "has_worker")
+                                                and mgr.has_worker(
+                                                    _model_workflow_cache_key_from_parts(
+                                                        pid=pid,
+                                                        sid=sid,
+                                                        flow_name=flow_name,
+                                                        settings=model_settings_for_worker,
+                                                        params=merged_params if isinstance(merged_params, dict) else {},
+                                                    )
+                                                )
+                                            )
+                                        )
+                                        else None
+                                    ),
+                                    keep_alive=(
+                                        _model_workflow_wants_cached_worker(
+                                            model_settings_for_worker,
+                                            merged_params if isinstance(merged_params, dict) else {},
+                                        )
+                                        or (
+                                            hasattr(mgr, "has_worker")
+                                            and mgr.has_worker(
+                                                _model_workflow_cache_key_from_parts(
+                                                    pid=pid,
+                                                    sid=sid,
+                                                    flow_name=flow_name,
+                                                    settings=model_settings_for_worker,
+                                                    params=merged_params if isinstance(merged_params, dict) else {},
+                                                )
+                                            )
+                                        )
+                                    ),
+                                    tool_name=tool_name,
+                                    ctx=tool_ctx,
+                                    params=merged_params,
+                                    progress=_model_tool_progress,
+                                    cancel_check=_is_canceled,
+                                    timeout_s=timeout_s,
+                                )
+                            else:
+                                raw_res = aw_call(
+                                    tool_name,
+                                    tool_ctx,
+                                    merged_params,
+                                )
                         except Exception as exc:
                             _publish_step_stream(f"[agent_flow] {label}: direct tool_node failed -> {tool_name}: {type(exc).__name__}")
                             raw_res = {
@@ -7191,7 +7414,76 @@ def install(app) -> None:
                                     "user_text": request_seed_text,
                                     "original_request": request_seed_text,
                                 }
-                                raw_res = aw_call(tool_name, tool_ctx, merged_params)
+                                if str(tool_name or "").startswith("models."):
+                                    mgr = getattr(app.state, "model_workflow_process_manager", None)
+                                    if mgr is None:
+                                        workspace_root = str(Path(__file__).resolve().parents[3])
+                                        mgr = ModelWorkflowProcessManager(workspace_root=workspace_root, python_exe=sys.executable)
+                                        app.state.model_workflow_process_manager = mgr
+
+                                    def _fallback_model_progress(message: str, **extra: Any) -> None:
+                                        text_msg = str(message or "").strip()
+                                        if text_msg:
+                                            _publish_step_stream(f"[agent_flow] {label}: {text_msg}")
+
+                                    _publish_step_stream(f"[agent_flow] {label}: model workflow worker dispatch -> {tool_name}")
+                                    raw_res = mgr.call_tool(
+                                        run_id,
+                                        worker_key=(
+                                            _model_workflow_cache_key_from_parts(
+                                                pid=pid,
+                                                sid=sid,
+                                                flow_name=flow_name,
+                                                settings=settings if isinstance(settings, dict) else {},
+                                                params=merged_params if isinstance(merged_params, dict) else {},
+                                            )
+                                            if (
+                                                _model_workflow_wants_cached_worker(
+                                                    settings if isinstance(settings, dict) else {},
+                                                    merged_params if isinstance(merged_params, dict) else {},
+                                                )
+                                                or (
+                                                    hasattr(mgr, "has_worker")
+                                                    and mgr.has_worker(
+                                                        _model_workflow_cache_key_from_parts(
+                                                            pid=pid,
+                                                            sid=sid,
+                                                            flow_name=flow_name,
+                                                            settings=settings if isinstance(settings, dict) else {},
+                                                            params=merged_params if isinstance(merged_params, dict) else {},
+                                                        )
+                                                    )
+                                                )
+                                            )
+                                            else None
+                                        ),
+                                        keep_alive=(
+                                            _model_workflow_wants_cached_worker(
+                                                settings if isinstance(settings, dict) else {},
+                                                merged_params if isinstance(merged_params, dict) else {},
+                                            )
+                                            or (
+                                                hasattr(mgr, "has_worker")
+                                                and mgr.has_worker(
+                                                    _model_workflow_cache_key_from_parts(
+                                                        pid=pid,
+                                                        sid=sid,
+                                                        flow_name=flow_name,
+                                                        settings=settings if isinstance(settings, dict) else {},
+                                                        params=merged_params if isinstance(merged_params, dict) else {},
+                                                    )
+                                                )
+                                            )
+                                        ),
+                                        tool_name=tool_name,
+                                        ctx=tool_ctx,
+                                        params=merged_params,
+                                        progress=_fallback_model_progress,
+                                        cancel_check=_is_canceled,
+                                        timeout_s=0,
+                                    )
+                                else:
+                                    raw_res = aw_call(tool_name, tool_ctx, merged_params)
                                 if not isinstance(raw_res, dict):
                                     raw_res = {"ok": False, "warnings": ["tool_fallback_invalid_result"], "data": {"result": raw_res}}
                                 tr_row = {
@@ -7491,6 +7783,61 @@ def install(app) -> None:
                                                 p_fb = tc_enf.get("fallback_params") if isinstance(tc_enf.get("fallback_params"), dict) else {}
                                                 params_enf.update(dict(p_cfg))
                                                 params_enf.update(dict(p_fb))
+                                                p_from_input = tc_enf.get("params_from_input") if isinstance(tc_enf.get("params_from_input"), list) else []
+                                                prior_file_hints = []
+                                                for report_hint in (last_step_report, last_step_report_with_tools, prev_step_report, prev_step_report_with_tools):
+                                                    prior_file_hints.extend(_tool_result_paths(report_hint if isinstance(report_hint, dict) else None))
+                                                request_file_hint = _extract_candidate_file_from_text(user_text)
+                                                if request_file_hint:
+                                                    prior_file_hints.append(request_file_hint)
+                                                file_hint_enf = str(prior_file_hints[0] if prior_file_hints else "").strip()
+
+                                                def _prior_enforced_value(pname: str) -> Any:
+                                                    key = str(pname or "").strip()
+                                                    if not key:
+                                                        return None
+                                                    for report_obj in (last_step_report, last_step_report_with_tools, prev_step_report, prev_step_report_with_tools):
+                                                        if not isinstance(report_obj, dict):
+                                                            continue
+                                                        if key in report_obj and report_obj.get(key) not in (None, "", [], {}):
+                                                            return report_obj.get(key)
+                                                        tr_rows = report_obj.get("tool_results") if isinstance(report_obj.get("tool_results"), list) else []
+                                                        for tr_row in tr_rows:
+                                                            if not isinstance(tr_row, dict):
+                                                                continue
+                                                            data_row = tr_row.get("data") if isinstance(tr_row.get("data"), dict) else {}
+                                                            if key in data_row and data_row.get(key) not in (None, "", [], {}):
+                                                                return data_row.get(key)
+                                                            if key in tr_row and tr_row.get(key) not in (None, "", [], {}):
+                                                                return tr_row.get(key)
+                                                    return None
+
+                                                for pkey0 in p_from_input:
+                                                    pkey = str(pkey0 or "").strip()
+                                                    if not pkey:
+                                                        continue
+                                                    if pkey in {"current_request_text", "request_text", "user_request", "request", "prompt", "query", "text"}:
+                                                        params_enf.setdefault(pkey, user_text)
+                                                        continue
+                                                    if (
+                                                        pkey in params_enf
+                                                        and str(params_enf.get(pkey) or "").strip()
+                                                        and pkey not in {"file", "path", "file_path", "input_path", "source_pdf_path"}
+                                                    ):
+                                                        continue
+                                                    v_enf = _coalesce_param_value(
+                                                        step_ext.get(pkey),
+                                                        ext.get(pkey) if isinstance(ext, dict) else None,
+                                                        (step.get("input") if isinstance(step.get("input"), dict) else {}).get(pkey),
+                                                    )
+                                                    if v_enf is None:
+                                                        v_enf = _prior_enforced_value(pkey)
+                                                    if v_enf is None and pkey in {"file", "path", "file_path", "input_path", "source_pdf_path"}:
+                                                        v_enf = file_hint_enf
+                                                    if v_enf is not None and str(v_enf).strip():
+                                                        params_enf[pkey] = v_enf
+                                                if sid_l.startswith("sheet.") and not any(str(params_enf.get(k) or "").strip() for k in ("file", "path", "file_path", "input_path")) and file_hint_enf:
+                                                    params_enf["path"] = file_hint_enf
                                             if not params_enf:
                                                 params_enf = {"user_request": user_text}
                                             if sid_l.startswith("result."):
@@ -8723,6 +9070,56 @@ def install(app) -> None:
                         pass
                 _publish_flow_status({"running": False, "paused": False, "pause_requested": False, "error": str(exc)})
             finally:
+                try:
+                    mgr = getattr(app.state, "model_workflow_process_manager", None)
+                    if mgr is not None and hasattr(mgr, "shutdown"):
+                        mgr.shutdown(run_id, keep_cache=False)
+                except Exception as exc:
+                    try:
+                        print(f"[agent_flow] model workflow worker shutdown failed run_id={run_id}: {exc}", flush=True)
+                    except Exception:
+                        pass
+                try:
+                    from .skills.models._model_lifecycle import ModelLifecycleManager, comfy_global_cleanup
+                    from .skills.models._model_workflow_common import (
+                        accelerator_cleanup as _model_accelerator_cleanup,
+                        model_workflow_state as _model_workflow_state,
+                        process_memory_trim as _model_process_memory_trim,
+                        release_workflow_object as _release_workflow_object,
+                        unload_runtime_modules as _unload_model_runtime_modules,
+                    )
+
+                    mw_state = _model_workflow_state({"app": app})
+                    resources = mw_state.get("resources") if isinstance(mw_state, dict) else None
+                    released = 0
+                    if isinstance(resources, dict):
+                        for resource_key in list(resources.keys()):
+                            key_text = str(resource_key or "")
+                            if key_text.startswith("cache:"):
+                                continue
+                            if key_text.startswith(run_id + ":"):
+                                released += _release_workflow_object(resources.get(resource_key))
+                                resources.pop(resource_key, None)
+                    lifecycle_report = ModelLifecycleManager.purge_global_resources(diagnostics=[])
+                    comfy_report = comfy_global_cleanup(unload_models=True, soft_empty=True)
+                    unloaded_modules = _unload_model_runtime_modules()
+                    _model_accelerator_cleanup()
+                    trim_report = _model_process_memory_trim()
+                    if released or lifecycle_report.get("released_values") or unloaded_modules:
+                        print(
+                            "[agent_flow] model workflow final cleanup "
+                            f"run_id={run_id} resources={released} "
+                            f"lifecycle={lifecycle_report.get('released_values')} "
+                            f"comfy_loaded_after={comfy_report.get('loaded_after')} "
+                            f"modules={unloaded_modules} "
+                            f"trim={trim_report.get('method') or 'none'} ok={trim_report.get('ok')}",
+                            flush=True,
+                        )
+                except Exception as exc:
+                    try:
+                        print(f"[agent_flow] model workflow final cleanup failed run_id={run_id}: {exc}", flush=True)
+                    except Exception:
+                        pass
                 if ai_jobs:
                     ai_jobs.remove(run_id)
                 try:
@@ -8843,7 +9240,24 @@ def install(app) -> None:
         _require_session_access(app, u, pid, sid)
         action = str(req.action or "warm_prompt_encoder").strip().lower()
         if action in {"stop", "clear", "clear_cache", "clear_source_conditioning_cache", "clear_model_workflow_cache", "unload"}:
-            return {"ok": True, "action": action, "result": _agent_flow_clear_model_workflow_caches()}
+            released_worker = False
+            try:
+                params0 = dict(req.params or {}) if isinstance(req.params, dict) else {}
+                settings0 = params0.get("settings") if isinstance(params0.get("settings"), dict) else {}
+                worker_key = _model_workflow_cache_key_from_parts(
+                    pid=pid,
+                    sid=sid,
+                    flow_name=str(req.flow_name or "").strip(),
+                    settings=settings0,
+                    params=params0,
+                )
+                mgr = getattr(app.state, "model_workflow_process_manager", None)
+                if mgr is not None and hasattr(mgr, "release_cached"):
+                    released_worker = bool(mgr.release_cached(worker_key))
+            except Exception:
+                released_worker = False
+            cleared = _agent_flow_clear_model_workflow_caches()
+            return {"ok": True, "action": action, "released_cached_worker": released_worker, "result": cleared}
 
         project_flows = _load_project_flows(pid).get("flows")
         default_flows = _load_default_flows_doc().get("flows")
@@ -8919,7 +9333,31 @@ def install(app) -> None:
                 **(dict(req.ext or {}) if isinstance(req.ext, dict) else {}),
             },
         }
-        result = _agent_flow_direct_model_tool_call(tool, ctx0, params)
+        if tool.lower().startswith("models."):
+            mgr = getattr(app.state, "model_workflow_process_manager", None)
+            if mgr is None:
+                workspace_root = str(Path(__file__).resolve().parents[3])
+                mgr = ModelWorkflowProcessManager(workspace_root=workspace_root, python_exe=sys.executable)
+                app.state.model_workflow_process_manager = mgr
+            settings_for_key = params.get("settings") if isinstance(params.get("settings"), dict) else {}
+            worker_key = _model_workflow_cache_key_from_parts(
+                pid=pid,
+                sid=sid,
+                flow_name=flow_name,
+                settings=settings_for_key,
+                params=params,
+            )
+            result = mgr.call_tool(
+                node_run_id,
+                worker_key=worker_key,
+                keep_alive=True,
+                tool_name=tool,
+                ctx=ctx0,
+                params=params,
+                timeout_s=0,
+            )
+        else:
+            result = _agent_flow_direct_model_tool_call(tool, ctx0, params)
         return {"ok": bool(result.get("ok", True)), "action": action, "flow_name": flow_name, "node_id": node_id, "tool": tool, "result": result}
 
     @r.get("/v1/projects/{pid}/sessions/{sid}/agent_flow/status")

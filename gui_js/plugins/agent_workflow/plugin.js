@@ -76,6 +76,9 @@ function ensureStyles() {
 .aw-job-group .aw-job-badge { display: none; }
 .aw-job-stream { max-height: 180px; overflow: auto; border-top: 1px solid var(--border); background: rgba(var(--panel-rgb), 0.6); }
 .aw-job-stream pre { margin: 0; padding: 8px 10px; white-space: pre-wrap; word-break: break-word; font-size: 12px; line-height: 1.35; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+.aw-job-chart-result { margin: 10px; }
+.aw-job-chart-result .aw-result-body { display: flex; flex-direction: column; gap: 14px; }
+.aw-job-chart-result .block-chart { margin: 0; }
 .aw-job-interaction { border-top: 1px solid var(--border); padding: 10px; background: rgba(var(--panel-rgb), 0.86); display: flex; flex-direction: column; gap: 8px; }
 .aw-job-interaction-title { font-size: 11px; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ui-muted); }
 .aw-job-interaction-question { font-size: 13px; line-height: 1.45; }
@@ -467,6 +470,72 @@ function parseKeyedResultText(content) {
   return { answer: String(answer || "").trim(), details };
 }
 
+const AW_CHART_FENCE_RE = /(```|'''|""")[ \t]*(?:chart|chartjson|charts)[^\r\n]*\r?\n([\s\S]*?)\1[ \t]*/gi;
+const AW_CHART_TAG_RE = /<chart\b[^>]*>[\s\S]*?<\/chart>/gi;
+
+function extractChartPayloadText(text) {
+  const src = String(text || "");
+  const parts = [];
+  AW_CHART_FENCE_RE.lastIndex = 0;
+  let m;
+  while ((m = AW_CHART_FENCE_RE.exec(src)) !== null) {
+    if (String(m[0] || "").trim()) parts.push(String(m[0] || "").trim());
+  }
+  AW_CHART_TAG_RE.lastIndex = 0;
+  while ((m = AW_CHART_TAG_RE.exec(src)) !== null) {
+    if (String(m[0] || "").trim()) parts.push(String(m[0] || "").trim());
+  }
+  return parts.join("\n\n").trim();
+}
+
+function stripChartPayloadText(text) {
+  AW_CHART_FENCE_RE.lastIndex = 0;
+  AW_CHART_TAG_RE.lastIndex = 0;
+  return String(text || "")
+    .replace(AW_CHART_FENCE_RE, "")
+    .replace(AW_CHART_TAG_RE, "")
+    .replace(/\n{3,}/g, "\n\n");
+}
+
+function renderAgentJobChartPayload(box, text, msg, ctx) {
+  if (!box) return { rendered: false, displayText: String(text || "") };
+  const renderTextWithPlugins = (typeof window !== "undefined" && typeof window.renderTextWithPlugins === "function")
+    ? window.renderTextWithPlugins
+    : null;
+  const chartPayload = extractChartPayloadText(text);
+  let panel = box.querySelector(".aw-job-chart-result");
+  if (!renderTextWithPlugins || !chartPayload) {
+    if (panel) panel.remove();
+    return { rendered: false, displayText: String(text || "") };
+  }
+  if (!panel) {
+    panel = document.createElement("div");
+    panel.className = "aw-job-chart-result aw-result-card";
+    const head = document.createElement("div");
+    head.className = "aw-result-head";
+    const title = document.createElement("span");
+    title.textContent = "Workflow Result";
+    const mode = document.createElement("span");
+    mode.textContent = "Chart";
+    head.appendChild(title);
+    head.appendChild(mode);
+    const body = document.createElement("div");
+    body.className = "aw-result-body";
+    panel.appendChild(head);
+    panel.appendChild(body);
+    const stream = box.querySelector(".aw-job-stream");
+    if (stream && stream.nextSibling) box.insertBefore(panel, stream.nextSibling);
+    else box.appendChild(panel);
+  }
+  if (panel.dataset.chartPayload !== chartPayload) {
+    panel.dataset.chartPayload = chartPayload;
+    const body = panel.querySelector(".aw-result-body") || panel;
+    body.innerHTML = "";
+    renderTextWithPlugins(body, chartPayload, { msg });
+  }
+  return { rendered: true, displayText: stripChartPayloadText(text) };
+}
+
 function renderResultTextMessage(msg, ctx) {
   if (!isResultTextMessage(msg)) return null;
   ensureStyles();
@@ -511,7 +580,13 @@ function renderResultTextMessage(msg, ctx) {
   const renderGridMarkdownSections = (typeof window !== "undefined" && typeof window.renderGridMarkdownSections === "function")
     ? window.renderGridMarkdownSections
     : null;
-  if (renderGridMarkdownSections) {
+  const renderTextWithPlugins = (typeof window !== "undefined" && typeof window.renderTextWithPlugins === "function")
+    ? window.renderTextWithPlugins
+    : null;
+  const hasChartPayload = /(?:```|'''|""")[ \t]*(?:chart|chartjson|charts)(?:\s|\r?\n)|<chart\b/i.test(answer);
+  if (hasChartPayload && renderTextWithPlugins) {
+    renderTextWithPlugins(body, answer, { msg });
+  } else if (renderGridMarkdownSections) {
     const rendered = renderGridMarkdownSections(answer, renderMarkdown);
     if (rendered) {
       body.innerHTML = "";
@@ -1166,9 +1241,11 @@ function renderAgentJobsGroup(msg, ctx) {
   }
   const streamShouldStick = shouldStickAgentJobStreamBottom(stream);
   if (badge) badge.textContent = `${g.count} update${g.count === 1 ? "" : "s"}${g.running ? " • running" : ""}`;
+  const chartRender = renderAgentJobChartPayload(box, g.text, msg, ctx);
+  const displayText = chartRender.rendered ? chartRender.displayText : g.text;
   let textChanged = false;
-  if (pre && pre.textContent !== g.text) {
-    pre.textContent = g.text;
+  if (pre && pre.textContent !== displayText) {
+    pre.textContent = displayText;
     textChanged = true;
   }
   if (box) box.open = true;
@@ -1947,9 +2024,11 @@ async function runWorkflowFromPayload(ctx, payload) {
     const transcriptShouldStick = shouldStickTranscriptBottom(transcript);
     const stream = pre?.closest?.(".aw-job-stream");
     const streamShouldStick = shouldStickAgentJobStreamBottom(stream);
+    const chartRender = renderAgentJobChartPayload(box, streamLog, { role: "assistant", content: streamLog }, ctx);
+    const displayText = chartRender.rendered ? chartRender.displayText : streamLog;
     let textChanged = false;
-    if (pre && pre.textContent !== streamLog) {
-      pre.textContent = streamLog;
+    if (pre && pre.textContent !== displayText) {
+      pre.textContent = displayText;
       textChanged = true;
     }
     if (box) box.open = true;

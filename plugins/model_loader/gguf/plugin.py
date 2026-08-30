@@ -19,6 +19,15 @@ try:
 except Exception:
     publish_gui_event = None
 
+_INVALID_MODEL_REF_VALUES = {"", "none", "null", "undefined", "nan"}
+
+
+def _clean_model_ref(value: Any) -> str:
+    text = str(value or "").strip()
+    if text.lower() in _INVALID_MODEL_REF_VALUES:
+        return ""
+    return text
+
 
 def _parse_hf_url(url: str) -> tuple[str, str]:
     """Parse an HF "resolve" URL into (repo_id, filename)."""
@@ -34,7 +43,7 @@ def _parse_hf_url(url: str) -> tuple[str, str]:
 
 
 def _looks_like_hf_gguf_ref(value: str) -> bool:
-    s = (value or "").strip()
+    s = _clean_model_ref(value)
     if not s or ".gguf" not in s.lower():
         return False
     if s.startswith("http://") or s.startswith("https://"):
@@ -62,7 +71,7 @@ def _is_local_gguf_file(path: Path) -> bool:
 
 
 def _resolve_gguf_path(app: FastAPI, model_id: str, gguf_filename: Optional[str]) -> str:
-    s = (model_id or "").strip()
+    s = _clean_model_ref(model_id)
     if not s:
         raise RuntimeError("empty model_id")
 

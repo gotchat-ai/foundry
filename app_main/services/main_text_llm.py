@@ -6,6 +6,15 @@ import inspect
 import os
 from typing import Any, Callable
 
+_INVALID_MODEL_REF_VALUES = {"", "none", "null", "undefined", "nan"}
+
+
+def _clean_model_ref(value: Any) -> str:
+    text = str(value or "").strip()
+    if text.lower() in _INVALID_MODEL_REF_VALUES:
+        return ""
+    return text
+
 
 class MainTextLlmService:
     def __init__(
@@ -145,7 +154,7 @@ class MainTextLlmService:
         try:
             from plugins.model_loader.gguf import plugin as gguf_module
 
-            model_id = str(settings.get("model_id") or "").strip()
+            model_id = _clean_model_ref(settings.get("model_id"))
             if model_id:
                 try:
                     print(f"[main_text_llm] resolve gguf path for {model_id}")
@@ -163,7 +172,7 @@ class MainTextLlmService:
                 print(f"[main_text_llm] resolve gguf path error: {exc}")
             except Exception:
                 pass
-        model_path = str(settings.get("model_id") or "").strip()
+        model_path = _clean_model_ref(settings.get("model_id"))
         if model_path and not os.path.exists(model_path):
             try:
                 print(f"[main_text_llm] model path missing: {model_path}")

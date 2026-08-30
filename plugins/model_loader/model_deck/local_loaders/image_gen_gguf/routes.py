@@ -29,15 +29,23 @@ _STATE: Dict[str, Any] = {
 }
 _SDCPP: Optional[Any] = None
 _SDCPP_LAST_KEY: Optional[str] = None
+_INVALID_MODEL_REF_VALUES = {"", "none", "null", "undefined", "nan"}
+
+
+def _clean_model_ref(value: Any) -> str:
+    text = str(value or "").strip()
+    if text.lower() in _INVALID_MODEL_REF_VALUES:
+        return ""
+    return text
 
 
 def _resolve_model_path(settings: Dict[str, Any]) -> str:
-    model_path = str(settings.get("model_path") or settings.get("gguf_path") or "").strip()
+    model_path = _clean_model_ref(settings.get("model_path") or settings.get("gguf_path"))
     if model_path:
         return model_path
 
-    model_id = str(settings.get("model_id") or settings.get("model") or "").strip()
-    gguf_filename = str(settings.get("gguf_filename") or "").strip() or None
+    model_id = _clean_model_ref(settings.get("model_id") or settings.get("model"))
+    gguf_filename = _clean_model_ref(settings.get("gguf_filename")) or None
     if not model_id:
         raise HTTPException(400, "model_path or model_id required")
     if _APP is None:

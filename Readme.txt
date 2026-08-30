@@ -3,10 +3,10 @@
 Name: GotChat Foundry Framework Release
 Contributors: thy.nguyen
 type: framework
-Version: 1.0.3
+Version: 1.0.4
 License: Apache 2.0
 
-Core framework release for the GotChat Foundry platform.
+Core framework release for the GotChat Foundry platform. Go to the website gotchat.ai and check out the setup tutorials.
 
 == Description ==
 This package contains the main GotChat framework release.
@@ -38,6 +38,10 @@ Model Deck 2
 This framework release should be deployed with compatible backend services, CMS components, and runtime dependencies for the same release line.
 
 == Changelog ==
+= 1.0.4 =
+- File changes
+- Improved video/image LLM workflow resource cleanup and move it into worker process
+
 = 1.0.3 =
 - File changes
 - Refractored app.py

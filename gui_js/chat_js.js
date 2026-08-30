@@ -1,4 +1,5 @@
 const STORAGE_KEY = "llmloader2.chat_js.state";
+const STORAGE_AUTH_KEY = "llmloader2.chat_js.auth";
 const STORAGE_PREFS_KEY = "llmloader2.chat_js.prefs";
 const STORAGE_ROUTER_STATE_KEY = "llmloader2.chat_js.router_state";
 const STORAGE_ASSET_DB = "llmloader2.chat_js.assets";
@@ -43,6 +44,7 @@ const DEFAULT_STATE = {
   pluginRepo: {
     apiBase: "https://pluginserver.gotchat.ai/api",
     downloads: [],
+    localInstalls: [],
     installedServer: {},
     installedClient: {},
     lastSearch: [],
@@ -133,6 +135,7 @@ const app = {
       messageFooterItems: [],
       eventHandlers: [],
       completionPayloadHooks: [],
+      aiRouterBridges: [],
       rosterActions: [],
       sendHooks: [],
       sendContextMenuItems: [],
@@ -198,6 +201,7 @@ const TRANSCRIPT_SNAPSHOT_SETTLE_MS = 260;
 const TRANSCRIPT_SNAPSHOT_MAX_WAIT_MS = 1400;
 const TRANSCRIPT_RENDER_CACHE_VERSION = 5;
 const STORAGE_QUOTA_WARN_THROTTLE_MS = 30000;
+const AGENT_FLOW_NO_FLOW_VALUE = "__none__";
 const GEO_CONTEXT_FETCH_TIMEOUT_MS = 4500;
 const GEO_CONTEXT_PROVIDERS = [
   {
@@ -544,7 +548,12 @@ function restoreTranscriptNodesFromDom() {
   if (!nodes) return;
   nodes.forEach((node) => {
     const id = String(node?.dataset?.msgId || "").trim();
-    if (id) app.dom.messageNodes[id] = node;
+    if (!id) return;
+    if (app.dom.messageNodes[id] && app.dom.messageNodes[id] !== node) {
+      try { node.remove(); } catch (_err) {}
+      return;
+    }
+    app.dom.messageNodes[id] = node;
   });
 }
 
@@ -685,6 +694,41 @@ function buildCriticalPrefsSnapshot(state) {
 function saveCriticalPrefsSnapshot(state) {
   try {
     localStorage.setItem(STORAGE_PREFS_KEY, JSON.stringify(buildCriticalPrefsSnapshot(state)));
+  } catch (_err) {}
+}
+
+function buildAuthSnapshot(state) {
+  const auth = state?.auth && typeof state.auth === "object" ? state.auth : {};
+  return {
+    auth: {
+      token: String(auth.token || ""),
+      username: String(auth.username || ""),
+      role: String(auth.role || ""),
+      mustChange: Boolean(auth.mustChange),
+      alias: String(auth.alias || ""),
+      guestId: String(auth.guestId || ""),
+    },
+  };
+}
+
+function saveAuthSnapshot(state) {
+  try {
+    localStorage.setItem(STORAGE_AUTH_KEY, JSON.stringify(buildAuthSnapshot(state)));
+  } catch (_err) {}
+}
+
+function loadAuthSnapshot() {
+  try {
+    const raw = localStorage.getItem(STORAGE_AUTH_KEY);
+    return raw ? JSON.parse(raw) : {};
+  } catch {
+    return {};
+  }
+}
+
+function clearAuthSnapshot() {
+  try {
+    localStorage.setItem(STORAGE_AUTH_KEY, JSON.stringify(buildAuthSnapshot({ auth: {} })));
   } catch (_err) {}
 }
 
@@ -951,6 +995,17 @@ async function prepareStateForStorage(state) {
   if (next.router && typeof next.router === "object") {
     next.router = buildRouterStateSnapshot(next).router;
   }
+  if (next.pluginRepo && typeof next.pluginRepo === "object") {
+    // These lists are server-refreshable and can include screenshots,
+    // requirements, descriptions, and other bulky metadata. Keeping them in
+    // the monolithic browser state is what pushes localStorage over quota and
+    // leaves stale router/session state behind.
+    next.pluginRepo.lastSearch = [];
+    next.pluginRepo.downloads = [];
+    next.pluginRepo.localInstalls = [];
+    next.pluginRepo.installedServer = {};
+    next.pluginRepo.installedClient = {};
+  }
   const themeDemo = ui.themeDemo && typeof ui.themeDemo === "object" ? ui.themeDemo : null;
   if (themeDemo?.light) {
     themeDemo.light.bodyImage = await persistLargeThemeAssetValue(themeDemo.light.bodyImage, "theme_demo.light.bodyImage");
@@ -1041,9 +1096,17 @@ function logStorageWarn(msg, err) {
 
 async function persistStateNow() {
   const prepared = await prepareStateForStorage(app.state);
+  saveAuthSnapshot(prepared);
   saveCriticalPrefsSnapshot(prepared);
   saveRouterStateSnapshot(prepared);
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(prepared));
+  const payload = JSON.stringify(prepared);
+  try {
+    localStorage.setItem(STORAGE_KEY, payload);
+  } catch (err) {
+    if (!isQuotaExceededError(err)) throw err;
+    try { localStorage.removeItem(STORAGE_KEY); } catch (_err) {}
+    localStorage.setItem(STORAGE_KEY, payload);
+  }
 }
 
 async function flushScheduledSave() {
@@ -1181,9 +1244,16 @@ function applySavedUiThemeEarly() {
 
 function coerceMessageTs(value) {
   if (!value) return null;
-  if (typeof value === "number") return value;
+  const normalizeEpoch = (num) => {
+    if (!Number.isFinite(num) || num <= 0) return null;
+    // Normalize Unix-second timestamps into milliseconds so optimistic local
+    // messages and server-delivered messages sort on the same time scale.
+    if (num >= 1e9 && num < 1e12) return Math.round(num * 1000);
+    return num;
+  };
+  if (typeof value === "number") return normalizeEpoch(value);
   const num = Number(value);
-  if (!Number.isNaN(num)) return num;
+  if (!Number.isNaN(num)) return normalizeEpoch(num);
   const parsed = Date.parse(value);
   return Number.isNaN(parsed) ? null : parsed;
 }
@@ -1201,15 +1271,35 @@ function getMessageDisplayRank(msg) {
 
 function sortMessagesForDisplay(messages) {
   if (!Array.isArray(messages) || messages.length < 2) return Array.isArray(messages) ? messages : [];
+  const turnAnchors = new Map();
+  messages.forEach((msg, index) => {
+    if (!msg || String(msg.role || "").trim().toLowerCase() !== "user") return;
+    const cmid = getMessageClientMsgId(msg);
+    if (!cmid || turnAnchors.has(cmid)) return;
+    turnAnchors.set(cmid, {
+      ts: coerceMessageTs(msg.ts) ?? 0,
+      index,
+    });
+  });
   return messages
     .map((msg, index) => ({ msg, index }))
     .sort((a, b) => {
-      const tsA = coerceMessageTs(a.msg?.ts) ?? 0;
-      const tsB = coerceMessageTs(b.msg?.ts) ?? 0;
-      if (tsA !== tsB) return tsA - tsB;
+      const cmidA = getMessageClientMsgId(a.msg);
+      const cmidB = getMessageClientMsgId(b.msg);
+      const anchorA = cmidA ? turnAnchors.get(cmidA) : null;
+      const anchorB = cmidB ? turnAnchors.get(cmidB) : null;
+      const turnTsA = anchorA ? anchorA.ts : (coerceMessageTs(a.msg?.ts) ?? 0);
+      const turnTsB = anchorB ? anchorB.ts : (coerceMessageTs(b.msg?.ts) ?? 0);
+      if (turnTsA !== turnTsB) return turnTsA - turnTsB;
+      const turnIdxA = anchorA ? anchorA.index : a.index;
+      const turnIdxB = anchorB ? anchorB.index : b.index;
+      if (turnIdxA !== turnIdxB) return turnIdxA - turnIdxB;
       const rankA = getMessageDisplayRank(a.msg);
       const rankB = getMessageDisplayRank(b.msg);
       if (rankA !== rankB) return rankA - rankB;
+      const tsA = coerceMessageTs(a.msg?.ts) ?? 0;
+      const tsB = coerceMessageTs(b.msg?.ts) ?? 0;
+      if (tsA !== tsB) return tsA - tsB;
       return a.index - b.index;
     })
     .map((entry) => entry.msg);
@@ -2102,28 +2192,28 @@ function bindStaticMenuActionButtons() {
 function shouldUseTapSubmenus() {
   try {
     const embedCfg = window.__CHAT_JS_EMBED_CONFIG || {};
-    // Keep the regular flyout submenu by default, including on mobile.
-    // Touch devices still use click/tap handlers for submenu buttons; this
-    // flag only controls the expanded inline submenu presentation.
     return Boolean(embedCfg.embedded && embedCfg.touchSubmenus === true);
   } catch (_err) {
     return false;
   }
 }
 
-function closeTouchSubmenus(except = "") {
-  const pairs = Array.from(app.dom.menuDropdown?.querySelectorAll?.(".menu-item.has-sub[data-menu]") || []).map((btn) => {
-    const menuId = String(btn.dataset.menu || "").trim();
-    const group = btn.closest(".menu-group");
-    const sub = Array.from(group?.children || []).find((child) => child?.classList?.contains?.("menu-sub")) || null;
-    return { id: menuId, group, sub };
-  });
-  for (const pair of pairs) {
-    if (!pair.group || !pair.sub) continue;
-    const keepOpen = except && pair.id === except;
-    pair.group.classList.toggle("submenu-open", Boolean(keepOpen));
+function closeTouchSubmenus(except = "", scopeRoot = null) {
+  const root = scopeRoot || app.dom.menuDropdown;
+  if (!root) return;
+  const groups = Array.from(root.children || []).filter((child) => (
+    child instanceof Element && child.classList.contains("menu-group")
+  ));
+  for (const group of groups) {
+    const btn = Array.from(group.children || []).find((child) => child?.classList?.contains?.("menu-item") && child?.classList?.contains?.("has-sub"));
+    const sub = Array.from(group.children || []).find((child) => child?.classList?.contains?.("menu-sub")) || null;
+    const menuId = String(btn?.dataset?.menu || "").trim();
+    if (!sub) continue;
+    const keepOpen = except && menuId === except;
+    group.classList.toggle("submenu-open", Boolean(keepOpen));
     if (!keepOpen) {
-      pair.sub.classList.add("hidden");
+      sub.classList.add("hidden");
+      closeTouchSubmenus("", sub);
     }
   }
 }
@@ -2135,8 +2225,19 @@ function toggleTouchSubmenu(menuId) {
   const pair = group && sub ? { group, sub } : null;
   if (!pair?.group || !pair?.sub || pair.sub.children.length === 0) return;
   const willOpen = pair.sub.classList.contains("hidden") || !pair.group.classList.contains("submenu-open");
-  closeTouchSubmenus(willOpen ? menuId : "");
-  if (!willOpen) return;
+  const scopeRoot = pair.group.parentElement || app.dom.menuDropdown;
+  closeTouchSubmenus(willOpen ? menuId : "", scopeRoot);
+  if (!willOpen) {
+    closeTouchSubmenus("", pair.sub);
+    return;
+  }
+  let ancestor = pair.group.parentElement?.closest?.(".menu-group") || null;
+  while (ancestor) {
+    ancestor.classList.add("submenu-open");
+    const ancestorSub = Array.from(ancestor.children || []).find((child) => child?.classList?.contains?.("menu-sub")) || null;
+    ancestorSub?.classList?.remove?.("hidden");
+    ancestor = ancestor.parentElement?.closest?.(".menu-group") || null;
+  }
   pair.sub.classList.remove("hidden");
   pair.group.classList.add("submenu-open");
   try {
@@ -2541,11 +2642,16 @@ function bindSubmenuPositioning() {
     group.addEventListener("focusin", adjust);
     sub.addEventListener("scroll", () => updateSubmenuOverflowIndicator(sub), { passive: true });
   }
-  window.addEventListener("resize", () => {
-    for (const [group, sub] of pairs) {
-      if (!group || !sub) continue;
+  const adjustAllOpenSubmenus = () => {
+    const groups = Array.from(app.dom.menuDropdown?.querySelectorAll?.(".menu-group") || []);
+    for (const group of groups) {
+      const sub = Array.from(group.children || []).find((child) => child?.classList?.contains?.("menu-sub")) || null;
+      if (!sub) continue;
       adjustSubmenuPosition(group, sub);
     }
+  };
+  window.addEventListener("resize", () => {
+    adjustAllOpenSubmenus();
   });
 }
 
@@ -2584,18 +2690,23 @@ function adjustSubmenuPosition(group, sub) {
     const mount = getEmbedMount?.();
     if (mount && mount !== document.body && mount !== document.documentElement) {
       const rect = mount.getBoundingClientRect();
-      // Keep flyouts viewport-aware first. Some embeds sit inside narrower
-      // wrappers even when the browser still has room, and shrinking the
-      // bounds to that wrapper forces unnecessary left-flips.
-      if (Number.isFinite(rect.left)) boundsLeft = Math.min(boundsLeft, rect.left);
-      if (Number.isFinite(rect.right)) boundsRight = Math.max(boundsRight, rect.right);
+      // Respect the actual visible viewport first. Narrow browser widths can
+      // otherwise report a wider host/mount box and incorrectly keep nested
+      // flyouts opening off the right edge.
+      if (Number.isFinite(rect.left)) boundsLeft = Math.max(0, Math.min(window.innerWidth - 24, rect.left));
+      if (Number.isFinite(rect.right)) boundsRight = Math.min(window.innerWidth, Math.max(boundsLeft + 120, rect.right));
     }
   } catch (_err) {}
   const spaceRight = boundsRight - groupRect.right;
   const spaceLeft = groupRect.left - boundsLeft;
   let openLeft = false;
-  if (spaceRight < subRect.width + 12) {
-    openLeft = spaceLeft >= subRect.width + 12 || spaceLeft > spaceRight;
+  const neededWidth = subRect.width + 12;
+  const wouldOverflowRight = (groupRect.right + neededWidth) > boundsRight;
+  const wouldOverflowLeft = (groupRect.left - neededWidth) < boundsLeft;
+  if (wouldOverflowRight && !wouldOverflowLeft) {
+    openLeft = true;
+  } else if (spaceRight < neededWidth) {
+    openLeft = spaceLeft >= neededWidth || spaceLeft > spaceRight;
   }
   sub.classList.toggle("menu-left", openLeft);
 
@@ -2790,7 +2901,9 @@ function renderGuiPluginsMenu() {
   }
   const frontendItems = app.plugins.list.filter((plugin) => {
     const enabled = Boolean(plugin.enabled ?? isPluginEnabled(plugin.id));
-    return enabled && plugin.status === "loaded" && plugin.hasPanel && canAccessPlugin(plugin.id, "open");
+    const canOpenPanel = Boolean(plugin.hasPanel && canAccessPlugin(plugin.id, "open"));
+    const canOpenSettings = Boolean(plugin.openSettings && canAccessPlugin(plugin.id, "settings"));
+    return enabled && plugin.status === "loaded" && (canOpenPanel || canOpenSettings);
   });
   const manifest = getRouterManifest();
   if (!Object.keys(manifest).length && canUseRemoteServer() && !app.routerManifestInFlight) {
@@ -2847,6 +2960,16 @@ function renderGuiPluginsMenu() {
     host.appendChild(group);
   };
 
+  const pluginSettingsCategory = (...candidates) => {
+    // Plugin settings categories are plugin-owned metadata. The framework only
+    // normalizes and reads what the plugin manifest/runtime provides.
+    for (const candidate of candidates) {
+      const value = String(candidate || "").trim();
+      if (value) return value;
+    }
+    return "";
+  };
+
   const buildFrontendFlyout = (sub) => {
     const items = frontendItems.slice().sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id));
     if (!items.length) {
@@ -2860,7 +2983,7 @@ function renderGuiPluginsMenu() {
     const grouped = new Map();
     const ungrouped = [];
     for (const plugin of items) {
-      const category = String(plugin?.meta?.category || plugin?.entry?.category || "").trim();
+      const category = pluginSettingsCategory(plugin?.meta?.category, plugin?.entry?.category);
       if (!category) {
         ungrouped.push(plugin);
         continue;
@@ -2874,14 +2997,26 @@ function renderGuiPluginsMenu() {
         const categoryItems = (grouped.get(category) || []).slice().sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id));
         for (const plugin of categoryItems) {
           appendActionButton(categorySub, plugin.name || plugin.id, () => {
-            openPluginPanel(plugin.id, { openModal: true });
+            if (plugin.hasPanel && canAccessPlugin(plugin.id, "open")) {
+              openPluginPanel(plugin.id, { openModal: true });
+              return;
+            }
+            if (plugin.openSettings && canAccessPlugin(plugin.id, "settings")) {
+              plugin.openSettings(getPluginContext());
+            }
           });
         }
       }, "menu-sub-level3");
     }
     for (const plugin of ungrouped) {
       appendActionButton(sub, plugin.name || plugin.id, () => {
-        openPluginPanel(plugin.id, { openModal: true });
+        if (plugin.hasPanel && canAccessPlugin(plugin.id, "open")) {
+          openPluginPanel(plugin.id, { openModal: true });
+          return;
+        }
+        if (plugin.openSettings && canAccessPlugin(plugin.id, "settings")) {
+          plugin.openSettings(getPluginContext());
+        }
       });
     }
   };
@@ -2898,7 +3033,7 @@ function renderGuiPluginsMenu() {
     const grouped = new Map();
     const ungrouped = [];
     for (const item of serverItems) {
-      const category = String(item?.meta?.category || "").trim();
+      const category = pluginSettingsCategory(item?.meta?.category, item?.entry?.category);
       if (!category) {
         ungrouped.push(item);
         continue;
@@ -2937,6 +3072,14 @@ function renderGuiPluginsMenu() {
     const scroll = document.createElement("div");
     scroll.className = "menu-sub-scroll menu-sub-level2-scroll";
     builder(scroll);
+    const hasInteractiveItems = Array.from(scroll.querySelectorAll(".menu-item, button"))
+      .some((node) => {
+        if (!(node instanceof HTMLElement)) return false;
+        if (node.tagName === "BUTTON") return true;
+        if (node.classList.contains("menu-item") && node.style.pointerEvents !== "none") return true;
+        return false;
+      });
+    if (!hasInteractiveItems) return;
     sub.appendChild(scroll);
     bindMenuActionButton(btn, () => {
       if (shouldUseTapSubmenus()) {
@@ -3421,26 +3564,44 @@ async function refreshPermissionState(options = {}) {
 }
 
 async function verifyAuth() {
+  let user = null;
   try {
     const data = await apiJson("/v1/auth/me");
-    const user = data?.user || data || {};
-    if (!user) return false;
-    app.state.auth.username = user.username || app.state.auth.username;
-    app.state.auth.role = user.role || app.state.auth.role;
-    app.state.auth.mustChange = Boolean(user.must_change_pw);
-    await refreshPermissionState({ silent: true });
-    await refreshGuiPluginsDiscovery();
-    await refreshSharedUiThemeDefault("theme_demo", { forceApply: true });
-    scheduleSave();
-    renderStatus("online");
-    renderTopRightIconRow();
-    applyChatInfoToInputs();
-    return true;
+    user = data?.user || data || {};
   } catch (err) {
-    appendLog("[auth] token invalid, logging out", "warn");
-    await logout(false);
+    const msg = String(err?.message || err || "");
+    const authRejected = /^HTTP\s+(401|403)\b/.test(msg);
+    if (authRejected) {
+      appendLog("[auth] token invalid, logging out", "warn");
+      await logout(false);
+    } else {
+      appendLog(`[auth] verify deferred: ${msg || "server unavailable"}`, "warn");
+    }
     return false;
   }
+  if (!user) return false;
+  app.state.auth.username = user.username || app.state.auth.username;
+  app.state.auth.role = user.role || app.state.auth.role;
+  app.state.auth.mustChange = Boolean(user.must_change_pw);
+  saveAuthSnapshot(app.state);
+  try {
+    await refreshPermissionState({ silent: true });
+  } catch (_err) {}
+  try {
+    await refreshGuiPluginsDiscovery();
+  } catch (err) {
+    appendLog(`[plugins] refresh failed: ${err.message || err}`, "warn");
+  }
+  try {
+    await refreshSharedUiThemeDefault("theme_demo", { forceApply: true });
+  } catch (err) {
+    appendLog(`[theme] shared default unavailable: ${err.message || err}`, "warn");
+  }
+  scheduleSave();
+  renderStatus("online");
+  renderTopRightIconRow();
+  applyChatInfoToInputs();
+  return true;
 }
 
 function renderAll() {
@@ -3636,6 +3797,25 @@ function renderTranscript() {
   if (forceLiveRender) app.plugins.forceLiveTranscriptRenderOnce = false;
   const prevMeta = app.state.ui.__transcriptRenderMeta || {};
   const prevFps = forceLiveRender ? [] : (Array.isArray(prevMeta.fingerprints) ? prevMeta.fingerprints : []);
+  const sameRender =
+    !forceLiveRender &&
+    sid &&
+    prevSid === sid &&
+    prevFps.length === nextFps.length &&
+    prevFps.length > 0 &&
+    prevFps.every((v, i) => v === nextFps[i]) &&
+    transcript &&
+    transcript.childElementCount === messages.length &&
+    transcript.dataset.renderSource &&
+    transcript.dataset.renderSource !== "no_session";
+  if (sameRender) {
+    markTranscriptRenderSource("stable", {
+      messageSource: session.source || "local_state",
+      cacheKey: transcriptCacheKey(pid, sid),
+      messageCount: messages.length,
+    });
+    return;
+  }
 
   // Hydrate from rendered HTML whenever the current message set matches a snapshot.
   // Remote session hydration can run after an initial local render, so this must not
@@ -3810,7 +3990,7 @@ function renderTranscript() {
       img.addEventListener("error", () => {
         wrap.textContent = i18nTranslate("chat_js.media.image_not_available", "Image not available");
       });
-      img.src = String(block.src || "");
+      img.src = resolveTranscriptMediaUrl(block.src || "");
       wrap.appendChild(img);
       if (block.name) {
         const caption = document.createElement("div");
@@ -3824,27 +4004,7 @@ function renderTranscript() {
       if (type === "video") {
         const wrap = document.createElement("div");
         wrap.className = "block block-video";
-      let src = String(block.src || "");
-      const normalized = src.replace(/\\/g, "/");
-      if (!/^https?:\/\//i.test(normalized)) {
-        if (normalized.includes("/uploads/")) {
-          const name = normalized.split("/uploads/").pop();
-          if (name) src = `/uploads/${name}`;
-        } else if (/\.(mp4|webm|mov|mkv)$/i.test(normalized)) {
-          const name = normalized.split("/").pop();
-          if (name) src = `/uploads/${name}`;
-        } else {
-          src = normalized;
-        }
-      }
-      if (!/^https?:\/\//i.test(src) && !/^data:/i.test(src)) {
-        const base = String(app?.state?.remote?.serverUrl || "").replace(/\/+$/, "");
-        const origin = String(window?.location?.origin || "").replace(/\/+$/, "");
-        const host = base && !base.startsWith("file:") ? base : origin;
-        if (host) {
-          src = src.startsWith("/") ? `${host}${src}` : `${host}/${src}`;
-        }
-      }
+      const src = resolveTranscriptMediaUrl(block.src || "");
       if (!src) {
         wrap.textContent = i18nTranslate("chat_js.media.video_not_available", "Video not available");
         bubble.appendChild(wrap);
@@ -4061,6 +4221,7 @@ function renderTranscript() {
       const msg = byId.get(String(node?.dataset?.msgId || "").trim());
       if (!msg) return;
       refreshMessageFooter(node, msg);
+      rebindRestoredTranscriptVideos(node, msg);
     });
   }
 
@@ -4176,7 +4337,7 @@ function renderBlocksToContainer(container, msg, blocks) {
       img.addEventListener("error", () => {
         wrap.textContent = i18nTranslate("chat_js.media.image_not_available", "Image not available");
       });
-      img.src = String(block.src || "");
+      img.src = resolveTranscriptMediaUrl(block.src || "");
       wrap.appendChild(img);
       if (block.name) {
         const caption = document.createElement("div");
@@ -4190,19 +4351,7 @@ function renderBlocksToContainer(container, msg, blocks) {
     if (type === "video") {
       const wrap = document.createElement("div");
       wrap.className = "block block-video";
-      let src = String(block.src || "");
-      const normalized = src.replace(/\\/g, "/");
-      if (!/^https?:\/\//i.test(normalized)) {
-        if (normalized.includes("/uploads/")) {
-          const name = normalized.split("/uploads/").pop();
-          if (name) src = `/uploads/${name}`;
-        } else if (/\.(mp4|webm|mov|mkv)$/i.test(normalized)) {
-          const name = normalized.split("/").pop();
-          if (name) src = `/uploads/${name}`;
-        } else {
-          src = normalized;
-        }
-      }
+      const src = resolveTranscriptMediaUrl(block.src || "");
       if (!src) {
         wrap.textContent = i18nTranslate("chat_js.media.video_not_available", "Video not available");
         container.appendChild(wrap);
@@ -5365,7 +5514,22 @@ async function loadSessionMessages() {
     }
   } catch (_err) {}
 
-  if (payload.handled) return;
+  if (payload.handled) {
+    try {
+      appendLog(`[send] handled before backend pid=${pid || ""} sid=${sid || ""}`, "warn");
+    } catch (_err) {}
+    return;
+  }
+
+  try {
+    const session = app.state.sessions[sid] || {};
+    const routerCfg = getCompletionRouterConfig(sid);
+    const enabledRouters = Array.isArray(routerCfg?.enabled) ? routerCfg.enabled.filter(Boolean) : [];
+    appendLog(
+      `[send] backend stream pid=${pid || ""} sid=${sid || ""} source=${session.source || "local"} routers=${enabledRouters.length ? enabledRouters.join(",") : "none"}`,
+      "info",
+    );
+  } catch (_err) {}
 
   await startCompletionStream(pid, sid, payload.text, clientMsgId);
 }
@@ -5657,6 +5821,18 @@ async function startModelStream(pid, sid, prompt, clientMsgId) {
   if (mergedSystemPrompt) body.system = mergedSystemPrompt;
   const contextMode = String(app.state.prefs.contextMode || "").trim();
   if (contextMode) body.ext = { ...(body.ext || {}), context_mode: contextMode };
+  body.ext = {
+    ...(body.ext || {}),
+    project_id: pid,
+    session_id: sid,
+    "session-id": sid,
+    sid,
+  };
+  const repoCtx = getRepoContextForSession(sid);
+  if (repoCtx && isPluginEnabled("repo_panel")) {
+    body.ext = { ...body.ext, ...repoCtx };
+  }
+  const routedBody = applyCompletionPayloadHooks(body);
 
   const url = `/v1/projects/${encodeURIComponent(pid)}/sessions/${encodeURIComponent(sid)}/model_turn_stream`;
   const controller = new AbortController();
@@ -5667,7 +5843,7 @@ async function startModelStream(pid, sid, prompt, clientMsgId) {
     await streamSSE(url, {
       method: "POST",
       headers: { ...buildHeaders({ pid, sid }), "Content-Type": "application/json" },
-      body: JSON.stringify(body),
+      body: JSON.stringify(routedBody),
       signal: controller.signal,
       onEvent: (event, data) => {
         if (event === "turn" && data?.msg_id) {
@@ -5749,6 +5925,12 @@ async function startCompletionStream(pid, sid, prompt, clientMsgId) {
     if (event === "token") {
       if (mode === "local") {
         appendToken(sid, streamId, data?.text || "");
+        for (const handler of app.plugins.slots.eventHandlers) {
+          try {
+            const fn = handler.fn || handler;
+            fn("token", { ...(data || {}), sid, msg_id: streamId, local: true }, getPluginContext());
+          } catch (_err) {}
+        }
       }
       return;
     }
@@ -5827,6 +6009,7 @@ async function startCompletionStream(pid, sid, prompt, clientMsgId) {
   };
 
   try {
+    appendLog(`[stream] POST /v1/chat/completions_stream pid=${pid || ""} sid=${sid || ""}`, "info");
     await runStream(buildCompletionHeaders(pid, sid), payload);
   } catch (err) {
     if (!sawDone && shouldRetryWithoutSession(err)) {
@@ -5954,7 +6137,7 @@ function buildCompletionPayload(sid) {
       },
     };
   }
-  const routerCfg = getRouterConfig(sid);
+  const routerCfg = getCompletionRouterConfig(sid);
   if (routerCfg.enabled.length) payload.router_enabled_plugins = routerCfg.enabled.slice();
   if (Object.keys(routerCfg.settings).length) {
     payload.ext = { ...payload.ext, router_plugin_settings: { ...routerCfg.settings } };
@@ -5968,6 +6151,23 @@ function buildCompletionPayload(sid) {
   if (!Number.isNaN(temp)) payload.temperature = temp;
   if (maxTokens != null) payload.max_tokens = maxTokens;
   return applyCompletionPayloadHooks(payload);
+}
+
+function agentFlowNoFlowSelected(settings) {
+  if (!settings || typeof settings !== "object") return false;
+  if (!Object.prototype.hasOwnProperty.call(settings, "agent_flow_active_flow")) return false;
+  const active = String(settings.agent_flow_active_flow || "").trim();
+  return active === "" || active === AGENT_FLOW_NO_FLOW_VALUE;
+}
+
+function getCompletionRouterConfig(sid, pid = app.state?.ui?.activePid) {
+  const cfg = getRouterConfig(sid, pid);
+  const settings = cfg.settings && typeof cfg.settings === "object" ? cfg.settings : {};
+  let enabled = Array.isArray(cfg.enabled) ? cfg.enabled.slice() : [];
+  if (enabled.includes("agent_flow") && agentFlowNoFlowSelected(settings.agent_flow)) {
+    enabled = enabled.filter((item) => item !== "agent_flow");
+  }
+  return { enabled, settings };
 }
 
 function startSessionEvents() {
@@ -6275,7 +6475,20 @@ function upsertMessage(sid, msg) {
   const messages = session.messages || [];
   const idx = msg.msg_id ? messages.findIndex((m) => m.msg_id === msg.msg_id) : -1;
   if (idx >= 0) {
-    messages[idx] = { ...messages[idx], ...msg };
+    const prev = messages[idx] || {};
+    const prevCmid = getMessageClientMsgId(prev);
+    const nextCmid = getMessageClientMsgId(msg);
+    const preserveTurnTs =
+      String(prev.role || "").trim().toLowerCase() === "user" &&
+      String(msg.role || "").trim().toLowerCase() === "user" &&
+      prevCmid &&
+      nextCmid &&
+      prevCmid === nextCmid &&
+      coerceMessageTs(prev.ts);
+    messages[idx] = { ...prev, ...msg };
+    if (preserveTurnTs) {
+      messages[idx].ts = prev.ts;
+    }
   } else {
     const insertAt = getAssistantInsertIndex(messages, msg);
     if (insertAt >= 0 && insertAt <= messages.length) messages.splice(insertAt, 0, msg);
@@ -6417,6 +6630,7 @@ function applyLoginResponse(data, fallbackUser) {
   app.state.auth.role = data.role || "user";
   app.state.auth.mustChange = Boolean(data.must_change_pw);
   app.state.remote.enabled = true;
+  saveAuthSnapshot(app.state);
   scheduleSave();
   renderAuthStatus();
   renderStatus("online");
@@ -6488,6 +6702,7 @@ async function logout(announce) {
   app.state.auth.mustChange = false;
   app.state.sessionAccess = {};
   clearPermissionsState();
+  clearAuthSnapshot();
   ensureLocalDefaults();
   scheduleSave();
   renderAuthStatus();
@@ -6563,7 +6778,7 @@ async function uploadFile(file) {
 
 function buildHeaders(extra = {}) {
   const headers = {};
-  if (isAuthEnabled()) {
+  if (isAuthEnabled() || app.state.auth.token) {
     const enabled = new Set(["collab_chat", "plugin_repo"]);
     for (const plugin of app.plugins.list || []) {
       const pid = String(plugin?.id || "").trim();
@@ -6772,6 +6987,10 @@ async function loadProjectRouterPrefs(pid, options = {}) {
         headers: buildHeaders({ pid: projectId }),
         timeoutMs: 15000,
       });
+      if (data?.unauthenticated) {
+        delete app.routerPrefsLoaded[projectId];
+        return false;
+      }
       const defaultPrefs = data?.default_prefs && typeof data.default_prefs === "object" ? data.default_prefs : {};
       const projectRouterDefaults = defaultPrefs.router_project_defaults && typeof defaultPrefs.router_project_defaults === "object"
         ? defaultPrefs.router_project_defaults
@@ -6789,8 +7008,21 @@ async function loadProjectRouterPrefs(pid, options = {}) {
         clearProjectRouterScopesFromApp(projectId);
         mergeRouterStateIntoApp(routerPrefs);
         renderRouterPluginsList();
+        renderGuiPluginsMenu();
         renderTranscriptBars();
         renderPluginPanels();
+      }
+      const pluginPrefs = prefs.plugin_state && typeof prefs.plugin_state === "object" ? prefs.plugin_state : null;
+      if (pluginPrefs) {
+        ensurePluginPrefs();
+        const enabledMap = pluginPrefs.enabled && typeof pluginPrefs.enabled === "object" ? pluginPrefs.enabled : {};
+        app.state.pluginPrefs.enabled = { ...app.state.pluginPrefs.enabled, ...enabledMap };
+        if (Array.isArray(pluginPrefs.priority)) {
+          app.state.pluginPrefs.priority = pluginPrefs.priority.slice();
+        }
+        if (pluginPrefs.preloads && typeof pluginPrefs.preloads === "object") {
+          app.state.pluginPrefs.preloads = JSON.parse(JSON.stringify(pluginPrefs.preloads));
+        }
       }
       const uiPrefs = prefs.ui_state && typeof prefs.ui_state === "object" ? prefs.ui_state : null;
       if (uiPrefs) {
@@ -6839,6 +7071,7 @@ async function saveProjectRouterPrefs(pid = app.state?.ui?.activePid) {
     }).catch(() => ({ prefs: {} }));
     const prefs = current?.prefs && typeof current.prefs === "object" ? { ...current.prefs } : {};
     prefs.router_state = projectRouterSnapshot(buildRouterStateSnapshot(app.state).router, projectId);
+    prefs.plugin_state = JSON.parse(JSON.stringify(ensurePluginPrefs()));
     prefs.ui_state = {
       activePid: String(app.state?.ui?.activePid || ""),
       activeSid: String(app.state?.ui?.activeSid || ""),
@@ -6850,7 +7083,7 @@ async function saveProjectRouterPrefs(pid = app.state?.ui?.activePid) {
       body: { scope: "user", prefs },
       timeoutMs: 8000,
     });
-    if (hasPermission("plugins.manage.install", false)) {
+    if (isAdminUser()) {
       const currentProjectPrefs = current?.default_prefs && typeof current.default_prefs === "object"
         ? { ...current.default_prefs }
         : {};
@@ -7266,6 +7499,58 @@ function deriveLocalServerUrlFromUiOrigin() {
   }
 }
 
+function deriveRemoteServerUrlFromUiOrigin() {
+  const uiOrigin = getChatJsUiOrigin();
+  if (!uiOrigin) return "";
+  try {
+    const url = new URL(uiOrigin);
+    const host = String(url.hostname || "").toLowerCase();
+    if (!host || isLocalHostName(host)) return "";
+    if (!/^chat\./i.test(host)) return "";
+    const nextHost = host.replace(/^chat\./i, "chatserver.");
+    if (!nextHost || nextHost === host) return "";
+    return normalizeServerUrl(`${url.protocol}//${nextHost}`);
+  } catch (_err) {
+    return "";
+  }
+}
+
+function getPreferredServerBaseUrl() {
+  const normalizeBase = (v) => normalizeServerUrl(String(v || "").trim());
+  return normalizeBase(
+    app.state?.remote?.discoveredServerUrl ||
+    app.state?.remote?.publicServerUrl ||
+    app.state?.remote?.serverUrl ||
+    deriveRemoteServerUrlFromUiOrigin() ||
+    getChatJsUiOrigin() ||
+    window?.location?.origin ||
+    ""
+  );
+}
+
+function resolveTranscriptMediaUrl(rawValue) {
+  let src = String(rawValue || "").trim();
+  if (!src) return "";
+  const normalized = src.replace(/\\/g, "/");
+  if (!/^https?:\/\//i.test(normalized) && !/^data:/i.test(normalized)) {
+    if (normalized.includes("/uploads/")) {
+      const name = normalized.split("/uploads/").pop();
+      if (name) src = `/uploads/${name}`;
+    } else if (/\.(png|jpe?g|gif|webp|svg|mp4|webm|mov|mkv)$/i.test(normalized)) {
+      const name = normalized.split("/").pop();
+      if (name) src = `/uploads/${name}`;
+      else src = normalized;
+    } else {
+      src = normalized;
+    }
+  }
+  if (!/^https?:\/\//i.test(src) && !/^data:/i.test(src)) {
+    const base = getPreferredServerBaseUrl();
+    if (base) src = src.startsWith("/") ? `${base}${src}` : `${base}/${src}`;
+  }
+  return src;
+}
+
 async function discoverRemoteServerUrl() {
   if (app.serverUrlResolvePromise) {
     return app.serverUrlResolvePromise;
@@ -7323,23 +7608,45 @@ async function discoverRemoteServerUrl() {
         return false;
       });
       const sorted = candidates.slice().sort((a, b) => {
+        const ah = lower(a?.hostname);
+        const bh = lower(b?.hostname);
+        const aExactServer = ah.includes("chatserver");
+        const bExactServer = bh.includes("chatserver");
+        if (aExactServer !== bExactServer) return aExactServer ? -1 : 1;
+        const aGenericChat = ah.includes("chat.") || ah.startsWith("chat.");
+        const bGenericChat = bh.includes("chat.") || bh.startsWith("chat.");
+        if (aGenericChat !== bGenericChat) return aGenericChat ? 1 : -1;
         const at = Date.parse(String(a?.updated_at || a?.updatedAt || "")) || 0;
         const bt = Date.parse(String(b?.updated_at || b?.updatedAt || "")) || 0;
         return bt - at;
       });
       return mappingPublicUrl(sorted[0]);
     };
+    const extractPublicServerFromStatus = (payload, serverPort = 8000) => {
+      const mapped = findPublicServerFromMappings(payload?.mappings, serverPort);
+      return mapped || normalizeBase(payload?._public_urls?.server);
+    };
 
     let publicServer = "";
+    let dockerPublicServer = "";
+    let localPublicServer = "";
     try {
       const resp = await fetch("/v1/cloudflare_docker_https/status", { credentials: "same-origin", cache: "no-cache" });
       if (resp.ok) {
         const payload = (await resp.json()) || {};
-        publicServer =
-          normalizeBase(payload?._public_urls?.server) ||
-          findPublicServerFromMappings(payload?.mappings, payload?.server_port || 8000);
+        dockerPublicServer = extractPublicServerFromStatus(payload, payload?.server_port || 8000);
       }
     } catch (_err) {}
+
+    try {
+      const resp = await fetch("/v1/cloudflare_local_https/status", { credentials: "same-origin", cache: "no-cache" });
+      if (resp.ok) {
+        const payload = (await resp.json()) || {};
+        localPublicServer = extractPublicServerFromStatus(payload, payload?.server_port || 8000);
+      }
+    } catch (_err) {}
+
+    publicServer = localPublicServer || dockerPublicServer || "";
 
     if (!publicServer) {
       try {
@@ -7403,11 +7710,37 @@ async function discoverRemoteServerUrl() {
       } catch (_err) {}
     }
 
+    if (!publicServer) {
+      const derivedRemote = deriveRemoteServerUrlFromUiOrigin();
+      if (derivedRemote) {
+        publicServer = derivedRemote;
+      }
+    }
+
     if (publicServer) {
       app.state.remote.discoveredServerUrl = publicServer;
       app.state.remote.publicServerUrl = publicServer;
       const localUrl = deriveLocalServerUrlFromUiOrigin();
-      const shouldPreferRemote = !localUrl && (!current || current === uiOrigin || current === DEFAULT_STATE.remote.serverUrl);
+      const hostOf = (value) => {
+        try {
+          return new URL(String(value || "")).hostname.toLowerCase();
+        } catch (_err) {
+          return "";
+        }
+      };
+      const currentHost = hostOf(current);
+      const uiHost = hostOf(uiOrigin);
+      const publicHost = hostOf(publicServer);
+      const currentLooksLikeUiHost = Boolean(currentHost && uiHost && currentHost === uiHost);
+      const currentLooksGenericChat = Boolean(currentHost && /(^|\.)chat\./.test(currentHost));
+      const publicLooksSpecificServer = Boolean(publicHost && publicHost.includes("chatserver"));
+      const shouldPreferRemote = !localUrl && (
+        !current ||
+        current === uiOrigin ||
+        current === DEFAULT_STATE.remote.serverUrl ||
+        currentLooksLikeUiHost ||
+        (currentLooksGenericChat && publicLooksSpecificServer)
+      );
       if (shouldPreferRemote) {
         app.state.remote.serverUrl = publicServer;
       }
@@ -7478,10 +7811,28 @@ function renderServerUrlOptions(preferredValue = "") {
     app.state?.remote?.publicServerUrl ||
     ""
   );
+  const hostOf = (value) => {
+    try {
+      return new URL(String(value || "")).hostname.toLowerCase();
+    } catch (_err) {
+      return "";
+    }
+  };
+  const currentHost = hostOf(current);
+  const uiHost = hostOf(uiOrigin);
+  const publicHost = hostOf(publicUrl);
+  const currentLooksLikeUiHost = Boolean(currentHost && uiHost && currentHost === uiHost);
+  const currentLooksGenericChat = Boolean(currentHost && /(^|\.)chat\./.test(currentHost));
+  const publicLooksSpecificServer = Boolean(publicHost && publicHost.includes("chatserver"));
   if (localUrl && (!current || current === uiOrigin)) {
     current = localUrl;
     app.state.remote.serverUrl = localUrl;
-  } else if (publicUrl && (!current || current === uiOrigin)) {
+  } else if (publicUrl && (
+    !current ||
+    current === uiOrigin ||
+    currentLooksLikeUiHost ||
+    (currentLooksGenericChat && publicLooksSpecificServer)
+  )) {
     current = publicUrl;
     app.state.remote.serverUrl = publicUrl;
   }
@@ -7936,12 +8287,13 @@ function loadState() {
     }
     const prefs = loadCriticalPrefsSnapshot();
     const routerState = loadRouterStateSnapshot();
-    const next = mergeDeep(mergeDeep(base, prefs), routerState);
+    const auth = loadAuthSnapshot();
+    const next = mergeDeep(mergeDeep(mergeDeep(base, prefs), routerState), auth);
     if (next?.ui && typeof next.ui === "object") delete next.ui.__transcriptRenderMeta;
     if (next?.ui && typeof next.ui === "object") delete next.ui.__sessionSwitchToken;
     return next;
   } catch {
-    return mergeDeep(loadCriticalPrefsSnapshot(), loadRouterStateSnapshot());
+    return mergeDeep(mergeDeep(loadCriticalPrefsSnapshot(), loadRouterStateSnapshot()), loadAuthSnapshot());
   }
 }
 
@@ -8075,12 +8427,13 @@ function sendComposerMessage() {
     }
   }
 
-  function getPluginContext() {
+function getPluginContext() {
     const pid = app.plugins.currentRegistering || "";
     return {
       state: app.state,
       log: appendLog,
       apiJson,
+      buildHeaders,
       streamSSE,
       renderMarkdown,
       refreshTranscript: renderTranscript,
@@ -8108,6 +8461,15 @@ function sendComposerMessage() {
       markMessageDone: (sid, msgId) => markStreamDone(sid, msgId),
       startCompletionStream: (pid, sid, prompt, clientMsgId) => startCompletionStream(pid, sid, prompt, clientMsgId),
       startModelStream: (pid, sid, prompt, clientMsgId) => startModelStream(pid, sid, prompt, clientMsgId),
+      getAiRouterBridges: () => {
+        const list = Array.isArray(app.plugins?.slots?.aiRouterBridges) ? app.plugins.slots.aiRouterBridges.slice() : [];
+        return list.sort((a, b) => {
+          const ap = Number(a?.priority || 0);
+          const bp = Number(b?.priority || 0);
+          if (bp !== ap) return bp - ap;
+          return String(a?.pluginId || "").localeCompare(String(b?.pluginId || ""));
+        });
+      },
       getAiEnabled: (pid, sid, fallback) => getAiEnabledFromState(pid, sid, fallback),
       setAiEnabled: (pid, sid, enabled) => setAiEnabledInState(pid, sid, enabled),
       randomId: (prefix) => randomId(prefix || "id"),
@@ -8120,6 +8482,9 @@ function sendComposerMessage() {
       t: (key, fallback) => i18nTranslate(key, fallback),
       hasPermission: (key, fallback) => hasPermission(key, fallback),
       canAccessPlugin: (pluginId, action) => canAccessPlugin(pluginId, action),
+      setPluginEnabled: (pluginId, enabled) => setPluginEnabled(pluginId, enabled),
+      requestPluginPriority: (pluginId, options) => requestPluginPriority(pluginId, options),
+      requestPluginPreload: (pluginId, kind) => requestPluginPreload(pluginId, kind),
       refreshPermissions: (options) => refreshPermissionState(options),
       refreshGuiPluginsDiscovery: () => refreshGuiPluginsDiscovery(),
       translateContainer: (root, pluginId) => translateContainer(root, pluginId),
@@ -8268,6 +8633,100 @@ function setPluginEnabled(pluginId, enabled) {
   app.state.pluginPrefs.enabled[key] = Boolean(enabled);
   saveCriticalPrefsSnapshot(app.state);
   scheduleSave();
+  if (app.state?.ui?.activePid && canUseRemoteServer() && hasRemoteAuth()) {
+    scheduleProjectRouterPrefsSave(app.state.ui.activePid);
+  }
+}
+
+function wireTranscriptVideoBlock(wrap, block) {
+  const src = resolveTranscriptMediaUrl(block?.src || "");
+  if (!wrap) return null;
+  wrap.className = "block block-video";
+  wrap.innerHTML = "";
+  if (!src) {
+    wrap.textContent = i18nTranslate("chat_js.media.video_not_available", "Video not available");
+    return wrap;
+  }
+  const vid = document.createElement("video");
+  vid.src = src;
+  vid.controls = false;
+  vid.preload = "metadata";
+  vid.playsInline = true;
+  vid.dataset.boundVideoControls = "1";
+  try {
+    vid.load();
+  } catch (_err) {}
+  const errorMsg = document.createElement("div");
+  errorMsg.className = "block-caption";
+  errorMsg.textContent = i18nTranslate("chat_js.media.video_not_available", "Video not available");
+  vid.addEventListener("error", () => {
+    if (!errorMsg.parentNode) wrap.appendChild(errorMsg);
+  });
+  wrap.appendChild(vid);
+  const controls = document.createElement("div");
+  controls.className = "block-video-controls";
+  const btnPlay = document.createElement("button");
+  btnPlay.type = "button";
+  btnPlay.textContent = i18nTranslate("chat_js.media.play", "Play");
+  const btnPause = document.createElement("button");
+  btnPause.type = "button";
+  btnPause.textContent = i18nTranslate("chat_js.media.pause", "Pause");
+  const seek = document.createElement("input");
+  seek.type = "range";
+  seek.min = "0";
+  seek.max = "0";
+  seek.value = "0";
+  seek.step = "0.1";
+  let isSeeking = false;
+  btnPlay.addEventListener("click", () => {
+    try { vid.currentTime = Number(vid.currentTime || 0); } catch (_err) {}
+    vid.play().catch(() => {});
+  });
+  btnPause.addEventListener("click", () => {
+    vid.pause();
+  });
+  seek.addEventListener("input", () => {
+    isSeeking = true;
+    if (Number.isFinite(vid.duration)) {
+      vid.currentTime = Number(seek.value || 0);
+    }
+  });
+  seek.addEventListener("change", () => {
+    isSeeking = false;
+  });
+  vid.addEventListener("loadedmetadata", () => {
+    const dur = Number.isFinite(vid.duration) ? vid.duration : 0;
+    seek.max = String(Math.max(0, dur));
+    seek.value = "0";
+    try { vid.currentTime = 0; } catch (_err) {}
+  });
+  vid.addEventListener("timeupdate", () => {
+    if (isSeeking) return;
+    seek.value = String(vid.currentTime || 0);
+  });
+  controls.appendChild(btnPlay);
+  controls.appendChild(btnPause);
+  controls.appendChild(seek);
+  wrap.appendChild(controls);
+  if (block?.name) {
+    const caption = document.createElement("div");
+    caption.className = "block-caption";
+    caption.textContent = String(block.name || "");
+    wrap.appendChild(caption);
+  }
+  return wrap;
+}
+
+function rebindRestoredTranscriptVideos(node, msg) {
+  if (!(node instanceof Element) || !msg) return;
+  const blocks = buildMessageBlocks(msg);
+  const videoBlocks = blocks.filter((block) => String(block?.type || "").toLowerCase() === "video");
+  if (!videoBlocks.length) return;
+  const wraps = Array.from(node.querySelectorAll(".block.block-video"));
+  wraps.forEach((wrap, index) => {
+    const block = videoBlocks[index] || videoBlocks[0];
+    wireTranscriptVideoBlock(wrap, block);
+  });
 }
 
 function getPluginRegistry(pluginId) {
@@ -8287,6 +8746,7 @@ function getPluginRegistry(pluginId) {
         messageFooterItems: [],
         eventHandlers: [],
         completionPayloadHooks: [],
+        aiRouterBridges: [],
         rosterActions: [],
       sendHooks: [],
       sendContextMenuItems: [],
@@ -8455,9 +8915,10 @@ function unregisterPluginSlots(pluginId) {
     app.plugins.slots.messageRenderers = filterOut(app.plugins.slots.messageRenderers);
     app.plugins.slots.blockTransformers = filterOut(app.plugins.slots.blockTransformers);
     app.plugins.slots.blockRenderers = filterOut(app.plugins.slots.blockRenderers);
-    app.plugins.slots.messageFooterItems = filterOut(app.plugins.slots.messageFooterItems);
-    app.plugins.slots.eventHandlers = filterOut(app.plugins.slots.eventHandlers);
+  app.plugins.slots.messageFooterItems = filterOut(app.plugins.slots.messageFooterItems);
+  app.plugins.slots.eventHandlers = filterOut(app.plugins.slots.eventHandlers);
   app.plugins.slots.completionPayloadHooks = filterOut(app.plugins.slots.completionPayloadHooks);
+  app.plugins.slots.aiRouterBridges = filterOut(app.plugins.slots.aiRouterBridges);
   app.plugins.slots.rosterActions = filterOut(app.plugins.slots.rosterActions);
   app.plugins.slots.sendHooks = filterOut(app.plugins.slots.sendHooks);
   app.plugins.slots.sendContextMenuItems = filterOut(app.plugins.slots.sendContextMenuItems);
@@ -8798,6 +9259,8 @@ function registerPluginInstance(pluginId, plugin, entry, meta) {
   try {
     if (plugin.register) {
       plugin.register(createPluginHost(key));
+    } else if (plugin.init) {
+      plugin.init(createPluginHost(key));
     }
   } finally {
     app.plugins.currentRegistering = null;
@@ -9150,7 +9613,7 @@ function createPluginHost(fixedPluginId = null) {
       if (reg) reg.composerLeft.push(entry);
       renderComposerLeft();
     },
-      addPanelTab(tab) {
+    addPanelTab(tab) {
       const pid = fixedPid || app.plugins.currentRegistering;
       if (pid && tab && !tab.pluginId) {
         tab.pluginId = pid;
@@ -9158,11 +9621,17 @@ function createPluginHost(fixedPluginId = null) {
       if (pid && app.plugins.meta[pid]) {
         app.plugins.meta[pid].hasPanel = true;
       }
+      if (pid) {
+        const row = (app.plugins.list || []).find((item) => String(item?.id || "").trim() === String(pid).trim());
+        if (row) row.hasPanel = true;
+      }
       const entry = { pluginId: pid, tab };
       app.plugins.slots.panels.push(entry);
       const reg = getPluginRegistry(pid);
       if (reg) reg.panels.push(entry);
       renderPluginPanels();
+      renderGuiPluginsMenu();
+      renderAccountMenu();
     },
       addMessageRenderer(renderer) {
         const pid = fixedPid || app.plugins.currentRegistering;
@@ -9228,6 +9697,32 @@ function createPluginHost(fixedPluginId = null) {
       app.plugins.slots.completionPayloadHooks.push(entry);
       const reg = getPluginRegistry(pid);
       if (reg) reg.completionPayloadHooks.push(entry);
+    },
+    addAiRouterBridge(spec) {
+      const pid = fixedPid || app.plugins.currentRegistering;
+      if (!spec || typeof spec !== "object") return;
+      const entry = {
+        pluginId: pid,
+        id: String(spec.id || pid || "").trim(),
+        priority: Number(spec.priority || 0),
+        routeId: String(spec.routeId || "").trim(),
+        activeFlowValue: String(spec.activeFlowValue || "").trim(),
+        shouldHandle: typeof spec.shouldHandle === "function" ? spec.shouldHandle : null,
+      };
+      if (!entry.id || !entry.routeId || !entry.activeFlowValue || !entry.shouldHandle) return;
+      app.plugins.slots.aiRouterBridges = (app.plugins.slots.aiRouterBridges || []).filter((item) => !(item.pluginId === pid && item.id === entry.id));
+      app.plugins.slots.aiRouterBridges.push(entry);
+      app.plugins.slots.aiRouterBridges.sort((a, b) => {
+        const ap = Number(a?.priority || 0);
+        const bp = Number(b?.priority || 0);
+        if (bp !== ap) return bp - ap;
+        return String(a?.pluginId || "").localeCompare(String(b?.pluginId || ""));
+      });
+      const reg = getPluginRegistry(pid);
+      if (reg) {
+        reg.aiRouterBridges = (reg.aiRouterBridges || []).filter((item) => !(item.pluginId === pid && item.id === entry.id));
+        reg.aiRouterBridges.push(entry);
+      }
     },
     addRosterAction(handler) {
       const pid = fixedPid || app.plugins.currentRegistering;
@@ -9595,6 +10090,7 @@ function ensurePluginRepoState() {
       app.state.pluginRepo = {
         apiBase: "https://pluginserver.gotchat.ai/api",
         downloads: [],
+        localInstalls: [],
         installedServer: {},
         installedClient: {},
         lastSearch: [],
@@ -9610,6 +10106,7 @@ function ensurePluginRepoState() {
       };
   }
   if (!Array.isArray(app.state.pluginRepo.downloads)) app.state.pluginRepo.downloads = [];
+  if (!Array.isArray(app.state.pluginRepo.localInstalls)) app.state.pluginRepo.localInstalls = [];
     if (!Array.isArray(app.state.pluginRepo.lastSearch)) app.state.pluginRepo.lastSearch = [];
     if (typeof app.state.pluginRepo.manageSearch !== "string") app.state.pluginRepo.manageSearch = "";
     if (!Array.isArray(app.state.pluginRepo.manageTypeFilters)) app.state.pluginRepo.manageTypeFilters = [];
@@ -9765,6 +10262,80 @@ function pluginRepoApi() {
 function pluginRepoServerPath(path, params = {}) {
   const query = new URLSearchParams({ ...params, repo_api: pluginRepoApi() }).toString();
   return `${path}?${query}`;
+}
+
+function pluginRepoFrontendBase() {
+  try {
+    const url = new URL(pluginRepoApi());
+    const host = String(url.hostname || "").toLowerCase();
+    if (host === "pluginserver.gotchat.ai" || host === "pluginserver.saikick.org") {
+      return "https://plugins.gotchat.ai";
+    }
+    url.pathname = "";
+    url.search = "";
+    url.hash = "";
+    return url.toString().replace(/\/+$/, "");
+  } catch {
+    return "https://plugins.gotchat.ai";
+  }
+}
+
+function pluginRepoIsRestricted(plugin) {
+  if (!plugin || typeof plugin !== "object") return false;
+  const truthyKeys = [
+    "isRestricted",
+    "isPaid",
+    "paid",
+    "requiresPayment",
+    "paymentRequired",
+    "premium",
+    "restrictedForPayment",
+    "restricted",
+    "restrictedAccess",
+  ];
+  for (const key of truthyKeys) {
+    if (plugin[key] || plugin[key.charAt(0).toUpperCase() + key.slice(1)]) return true;
+  }
+  const textKeys = ["licenseType", "accessType", "visibility", "distribution", "monetization", "paymentType", "type", "pluginType", "accessMode"];
+  for (const key of textKeys) {
+    const raw = plugin[key] ?? plugin[key.charAt(0).toUpperCase() + key.slice(1)] ?? "";
+    const value = String(raw || "").trim().toLowerCase();
+    if (["paid", "premium", "restricted", "commercial", "purchase", "purchase_required"].includes(value)) return true;
+  }
+  const priceKeys = ["price", "priceUsd", "usdPrice", "amount", "paymentAmount", "nowpaymentsAmount"];
+  for (const key of priceKeys) {
+    const value = Number(plugin[key] ?? plugin[key.charAt(0).toUpperCase() + key.slice(1)] ?? 0);
+    if (Number.isFinite(value) && value > 0) return true;
+  }
+  return false;
+}
+
+function pluginRepoPublicPluginSlug(plugin) {
+  const raw =
+    plugin?.name ||
+    plugin?.Name ||
+    plugin?.pluginName ||
+    plugin?.PluginName ||
+    plugin?.slug ||
+    plugin?.Slug ||
+    plugin?.prettySlug ||
+    plugin?.PrettySlug ||
+    plugin?.repoSlug ||
+    plugin?.RepoSlug ||
+    plugin?.id ||
+    "";
+  const value = String(raw || "").trim();
+  if (!value) return "";
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "") || value;
+}
+
+function pluginRepoRestrictedAccessUrl(plugin) {
+  const slug = pluginRepoPublicPluginSlug(plugin);
+  if (slug) return `${pluginRepoFrontendBase()}/plugin/${encodeURIComponent(slug)}`;
+  return `${pluginRepoFrontendBase()}/plugin/${encodeURIComponent(String(plugin?.id || ""))}`;
 }
 
 function isLocalhostUrl(value) {
@@ -9967,6 +10538,7 @@ function pluginRepoAssetUrl(pluginId, assetPath) {
   function renderPluginRepoDownloaded() {
     if (!app.dom.pluginRepoDownloadResults || !app.dom.pluginRepoDownloadStatus) return;
     ensurePluginRepoState();
+    const staged = app.state.pluginRepo.localInstalls || [];
     const downloads = app.state.pluginRepo.downloads || [];
     const pageSize = app.state.pluginRepo.downloadedPageSize || 10;
     const total = downloads.length;
@@ -9983,14 +10555,34 @@ function pluginRepoAssetUrl(pluginId, assetPath) {
     const start = (page - 1) * pageSize;
     const items = downloads.slice(start, start + pageSize);
     app.dom.pluginRepoDownloadResults.innerHTML = "";
+    if (staged.length) {
+      const stagedWrap = document.createElement("div");
+      stagedWrap.className = "plugin-local-install-section";
+      const title = document.createElement("h3");
+      title.textContent = "Ready to install from app folder";
+      const note = document.createElement("div");
+      note.className = "muted";
+      const folder = app.state.pluginRepo.localInstallFolder || "llmloader2/install_plugin";
+      note.textContent = `Drop plugin install ZIP files into ${folder}. Successfully installed ZIPs are removed from that folder and moved into Downloaded.`;
+      stagedWrap.appendChild(title);
+      stagedWrap.appendChild(note);
+      for (const plugin of staged) {
+        stagedWrap.appendChild(buildPluginRepoLocalInstallCard(plugin));
+      }
+      app.dom.pluginRepoDownloadResults.appendChild(stagedWrap);
+    }
     if (!downloads.length) {
-      app.dom.pluginRepoDownloadStatus.textContent = i18nTranslate("chat_js.plugins.no_downloaded", "No downloaded plugins yet.");
+      app.dom.pluginRepoDownloadStatus.textContent = staged.length
+        ? `Found ${staged.length} staged plugin ZIP(s). No downloaded plugins yet.`
+        : i18nTranslate("chat_js.plugins.no_downloaded", "No downloaded plugins yet.");
       if (app.dom.pluginRepoDownloadPage) app.dom.pluginRepoDownloadPage.textContent = "Page 0 of 0";
       if (app.dom.pluginRepoDownloadPrev) app.dom.pluginRepoDownloadPrev.disabled = true;
       if (app.dom.pluginRepoDownloadNext) app.dom.pluginRepoDownloadNext.disabled = true;
       return;
     }
-    app.dom.pluginRepoDownloadStatus.textContent = `Showing ${items.length} of ${downloads.length} downloaded plugin(s).`;
+    app.dom.pluginRepoDownloadStatus.textContent = staged.length
+      ? `Found ${staged.length} staged plugin ZIP(s). Showing ${items.length} of ${downloads.length} downloaded plugin(s).`
+      : `Showing ${items.length} of ${downloads.length} downloaded plugin(s).`;
     if (app.dom.pluginRepoDownloadPage) app.dom.pluginRepoDownloadPage.textContent = `Page ${page} of ${totalPages}`;
     if (app.dom.pluginRepoDownloadPrev) app.dom.pluginRepoDownloadPrev.disabled = page <= 1;
     if (app.dom.pluginRepoDownloadNext) app.dom.pluginRepoDownloadNext.disabled = page >= totalPages;
@@ -10008,6 +10600,55 @@ function pluginRepoAssetUrl(pluginId, assetPath) {
       app.dom.pluginRepoDownloadResults.appendChild(card);
     }
   }
+
+function buildPluginRepoLocalInstallCard(plugin) {
+  const card = document.createElement("div");
+  card.className = "plugin-card plugin-local-install-card";
+  card.addEventListener("click", () => openPluginRepoDetail(plugin));
+
+  const body = document.createElement("div");
+  const title = document.createElement("div");
+  title.className = "plugin-card-title";
+  title.textContent = plugin.name || plugin.localInstallFilename || "Local plugin ZIP";
+
+  const summary = document.createElement("div");
+  summary.className = "plugin-card-summary";
+  summary.textContent = plugin.description || "Local staged plugin ZIP ready to install.";
+
+  const meta = document.createElement("div");
+  meta.className = "plugin-card-meta";
+  const parts = [];
+  if (plugin.localInstallFilename) parts.push(plugin.localInstallFilename);
+  if (plugin.version) parts.push(`Version ${plugin.version}`);
+  const bytes = Number(plugin.sizeBytes || plugin.size_bytes || 0);
+  if (Number.isFinite(bytes) && bytes > 0) parts.push(formatPluginRepoBytes(bytes));
+  if (plugin.hasServer) parts.push("Server files");
+  parts.push("Local ZIP");
+  meta.textContent = parts.join(" | ");
+
+  const actions = document.createElement("div");
+  actions.className = "plugin-card-actions";
+  const canInstallPlugins = hasPermission("plugins.manage.install", false);
+  const invalid = Boolean(plugin.zipInvalid);
+  if (canInstallPlugins) {
+    const btn = document.createElement("button");
+    btn.className = invalid ? "ghost" : "primary";
+    btn.textContent = invalid ? "Invalid ZIP" : "Install ZIP";
+    btn.disabled = invalid || pluginRepoDownloadInFlight.has(`local:${plugin.localInstallFilename || plugin.id}`);
+    btn.addEventListener("click", (event) => {
+      event.stopPropagation();
+      void installPluginRepoLocalZip(plugin);
+    });
+    actions.appendChild(btn);
+  }
+
+  body.appendChild(title);
+  body.appendChild(summary);
+  if (meta.textContent) body.appendChild(meta);
+  if (actions.children.length) body.appendChild(actions);
+  card.appendChild(body);
+  return card;
+}
 
 function sortPluginRepoResults(list, filter) {
   const items = Array.isArray(list) ? list.slice() : [];
@@ -10373,6 +11014,8 @@ function buildPluginRepoCard(plugin, options) {
   const installed = isPluginRepoInstalled(plugin.id);
   const serverInstalled = isPluginRepoServerInstalled(plugin.id);
   const hasServer = pluginRepoHasServerAny(plugin);
+  const restrictedPlugin = pluginRepoIsRestricted(plugin);
+  const restrictedNeedsMarketplaceAccess = restrictedPlugin && !downloaded && !installed && !serverInstalled;
   const canInstallPlugins = hasPermission("plugins.manage.install", false);
   const canUninstallPlugins = hasPermission("plugins.manage.uninstall", false);
   const canUpgradePlugins = hasPermission("plugins.manage.upgrade", false);
@@ -10381,7 +11024,19 @@ function buildPluginRepoCard(plugin, options) {
     void schedulePluginRepoRequirementCheck(plugin);
   }
 
-  if (opts.showDownload) {
+  if (restrictedNeedsMarketplaceAccess) {
+    const btn = document.createElement("button");
+    btn.className = "primary";
+    btn.textContent = "GET";
+    btn.title = "Open this plugin on plugins.gotchat.ai.";
+    btn.addEventListener("click", (event) => {
+      event.stopPropagation();
+      window.open(pluginRepoRestrictedAccessUrl(plugin), "_blank", "noopener,noreferrer");
+    });
+    actions.appendChild(btn);
+  }
+
+  if (opts.showDownload && !restrictedPlugin) {
     const downloading = isPluginRepoDownloadInFlight(plugin.id);
     const btn = document.createElement("button");
     btn.className = downloaded || downloading ? "ghost" : "primary";
@@ -10394,7 +11049,7 @@ function buildPluginRepoCard(plugin, options) {
     actions.appendChild(btn);
   }
 
-  if (opts.showInstall && canInstallPlugins) {
+  if (opts.showInstall && canInstallPlugins && (!restrictedPlugin || downloaded || installed || serverInstalled)) {
     const showInstalledLabel = opts.installLabelWhenInstalled !== false;
     if (!installed || showInstalledLabel) {
       const btn = document.createElement("button");
@@ -10441,7 +11096,7 @@ function buildPluginRepoCard(plugin, options) {
     actions.appendChild(btn);
   }
 
-  if (opts.showUpdate && canUpgradePlugins && (installed || serverInstalled)) {
+  if (opts.showUpdate && canUpgradePlugins && (installed || serverInstalled) && !restrictedPlugin) {
     const btn = document.createElement("button");
     btn.className = "ghost";
     btn.textContent = i18nTranslate("chat_js.plugins.check_updates", "Check for updates");
@@ -10551,11 +11206,25 @@ function formatPluginRepoDate(value) {
   return date.toLocaleDateString();
 }
 
+function formatPluginRepoBytes(value) {
+  const num = Number(value || 0);
+  if (!Number.isFinite(num) || num <= 0) return "";
+  const units = ["B", "KB", "MB", "GB"];
+  let val = num;
+  let idx = 0;
+  while (val >= 1024 && idx < units.length - 1) {
+    val /= 1024;
+    idx += 1;
+  }
+  return `${val >= 10 || idx === 0 ? val.toFixed(0) : val.toFixed(1)} ${units[idx]}`;
+}
+
 
   async function refreshPluginRepoServerState(options = {}) {
     const forceRequirements = Boolean(options.forceRequirements);
     try {
       const downloads = await apiJson("/v1/plugin_repo/downloads");
+      const localInstalls = await apiJson("/v1/plugin_repo/local_installs", { cache: false }).catch(() => ({ plugins: [] }));
       const installed = await apiJson("/v1/plugin_repo/installed");
       let clientInstalled = null;
       let clientAvailable = false;
@@ -10571,6 +11240,8 @@ function formatPluginRepoDate(value) {
       }
       ensurePluginRepoState();
       app.state.pluginRepo.downloads = Array.isArray(downloads?.downloads) ? downloads.downloads : [];
+      app.state.pluginRepo.localInstalls = Array.isArray(localInstalls?.plugins) ? localInstalls.plugins : [];
+      app.state.pluginRepo.localInstallFolder = String(localInstalls?.folder || "");
       app.state.pluginRepo.installedServer =
         installed?.server && typeof installed.server === "object" ? installed.server : {};
       app.state.pluginRepo.clientServiceAvailable = clientAvailable;
@@ -10795,12 +11466,56 @@ async function downloadPluginRepo(plugin) {
     });
     await refreshPluginRepoServerState();
   } catch (err) {
+    const message = String(err?.message || err || "");
+    if (/restricted|payment|required|purchase/i.test(message)) {
+      const markRestricted = (item) => {
+        if (item && String(item.id) === String(plugin.id)) {
+          item.isRestricted = true;
+          item.restricted = true;
+          item.accessType = "restricted";
+        }
+      };
+      markRestricted(plugin);
+      (app.state.pluginRepo.lastSearch || []).forEach(markRestricted);
+    }
     if (app.dom.pluginRepoSearchStatus) {
-      app.dom.pluginRepoSearchStatus.textContent = `Download failed: ${err.message || err}`;
+      app.dom.pluginRepoSearchStatus.textContent = `Download failed: ${message}`;
     }
   } finally {
     pluginRepoDownloadInFlight.delete(key);
     renderPluginRepoSearchResults(app.state.pluginRepo.lastSearch || []);
+    renderPluginRepoDownloaded();
+  }
+}
+
+async function installPluginRepoLocalZip(plugin) {
+  ensurePluginRepoState();
+  const filename = String(plugin?.localInstallFilename || "").trim();
+  if (!filename) return;
+  if (!hasPermission("plugins.manage.install", false)) {
+    alert("Install permission required.");
+    return;
+  }
+  const key = `local:${filename}`;
+  if (pluginRepoDownloadInFlight.has(key)) return;
+  try {
+    pluginRepoDownloadInFlight.add(key);
+    renderPluginRepoDownloaded();
+    const res = await apiJson("/v1/plugin_repo/install_local_zip", {
+      method: "POST",
+      body: { filename },
+    });
+    if (!res?.ok) throw new Error("Local ZIP install failed");
+    await refreshPluginRepoServerState({ forceRequirements: true });
+    await refreshGuiPluginsDiscovery();
+    if (app.dom.pluginRepoDownloadStatus) {
+      const name = res?.plugin?.name || filename;
+      app.dom.pluginRepoDownloadStatus.textContent = `Installed ${name} from local ZIP.`;
+    }
+  } catch (err) {
+    alert(`Local ZIP install failed: ${err.message || err}`);
+  } finally {
+    pluginRepoDownloadInFlight.delete(key);
     renderPluginRepoDownloaded();
   }
 }
@@ -11076,7 +11791,7 @@ async function openPluginRepoDetail(plugin) {
     });
   });
 
-  await loadPluginRepoDetail(plugin.id);
+  await loadPluginRepoDetail(plugin.id, plugin);
 }
 
 async function openPluginRepoRequirementsTodo(plugin) {
@@ -11118,7 +11833,7 @@ async function openPluginRepoRequirementsTodo(plugin) {
   }
 }
 
-async function loadPluginRepoDetail(pluginId) {
+async function loadPluginRepoDetail(pluginId, initialPlugin = null) {
   const modal = pluginRepoDetailModal;
   if (!modal) return;
   const overview = modal.querySelector('[data-section="overview"]');
@@ -11127,16 +11842,24 @@ async function loadPluginRepoDetail(pluginId) {
   const bugs = modal.querySelector('[data-section="bugs"]');
   const git = modal.querySelector('[data-section="git"]');
   try {
-    const [plugin, reviewsData, bugsData, filesData, gitData] = await Promise.all([
-      apiJson(pluginRepoServerPath(`/v1/plugin_repo/plugin/${pluginId}`)),
+    const plugin = await apiJson(pluginRepoServerPath(`/v1/plugin_repo/plugin/${pluginId}`));
+    const mergedPlugin = { ...(initialPlugin || {}), ...(plugin || {}) };
+    const restrictedPlugin = pluginRepoIsRestricted(mergedPlugin);
+    if (restrictedPlugin) {
+      modal.querySelectorAll('[data-tab="files"]').forEach((node) => {
+        node.style.display = "none";
+      });
+      if (files) files.innerHTML = "<div class=\"muted\">Files are restricted for this plugin. Open the plugin repository site and install the downloaded ZIP manually after access is granted.</div>";
+    }
+    const [reviewsData, bugsData, filesData, gitData] = await Promise.all([
       apiJson(pluginRepoServerPath(`/v1/plugin_repo/reviews/${pluginId}`)).catch(() => []),
       apiJson(pluginRepoServerPath(`/v1/plugin_repo/bugs/${pluginId}`)).catch(() => []),
-      apiJson(pluginRepoServerPath(`/v1/plugin_repo/files/${pluginId}`)).catch(() => []),
+      restrictedPlugin ? Promise.resolve([]) : apiJson(pluginRepoServerPath(`/v1/plugin_repo/files/${pluginId}`)).catch(() => []),
       apiJson(pluginRepoServerPath(`/v1/plugin_repo/gitlog/${pluginId}`)).catch(() => []),
     ]);
 
-    await renderPluginRepoOverview(overview, plugin);
-    renderPluginRepoFiles(files, pluginId, filesData);
+    await renderPluginRepoOverview(overview, mergedPlugin);
+    if (!restrictedPlugin) renderPluginRepoFiles(files, pluginId, filesData);
     renderPluginRepoCards(reviews, reviewsData, formatReviewCard);
     renderPluginRepoCards(bugs, bugsData, formatBugCard);
     renderPluginRepoCards(git, gitData, formatGitCard);
@@ -11712,6 +12435,7 @@ function setRouterEnabled(sid, pluginId, enabled, pid = app.state?.ui?.activePid
   saveRouterStateSnapshot(app.state);
   scheduleProjectRouterPrefsSave(pid);
   scheduleSave();
+  renderGuiPluginsMenu();
 }
 
 function setRouterSettings(sid, pluginId, values, pid = app.state?.ui?.activePid) {
@@ -11747,6 +12471,7 @@ function setRouterManifest(manifest) {
   app.state.router.manifest_ts = Date.now();
   saveRouterStateSnapshot(app.state);
   scheduleSave();
+  renderGuiPluginsMenu();
 }
 
 function routerAvailablePlugins(manifest, enabled, settings) {
@@ -11808,6 +12533,7 @@ async function refreshRouterManifest(force) {
   } finally {
     app.routerManifestInFlight = false;
     renderRouterPluginsList();
+    renderGuiPluginsMenu();
   }
 }
 
@@ -12565,4 +13291,6 @@ function openPluginPanel(pluginId, options = {}) {
     });
   }
 }
+
+
 

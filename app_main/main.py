@@ -735,6 +735,19 @@ def create_app(model_id: str, device: str, dtype: str, chat_template: str, schem
     def health():
         return health_routes.health()
 
+    @app.get("/v1/debug/rag_message/last")
+    def rag_message_last_debug(limit: int = 10):
+        history = getattr(app.state, "rag_message_diag_history", []) or []
+        try:
+            limit = max(1, min(int(limit or 10), 50))
+        except Exception:
+            limit = 10
+        return {
+            "ok": True,
+            "last": getattr(app.state, "rag_message_last_diag", None),
+            "history": list(history[-limit:]) if isinstance(history, list) else [],
+        }
+
 
     def _configured_runtime_mode() -> str:
         return health_routes.configured_runtime_mode()
