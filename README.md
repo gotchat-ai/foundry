@@ -2,6 +2,21 @@
 
 GotChat Foundry is a local AI application framework for running and extending the GotChat stack on your own hardware. It includes the main app server, setup wizard, plugin runtime, model deck, local model loader support, workflow tooling, and bundled framework resources.
 
+## Why build the plugin instead of rebuilding the chat?
+
+Your product idea is the capability that makes it useful—not another chat shell. Building an AI chat application from scratch means spending weeks or months implementing and debugging the same foundation: streaming responses, conversation state, projects and sessions, model connections, permissions, responsive interface behavior, error recovery, setup, and service lifecycle management. That work is necessary, but it rarely becomes the feature that distinguishes your product.
+
+GotChat is already a running solution. A developer, independent builder, or vibe coder can install the framework, confirm that the chat works, and focus directly on the plugin that turns an idea into a specialized solution or product.
+
+- Add interface controls, panels, settings, renderers, or complete user experiences with GUI plugins.
+- Add protected routes, integrations, storage, tools, model behavior, and business logic with backend plugins.
+- Combine both sides into one independently installable full-stack plugin.
+- Test and improve the differentiating capability without repeatedly rebuilding the underlying chat application.
+
+This plugin-first approach can save months of infrastructure work and debugging. It gives builders a dependable starting point while preserving the freedom to create nearly any experience the product requires.
+
+> Build the part users will choose your product for. Let GotChat provide the working chat foundation.
+
 The framework gives developers a starting point for building in-house AI tools without rebuilding the same session management, model loading, plugin routing, and setup workflows from scratch. You can run local LLMs, manage model profiles through the Model Deck, and add your own plugin stack to create a customized hosted solution for your team or workflow.
 
 This release is designed around local model execution rather than cloud-hosted model APIs. Remote access can still be configured for your own deployment, but the framework itself is built to run against models and services you control.
