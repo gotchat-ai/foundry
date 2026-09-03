@@ -2,7 +2,7 @@
 
 GotChat Foundry is a local AI application framework for running and extending the GotChat stack on your own hardware. It includes the main app server, setup wizard, plugin runtime, model deck, local model loader support, workflow tooling, and bundled framework resources.
 
-## Why build the plugin instead of rebuilding the chat?
+## Why
 
 Your product idea is the capability that makes it useful—not another chat shell. Building an AI chat application from scratch means spending weeks or months implementing and debugging the same foundation: streaming responses, conversation state, projects and sessions, model connections, permissions, responsive interface behavior, error recovery, setup, and service lifecycle management. That work is necessary, but it rarely becomes the feature that distinguishes your product.
 
