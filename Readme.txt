@@ -6,10 +6,10 @@ type: framework
 Version: 1.0.4
 License: Apache 2.0
 
-Core framework release for the GotChat Foundry platform. Go to the website gotchat.ai and check out the setup tutorials.
+Core release for the GotChat Foundry platform. Go to the website gotchat.ai and check out the setup tutorials.
 
 == Description ==
-This package contains the main GotChat framework release.
+This package contains the main GotChat release.
 
 == Installation ==
 1. Upload the release archive in the admin release area.
@@ -35,7 +35,7 @@ Model Deck 2
 - Modern web browser for admin and user access
 
 == Special Note On Requirements ==
-This framework release should be deployed with compatible backend services, CMS components, and runtime dependencies for the same release line.
+This release should be deployed with compatible backend services, CMS components, and runtime dependencies for the same release line.
 
 == Changelog ==
 = 1.0.4 =
