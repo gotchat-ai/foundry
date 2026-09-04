@@ -509,6 +509,6 @@ Return to the GPU page, choose the exact hardware or select **No GPU / I don't k
 ## Next steps
 
 - Explore the interactive tutorials at <https://gotchat.ai/tutorials.html>.
-- Review framework capabilities at <https://gotchat.ai/framework.html>.
+- Review platform capabilities at <https://gotchat.ai/platform.html>.
 - Use the Build resources and starter packages at <https://gotchat.ai/build.html>.
 - Keep each new plugin focused, permission-aware, and independently removable.
