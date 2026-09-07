@@ -121,6 +121,7 @@ Before running a release update, back up any local data, model configuration, or
 - Modern web browser for the local app UI
 - Sufficient CPU, RAM, and storage for the selected local models and plugins
 - Compatible backend/runtime components for this release line
+- Make sure that ports 8000 and 8080 are available and not used while running the application
 
 ## Stopping the System
 
