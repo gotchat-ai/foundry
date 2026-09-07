@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import platform
 import re
@@ -20,6 +21,7 @@ from urllib.request import Request, urlopen
 
 
 DEFAULT_UA = "llmloader2-llama-server-manager/1.0"
+logger = logging.getLogger(__name__)
 
 
 def _now_ts() -> int:
@@ -35,7 +37,7 @@ def _https_context() -> Optional[ssl.SSLContext]:
         return None
 
 
-def _json_url(url: str, *, timeout: float = 30.0) -> Dict[str, Any]:
+def _json_url(url: str, *, timeout: float = 30.0) -> Any:
     req = Request(url, headers={"User-Agent": DEFAULT_UA, "Accept": "application/json"})
     kwargs: Dict[str, Any] = {}
     if str(url).lower().startswith("https://"):
@@ -268,6 +270,93 @@ def _parse_device_memory(line: str) -> Dict[str, Optional[int]]:
     free_bytes = free_mib * 1024 * 1024
     used_bytes = max(0, total_bytes - free_bytes)
     return {"total_bytes": total_bytes, "free_bytes": free_bytes, "used_bytes": used_bytes}
+
+
+def _is_generic_display_adapter(label: Any) -> bool:
+    text = str(label or "").strip().lower()
+    return text in (
+        "microsoft display adapter",
+        "microsoft basic display adapter",
+        "microsoft remote display adapter",
+    )
+
+
+def _is_generic_runtime_gpu_label(label: Any) -> bool:
+    text = str(label or "").strip()
+    if not text:
+        return True
+    if _is_generic_display_adapter(text):
+        return True
+    upper = text.upper()
+    return bool(re.match(r"^(SYCL|VULKAN|CUDA)\s+GPU(?:\s*#\d+)?$", upper))
+
+
+def _runtime_gpu_choices() -> List[Dict[str, str]]:
+    py = shutil.which("python") or sys.executable
+    if not py:
+        return []
+    probe = r"""
+import json
+out = []
+try:
+    import torch
+    xpu = getattr(torch, "xpu", None)
+    if xpu is not None and xpu.is_available():
+        count = int(xpu.device_count())
+        for idx in range(count):
+            name = ""
+            try:
+                name = str(xpu.get_device_name(idx) or "")
+            except Exception:
+                name = ""
+            out.append({"value": str(idx), "label": name or f"XPU {idx}", "kind": "xpu"})
+    elif getattr(torch, "cuda", None) is not None and torch.cuda.is_available():
+        count = int(torch.cuda.device_count())
+        for idx in range(count):
+            name = ""
+            try:
+                name = str(torch.cuda.get_device_name(idx) or "")
+            except Exception:
+                name = ""
+            out.append({"value": str(idx), "label": name or f"CUDA {idx}", "kind": "cuda"})
+except Exception:
+    pass
+print(json.dumps(out))
+"""
+    try:
+        proc = subprocess.run(
+            [py, "-c", probe],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+            timeout=8,
+            **_windows_hidden_subprocess_kwargs(),
+        )
+    except Exception:
+        return []
+    if int(proc.returncode or 0) != 0:
+        return []
+    try:
+        raw = json.loads(str(proc.stdout or "").strip() or "[]")
+    except Exception:
+        return []
+    out: List[Dict[str, str]] = []
+    seen: set[str] = set()
+    for item in raw if isinstance(raw, list) else []:
+        if not isinstance(item, dict):
+            continue
+        value = str(item.get("value") or "").strip()
+        label = str(item.get("label") or "").strip()
+        if not value or not label or value in seen:
+            continue
+        seen.add(value)
+        row = {"value": value, "label": label}
+        kind = str(item.get("kind") or "").strip()
+        if kind:
+            row["kind"] = kind
+        out.append(row)
+    return out
 
 
 def _process_memory_bytes(pid: int) -> Dict[str, Optional[int]]:
@@ -589,6 +678,7 @@ class LlamaServerHostManager:
         self.logs_dir = self.base_dir / "logs"
         self.token_path = self.base_dir / "shared_token.json"
         self.state_path = self.base_dir / "state.json"
+        self.state_last_good_path = self.base_dir / "state.json.last_good"
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self.downloads_dir.mkdir(parents=True, exist_ok=True)
         self.installs_dir.mkdir(parents=True, exist_ok=True)
@@ -643,6 +733,19 @@ class LlamaServerHostManager:
             return dict(cached[1] or {})
         return None
 
+    def _cached_device_probe(self, *, install_id: str = "", runtime_id: str = "", max_age: float = 300.0) -> Optional[Dict[str, Any]]:
+        cache_key = f"{str(install_id or '').strip()}::{str(runtime_id or '').strip().lower()}"
+        if not cache_key.strip(":"):
+            return None
+        cached = self._device_probe_cache.get(cache_key)
+        if not cached:
+            return None
+        now = time.time()
+        if (now - float(cached[0] or 0.0)) >= max_age:
+            return None
+        payload = cached[1]
+        return dict(payload or {}) if isinstance(payload, dict) else None
+
     def _store_server_status(self, cfg: Dict[str, Any], payload: Dict[str, Any], *, lightweight: bool) -> None:
         key = str(cfg.get("id") or "")
         if not key:
@@ -653,15 +756,166 @@ class LlamaServerHostManager:
         if not self.state_path.is_file():
             return {"installs": {}, "servers": {}}
         try:
-            return json.loads(self.state_path.read_text(encoding="utf-8"))
-        except Exception:
+            state = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("Failed to parse llama host state.json; attempting recovery: %s", exc)
+            self._quarantine_state_file(self.state_path, suffix="corrupt")
+            recovered = self._load_last_good_state()
+            if recovered is not None:
+                self._save_state(recovered)
+                return recovered
             return {"installs": {}, "servers": {}}
+        normalized, issues = self._normalize_state(state)
+        if issues:
+            logger.warning("Sanitized llama host state.json: %s", "; ".join(issues))
+            self._save_state(normalized)
+        return normalized
 
     def _save_state(self, state: Dict[str, Any]) -> None:
-        payload = json.dumps(state, indent=2, sort_keys=True)
+        normalized, issues = self._normalize_state(state)
+        if issues:
+            logger.warning("Refined llama host state before save: %s", "; ".join(issues))
+        payload = json.dumps(normalized, indent=2, sort_keys=True)
         tmp_path = self.state_path.with_suffix(".state.tmp")
         tmp_path.write_text(payload, encoding="utf-8")
         tmp_path.replace(self.state_path)
+        self._write_last_good_state(normalized)
+
+    def _write_last_good_state(self, state: Dict[str, Any]) -> None:
+        try:
+            payload = json.dumps(state, indent=2, sort_keys=True)
+            # Use a per-call temp file so concurrent status requests do not
+            # contend on the same state.json.tmp path.
+            tmp_path = self.state_last_good_path.with_name(
+                f"{self.state_last_good_path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+            )
+            tmp_path.write_text(payload, encoding="utf-8")
+            tmp_path.replace(self.state_last_good_path)
+        except Exception as exc:
+            logger.warning("Failed to update llama host last_good state snapshot: %s", exc)
+
+    def _load_last_good_state(self) -> Optional[Dict[str, Any]]:
+        if not self.state_last_good_path.is_file():
+            return None
+        try:
+            state = json.loads(self.state_last_good_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("Failed to parse llama host last_good state: %s", exc)
+            return None
+        normalized, _issues = self._normalize_state(state)
+        return normalized
+
+    def _quarantine_state_file(self, path: Path, *, suffix: str) -> None:
+        try:
+            if not path.is_file():
+                return
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            target = path.with_name(f"{path.name}.{suffix}.{stamp}")
+            path.replace(target)
+        except Exception as exc:
+            logger.warning("Failed to quarantine bad llama host state file %s: %s", path, exc)
+
+    def _normalize_state(self, state: Any) -> tuple[Dict[str, Any], List[str]]:
+        issues: List[str] = []
+        base: Dict[str, Any] = state if isinstance(state, dict) else {}
+        installs_in = base.get("installs") if isinstance(base.get("installs"), dict) else {}
+        servers_in = base.get("servers") if isinstance(base.get("servers"), dict) else {}
+        installs_out: Dict[str, Any] = {}
+        for install_id, raw in installs_in.items():
+            if not isinstance(raw, dict):
+                issues.append(f"drop install {install_id}: non-object")
+                continue
+            iid = str(install_id or "").strip()
+            if not iid:
+                issues.append("drop install: empty id")
+                continue
+            installs_out[iid] = dict(raw)
+        servers_out: Dict[str, Any] = {}
+        for server_id, raw in servers_in.items():
+            if not isinstance(raw, dict):
+                issues.append(f"drop server {server_id}: non-object")
+                continue
+            sid = _safe_id(str(server_id or "").strip())
+            if not sid:
+                issues.append("drop server: empty id")
+                continue
+            cfg = dict(raw)
+            install_id = str(cfg.get("install_id") or "").strip()
+            if install_id and install_id not in installs_out:
+                issues.append(f"drop server {sid}: missing install_id {install_id}")
+                continue
+            runtime_id = str(cfg.get("runtime_id") or "").strip().lower()
+            if runtime_id and runtime_id not in {"cpu", "vulkan", "sycl", "cuda", "metal", "openvino"}:
+                issues.append(f"drop server {sid}: invalid runtime_id {runtime_id}")
+                continue
+            cfg["id"] = sid
+            model_path = str(cfg.get("model_path") or "").strip()
+            effective_model_path = str(cfg.get("effective_model_path") or "").strip()
+            normalized_model = self._normalize_existing_model_path(model_path)
+            normalized_effective = self._normalize_existing_model_path(effective_model_path)
+            if model_path and not normalized_model:
+                issues.append(f"clear server {sid} model_path: missing/non-absolute path {model_path}")
+                cfg.pop("model_path", None)
+            elif normalized_model:
+                cfg["model_path"] = normalized_model
+            if effective_model_path and not normalized_effective:
+                issues.append(f"clear server {sid} effective_model_path: missing/non-absolute path {effective_model_path}")
+                cfg.pop("effective_model_path", None)
+            elif normalized_effective:
+                cfg["effective_model_path"] = normalized_effective
+            mmproj_path = str(cfg.get("mmproj_path") or "").strip()
+            if mmproj_path:
+                mmproj_abs = self._normalize_existing_file_path(mmproj_path)
+                if mmproj_abs:
+                    cfg["mmproj_path"] = mmproj_abs
+                else:
+                    issues.append(f"clear server {sid} mmproj_path: missing/non-absolute path {mmproj_path}")
+                    cfg.pop("mmproj_path", None)
+            for key in ("port", "ctx_size", "n_gpu_layers", "parallel_slots", "batch_size", "ubatch_size", "n_threads", "threads_batch", "main_gpu", "cache_ram", "ctx_checkpoints"):
+                if key not in cfg or cfg.get(key) in (None, ""):
+                    continue
+                try:
+                    cfg[key] = int(cfg.get(key))
+                except Exception:
+                    issues.append(f"clear server {sid} {key}: non-integer value")
+                    cfg.pop(key, None)
+            if "port" in cfg:
+                port = int(cfg.get("port") or 0)
+                if port <= 0 or port > 65535:
+                    issues.append(f"drop server {sid}: invalid port {port}")
+                    continue
+            pid = cfg.get("pid")
+            if pid not in (None, ""):
+                try:
+                    cfg["pid"] = int(pid)
+                except Exception:
+                    issues.append(f"clear server {sid} pid: non-integer value")
+                    cfg.pop("pid", None)
+            servers_out[sid] = cfg
+        return {"installs": installs_out, "servers": servers_out}, issues
+
+    def _normalize_existing_file_path(self, value: str) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+        try:
+            path = Path(raw)
+        except Exception:
+            return ""
+        if not path.is_absolute() or not path.is_file():
+            return ""
+        try:
+            return str(path.resolve())
+        except Exception:
+            return str(path)
+
+    def _normalize_existing_model_path(self, value: str) -> str:
+        out = self._normalize_existing_file_path(value)
+        if not out:
+            return ""
+        if not out.lower().endswith(".gguf"):
+            return ""
+        return out
 
     def ensure_shared_token(self) -> str:
         if self.token_path.is_file():
@@ -703,16 +957,24 @@ class LlamaServerHostManager:
         host_os = self._host_os()
         try:
             if host_os == "windows":
-                proc = subprocess.run(
-                    ["powershell", "-NoProfile", "-Command", "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name"],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    check=False,
-                    timeout=10,
-                    **self._run_hidden_kwargs(),
-                )
-                names = [line.strip() for line in (proc.stdout or "").splitlines() if line.strip()]
+                probe_cmds = [
+                    "Get-PnpDevice -Class Display -PresentOnly | Select-Object -ExpandProperty FriendlyName",
+                    "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name",
+                ]
+                for probe_cmd in probe_cmds:
+                    proc = subprocess.run(
+                        ["powershell", "-NoProfile", "-Command", probe_cmd],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        check=False,
+                        timeout=10,
+                        **self._run_hidden_kwargs(),
+                    )
+                    lines = [line.strip() for line in (proc.stdout or "").splitlines() if line.strip()]
+                    if lines:
+                        names = lines
+                        break
             elif host_os == "linux":
                 proc = subprocess.run(
                     ["sh", "-lc", "lspci | grep -Ei 'vga|3d|display'"],
@@ -745,7 +1007,40 @@ class LlamaServerHostManager:
                         names.append(line)
             except Exception:
                 pass
-        return names
+        filtered: List[str] = []
+        seen: set[str] = set()
+        for name in names:
+            text = str(name or "").strip()
+            if not text:
+                continue
+            lower = text.lower()
+            if lower in ("microsoft display adapter", "microsoft basic display adapter"):
+                continue
+            if lower in seen:
+                continue
+            seen.add(lower)
+            filtered.append(text)
+        return filtered or names
+
+    def list_host_gpus(self, *, refresh: bool = False) -> Dict[str, Any]:
+        try:
+            caps = self._detect_capabilities() if refresh else self._cached_capabilities(max_age=5.0)
+            gpu_names = list((caps or {}).get("gpu_names") or [])
+            runtime_devices = _runtime_gpu_choices()
+            if runtime_devices:
+                devices = runtime_devices
+            else:
+                devices = [{"value": str(idx), "label": str(name or f"GPU {idx}").strip()} for idx, name in enumerate(gpu_names)]
+            return {
+                "ok": True,
+                "host_os": str((caps or {}).get("host_os") or self._host_os()),
+                "gpu_names": gpu_names,
+                "devices": devices,
+                "device_source": "runtime" if runtime_devices else "display_adapters",
+                "refreshed": bool(refresh),
+            }
+        except Exception as exc:
+            return {"ok": False, "error": str(exc), "gpu_names": [], "devices": []}
 
     def _detect_capabilities(self) -> Dict[str, Any]:
         host_os = self._host_os()
@@ -841,7 +1136,7 @@ class LlamaServerHostManager:
             "excluded": [x for x in excluded if x != runtime_id],
         }
 
-    def _pick_asset(self, release: Dict[str, Any], runtime_id: str) -> Dict[str, Any]:
+    def _matching_assets(self, release: Dict[str, Any], runtime_id: str) -> List[Dict[str, Any]]:
         assets = release.get("assets") or []
         filters = self._asset_filters(runtime_id)
         host_os = self._host_os()
@@ -874,13 +1169,58 @@ class LlamaServerHostManager:
                     break
             if ok:
                 candidates.append(asset)
-        if not candidates:
-            sample = ", ".join(str((a or {}).get("name") or "") for a in assets[:10] if isinstance(a, dict))
-            raise RuntimeError(
-                f"No release asset found for runtime={runtime_id} on {host_os}. "
-                f"Sample assets: {sample}"
-            )
-        return candidates[0]
+        return candidates
+
+    def _pick_asset(self, release: Dict[str, Any], runtime_id: str) -> Dict[str, Any]:
+        candidates = self._matching_assets(release, runtime_id)
+        if candidates:
+            def _score(asset: Dict[str, Any]) -> int:
+                name = str(asset.get("name") or "").lower()
+                score = 0
+                if name.startswith("llama-"):
+                    score += 100
+                if name.startswith("cudart-"):
+                    score -= 100
+                if self._host_os() == "windows" and ("-x64" in name or "amd64" in name):
+                    score += 10
+                if runtime_id == "cuda" and "cuda-12" in name:
+                    score += 5
+                return score
+
+            candidates.sort(key=_score, reverse=True)
+            return candidates[0]
+        assets = release.get("assets") or []
+        sample = ", ".join(str((a or {}).get("name") or "") for a in assets[:10] if isinstance(a, dict))
+        raise RuntimeError(
+            f"No release asset found for runtime={runtime_id} on {self._host_os()}. "
+            f"Sample assets: {sample}"
+        )
+
+    def _release_for_install(self, runtime_id: str, tag: str) -> Dict[str, Any]:
+        tag_text = str(tag or "latest").strip()
+        if tag_text and tag_text.lower() != "latest":
+            release = _json_url(f"https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/{tag_text}")
+            if not isinstance(release, dict):
+                raise RuntimeError(f"Release lookup failed for tag={tag_text}")
+            return release
+
+        latest = _json_url("https://api.github.com/repos/ggml-org/llama.cpp/releases/latest")
+        if isinstance(latest, dict) and self._matching_assets(latest, runtime_id):
+            return latest
+
+        releases = _json_url("https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=25")
+        if isinstance(releases, list):
+            for release in releases:
+                if isinstance(release, dict) and self._matching_assets(release, runtime_id):
+                    return release
+
+        latest_name = str((latest or {}).get("tag_name") or "latest") if isinstance(latest, dict) else "latest"
+        latest_assets = (latest or {}).get("assets") if isinstance(latest, dict) else []
+        sample = ", ".join(str((a or {}).get("name") or "") for a in list(latest_assets or [])[:10] if isinstance(a, dict))
+        raise RuntimeError(
+            f"No installable llama.cpp release asset found for runtime={runtime_id} on {self._host_os()}. "
+            f"GitHub latest was {latest_name}. Sample latest assets: {sample}"
+        )
 
     def list_status(self, *, lightweight: bool = False) -> Dict[str, Any]:
         state = self._load_state()
@@ -893,6 +1233,11 @@ class LlamaServerHostManager:
             item = dict(cfg or {})
             item["id"] = server_id
             runtime = self._server_runtime_status(item, lightweight=lightweight)
+            saved_selected_device = str(item.get("selected_device") or "").strip()
+            runtime_selected_device = str(runtime.get("selected_device") or "").strip()
+            if saved_selected_device and not _is_generic_runtime_gpu_label(saved_selected_device):
+                if not runtime_selected_device or _is_generic_runtime_gpu_label(runtime_selected_device):
+                    runtime["selected_device"] = saved_selected_device
             item.update(runtime)
             if item.get("pid") and not runtime.get("running") and not runtime.get("process_alive"):
                 item.pop("pid", None)
@@ -918,10 +1263,7 @@ class LlamaServerHostManager:
         runtime_id = str(runtime_id or "").strip().lower()
         if runtime_id not in ("cpu", "vulkan", "sycl", "cuda"):
             raise RuntimeError("runtime_id must be cpu, vulkan, sycl, or cuda")
-        rel_url = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
-        if tag and tag.lower() != "latest":
-            rel_url = f"https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/{tag}"
-        release = _json_url(rel_url)
+        release = self._release_for_install(runtime_id, tag)
         asset = self._pick_asset(release, runtime_id)
         tag_name = str(release.get("tag_name") or tag or "latest")
         asset_name = str(asset.get("name") or "")
@@ -1253,6 +1595,19 @@ class LlamaServerHostManager:
             effective_mmproj_path = str(cfg.get("mmproj_path") or "").strip()
         if not effective_model_path:
             raise RuntimeError("model_path required")
+        normalized_model_path = self._normalize_existing_model_path(effective_model_path)
+        if not normalized_model_path:
+            raise RuntimeError(
+                f"invalid_server_state:model_path_missing_or_invalid:{effective_model_path}"
+            )
+        effective_model_path = normalized_model_path
+        if effective_mmproj_path:
+            normalized_mmproj_path = self._normalize_existing_file_path(effective_mmproj_path)
+            if not normalized_mmproj_path:
+                raise RuntimeError(
+                    f"invalid_server_state:mmproj_path_missing_or_invalid:{effective_mmproj_path}"
+                )
+            effective_mmproj_path = normalized_mmproj_path
         cfg["model_path"] = effective_model_path
         cfg["effective_model_path"] = effective_model_path
         cfg["mmproj_path"] = effective_mmproj_path
@@ -1815,11 +2170,9 @@ class LlamaServerHostManager:
         runtime_id = str(cfg.get("runtime_id") or "").strip().lower()
         probe = None
         runtime_uses_gpu = runtime_id in ("sycl", "vulkan", "cuda")
-        probe_opt_in = str(os.environ.get("LLMLOADER2_LLAMA_STATUS_PROBE_DEVICES") or "").strip().lower()
-        probe_enabled = (not lightweight) and (runtime_uses_gpu or probe_opt_in in ("1", "true", "yes", "on"))
-        if probe_enabled:
+        if runtime_uses_gpu:
             try:
-                probe = self.probe_devices(install_id=install_id, runtime_id=runtime_id)
+                probe = self._cached_device_probe(install_id=install_id, runtime_id=runtime_id, max_age=300.0)
             except Exception:
                 probe = None
         if isinstance(probe, dict) and probe.get("ok"):
@@ -1838,6 +2191,24 @@ class LlamaServerHostManager:
                     gpu_free_bytes = mem.get("free_bytes")
                     gpu_used_bytes = mem.get("used_bytes")
                     break
+        if selected_device and _is_generic_display_adapter(selected_device):
+            selected_device = None
+        saved_selected_device = str(cfg.get("selected_device") or "").strip()
+        if (not selected_device or _is_generic_runtime_gpu_label(selected_device)) and saved_selected_device and not _is_generic_runtime_gpu_label(saved_selected_device):
+            selected_device = saved_selected_device
+        if not selected_device and runtime_uses_gpu:
+            try:
+                host_gpu_names = list((self._cached_capabilities() or {}).get("gpu_names") or [])
+            except Exception:
+                host_gpu_names = []
+            try:
+                selected_idx = int(selected_device_index)
+            except Exception:
+                selected_idx = None
+            if selected_idx is not None and 0 <= selected_idx < len(host_gpu_names):
+                candidate = str(host_gpu_names[selected_idx] or "").strip() or None
+                if candidate and not _is_generic_runtime_gpu_label(candidate):
+                    selected_device = candidate
         if not selected_device and runtime_uses_gpu:
             try:
                 selected_idx = int(selected_device_index)
