@@ -68,6 +68,7 @@ GPU_MODELS: Dict[str, List[str]] = {
     ],
     "Nvidia": [
         "GeForce GTX 10-series",
+        "GeForce GTX 16-series",
         "GeForce RTX 20-series",
         "GeForce RTX 30-series",
         "GeForce RTX 40-series",
@@ -406,8 +407,46 @@ def _cpu_torch_packages() -> List[str]:
     return ["torch", "torchvision", "torchaudio"]
 
 
+def _nvidia_torch_plan_for_model(model: str) -> Dict[str, Any]:
+    """Return a stable PyTorch CUDA wheel plan for the selected NVIDIA family.
+
+    CUDA tags are wheel/runtime targets, not a promise that every NVIDIA GPU can
+    use every wheel. GTX 10-series cards are Pascal (compute capability 6.x), so
+    keep them on CUDA 11.8 wheels. Newer RTX/Turing+ cards use the newer CUDA
+    12.8 wheel line.
+    """
+    label = str(model or "").strip().lower()
+    if "gtx 10" in label or any(token in label for token in ("1050", "1060", "1070", "1080")):
+        return {
+            "backend": "cuda",
+            "cuda": "cu118",
+            "command": [
+                "install",
+                "torch==2.7.1",
+                "torchvision==0.22.1",
+                "torchaudio==2.7.1",
+                "--index-url",
+                "https://download.pytorch.org/whl/cu118",
+            ],
+            "reason": "GTX 10-series/Pascal GPUs use the CUDA 11.8 PyTorch wheel plan for wider legacy compatibility.",
+        }
+    return {
+        "backend": "cuda",
+        "cuda": "cu128",
+        "command": [
+            "install",
+            "torch==2.8.0",
+            "torchvision==0.23.0",
+            "torchaudio==2.8.0",
+            "--index-url",
+            "https://download.pytorch.org/whl/cu128",
+        ],
+    }
+
+
 def torch_plan(cfg: Dict[str, Any]) -> Dict[str, Any]:
     brand = str(cfg.get("gpu_brand") or "").strip().lower()
+    model = str(cfg.get("gpu_model") or "").strip().lower()
     sysname = _platform_key()
     packages = ["torch", "torchvision", "torchaudio"]
     if sysname == "macos":
@@ -425,10 +464,7 @@ def torch_plan(cfg: Dict[str, Any]) -> Dict[str, Any]:
                 "command": ["install", *cpu_packages, "--index-url", "https://download.pytorch.org/whl/cpu"],
                 "reason": "Nvidia was selected, but no NVIDIA runtime/tooling was detected on this Linux machine.",
             }
-        return {
-            "backend": "cuda",
-            "command": ["install", "--pre", *packages, "--index-url", "https://download.pytorch.org/whl/nightly/cu128"],
-        }
+        return _nvidia_torch_plan_for_model(model)
     if brand == "intel":
         return {
             "backend": "xpu",
@@ -556,18 +592,25 @@ def _python_torch_matches_plan(python_exe: Path, tplan: Dict[str, Any]) -> bool:
         [
             str(python_exe),
             "-c",
-            "import torch; print(getattr(torch, '__version__', ''))",
+            "import json, torch; print(json.dumps({'version': getattr(torch, '__version__', ''), 'cuda_available': bool(getattr(torch, 'cuda', None) and torch.cuda.is_available())}))",
         ],
         timeout=10.0,
     )
     if not result.get("ok"):
         return False
-    version = str(result.get("output") or "").strip().lower()
+    try:
+        info = json.loads(str(result.get("output") or "").strip())
+    except Exception:
+        info = {"version": str(result.get("output") or "").strip(), "cuda_available": False}
+    version = str(info.get("version") or "").strip().lower()
     backend = str(tplan.get("backend") or "").strip().lower()
     if backend == "cpu" and _linux_x86_64():
         return "+cpu" in version and "+cu" not in version
     if backend == "cuda":
-        return "+cu" in version or "cuda" in version
+        expected_cuda = str(tplan.get("cuda") or "").strip().lower()
+        has_expected_cuda = bool(expected_cuda and expected_cuda in version)
+        has_cuda_build = "+cu" in version or "cuda" in version
+        return bool((has_expected_cuda or (not expected_cuda and has_cuda_build)) and info.get("cuda_available"))
     return True
 
 
@@ -1740,7 +1783,7 @@ function applyDetectionToUi(detection, options = {}) {
     $('detectOut').innerHTML += `<br><b>NumPy:</b> ${detection.tools?.numpy_version || 'not installed'} (${detection.tools?.numpy_torch_compatible ? 'Torch compatible' : 'needs numpy<2'})`;
   }
   if (detection.torch_plan.reason) {
-    $('detectOut').innerHTML += `<br><b class="warn">PyTorch fallback:</b> ${detection.torch_plan.reason}`;
+    $('detectOut').innerHTML += `<br><b class="warn">PyTorch note:</b> ${detection.torch_plan.reason}`;
   }
   $('detectOut').innerHTML += `<br><b>Install ready:</b> ${detection.install_ready ? 'yes' : 'no'}`;
   if (detection.config_matches_installed === false) {
@@ -1934,7 +1977,9 @@ function renderPlan(){
   if (!isWindows && brand === 'Nvidia') { backend = 'CUDA when NVIDIA runtime is detected, otherwise Vulkan'; torch = 'CUDA when NVIDIA runtime is detected, otherwise CPU'; }
   if (!isWindows && (brand === 'No GPU' || brand === "I don't know")) { backend = 'Vulkan'; torch = 'CPU'; }
   if (isWindows && brand === 'Intel') torch = 'XPU';
-  if (isWindows && brand === 'Nvidia') torch = 'CUDA when NVIDIA runtime is detected, otherwise CPU';
+  if (isWindows && brand === 'Nvidia') torch = model.includes('GTX 10')
+    ? 'CUDA 11.8 PyTorch wheels for GTX 10-series/Pascal'
+    : 'CUDA 12.8 PyTorch wheels for newer NVIDIA GPUs';
   if (isMac && isAppleSilicon && brand === 'Apple') { backend = 'Metal'; torch = 'CPU'; }
   else if (isMac) { backend = 'CPU / Accelerate'; torch = 'CPU'; }
   $('gpuPlan').textContent = `Embedded GGUF backend plan: ${backend}. Torch plan: ${torch}.`;

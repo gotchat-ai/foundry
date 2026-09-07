@@ -30,12 +30,17 @@ Requests==2.33.0
 safetensors==0.7.0
 sentence_transformers==5.1.2
 sse_starlette==3.1.2
-# NOTE: On Linux x86_64, PyPI's default `torch==2.8.0` wheel pulls in many
-# proprietary `nvidia-*-cu12` dependency wheels. Prefer the CPU wheel instead.
-# (The Vulkan image sets `PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu`)
+# NOTE: The setup wizard installs PyTorch separately because the correct CUDA
+# wheel depends on the selected GPU family. GTX 10-series/Pascal uses the
+# stable cu118 plan (torch/torchaudio 2.7.1 + torchvision 0.22.1). Newer
+# RTX/Turing+ NVIDIA cards use the stable cu128 plan (torch/torchaudio 2.8.0
+# + torchvision 0.23.0). Do not pin a Windows cu### wheel here; pip needs the
+# matching PyTorch wheel index URL.
+#
+# Linux x86_64 defaults to the CPU wheel to avoid pulling proprietary
+# nvidia-*-cu12 dependency wheels from regular PyPI during generic installs.
 torch==2.8.0+cpu; platform_system == "Linux" and platform_machine == "x86_64"
 torch==2.8.0; platform_system != "Windows" and (platform_system != "Linux" or platform_machine != "x86_64")
-torch==2.8.0+cu129; platform_system == "Windows"
 transformers==4.57.1
 tree_sitter==0.25.2
 tree_sitter_c_sharp==0.23.1
