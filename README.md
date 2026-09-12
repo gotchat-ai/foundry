@@ -1,6 +1,6 @@
 # GotChat Foundry Platform
 
-GotChat Foundry is a local AI application platform for running and extending the GotChat stack on your own hardware. It includes the main app server, setup wizard, plugin runtime, model deck, local model loader support, workflow tooling, and bundled platform resources.
+Fork of this project. GotChat Foundry is a local AI application platform for running and extending the GotChat stack on your own hardware. It includes the main app server, setup wizard, plugin runtime, model deck, local model loader support, workflow tooling, and bundled platform resources.
 
 ## Why
 
