@@ -3,16 +3,483 @@ from __future__ import annotations
 from typing import Any, Dict, Optional, Tuple, Callable, List
 import asyncio
 import inspect
+import json
 import multiprocessing
 import os
 import traceback
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from runtime_cuda import empty_accelerator_cache
 from plugins.gui_helpers._framework.services import get_plugin_service
 
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi", ".wmv"}
+
+
+def _is_workflow_model_loader_settings(info: Dict[str, Any], model_settings: Dict[str, Any]) -> bool:
+    fields = dict(info or {})
+    fields.update(model_settings or {})
+    mode_values = {
+        str(fields.get("workflow_loader_mode") or "").strip().lower(),
+        str(fields.get("model_workflow_mode") or "").strip().lower(),
+        str(fields.get("execution_mode") or "").strip().lower(),
+        str(fields.get("backend_mode") or "").strip().lower(),
+    }
+    return (
+        "workflow_model_loader" in mode_values
+        or bool(str(fields.get("workflow_model_loader_id") or "").strip())
+        or bool(str(fields.get("model_workflow_flow_name") or "").strip())
+    )
+
+
+def _http_json(method: str, url: str, payload: Optional[Dict[str, Any]], headers: Dict[str, str], timeout_s: float) -> Dict[str, Any]:
+    data = None
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method=method.upper())
+    req.add_header("Content-Type", "application/json")
+    for k, v in (headers or {}).items():
+        if v is not None:
+            req.add_header(str(k), str(v))
+    try:
+        with urllib.request.urlopen(req, timeout=max(1.0, float(timeout_s or 1.0))) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"http {exc.code}: {raw[:500]}") from exc
+    if not raw.strip():
+        return {}
+    parsed = json.loads(raw)
+    return parsed if isinstance(parsed, dict) else {"data": parsed}
+
+
+def _request_headers_for_agent_flow(settings: Dict[str, Any]) -> Dict[str, str]:
+    raw = dict((settings or {}).get("__request_headers") or {})
+    out: Dict[str, str] = {}
+    for key in ("authorization", "x-auth-token", "x-admin-auth", "cookie"):
+        value = raw.get(key) or raw.get(key.title())
+        if value:
+            out[key] = str(value)
+    enabled = raw.get("x-gui-enabled-plugins") or raw.get("X-Gui-Enabled-Plugins") or ""
+    parts = [p.strip() for p in str(enabled or "").split(",") if p.strip()]
+    for required in ("agent_flow", "model_deck", "collab_chat"):
+        if required not in parts:
+            parts.append(required)
+    out["X-Gui-Enabled-Plugins"] = ",".join(parts)
+    return out
+
+
+def _is_loopback_host(host: str) -> bool:
+    parsed = urllib.parse.urlparse(f"//{host}" if "://" not in host else host)
+    name = (parsed.hostname or host).strip().lower().strip("[]")
+    return name in {"127.0.0.1", "localhost", "0.0.0.0", "::1", "host.docker.internal"}
+
+
+def _setting_url(settings: Dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = str((settings or {}).get(key) or os.environ.get(key.upper()) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _agent_flow_base_url(settings: Dict[str, Any]) -> str:
+    explicit = _setting_url(
+        settings,
+        "agent_flow_internal_base_url",
+        "llmloader2_internal_base_url",
+        "gotchat_internal_base_url",
+    )
+    if explicit:
+        return explicit.rstrip("/")
+
+    headers = dict((settings or {}).get("__request_headers") or {})
+    host = str(headers.get("host") or headers.get("Host") or "").strip()
+    if host and _is_loopback_host(host):
+        proto = str(headers.get("x-forwarded-proto") or headers.get("X-Forwarded-Proto") or "http").split(",", 1)[0].strip() or "http"
+        if proto not in {"http", "https"}:
+            proto = "http"
+        return f"{proto}://{host}"
+
+    port = (
+        str((settings or {}).get("server_port") or "").strip()
+        or str((settings or {}).get("app_port") or "").strip()
+        or os.environ.get("LLMLOADER2_PORT")
+        or os.environ.get("PORT")
+        or "8000"
+    )
+    return f"http://127.0.0.1:{port}"
+
+
+def _find_media_result(value: Any, suffixes: Tuple[str, ...]) -> str:
+    seen: set[int] = set()
+
+    def walk(obj: Any) -> str:
+        oid = id(obj)
+        if oid in seen:
+            return ""
+        seen.add(oid)
+        if isinstance(obj, str):
+            text = obj.strip()
+            low = text.lower().split("?", 1)[0]
+            return text if any(low.endswith(s) for s in suffixes) else ""
+        if isinstance(obj, dict):
+            preferred = (
+                "output_path",
+                "out_path",
+                "video_path",
+                "image_path",
+                "path",
+                "url",
+                "video_url",
+                "image_url",
+                "output",
+            )
+            for key in preferred:
+                if key in obj:
+                    found = walk(obj.get(key))
+                    if found:
+                        return found
+            for item in obj.values():
+                found = walk(item)
+                if found:
+                    return found
+        elif isinstance(obj, (list, tuple)):
+            for item in obj:
+                found = walk(item)
+                if found:
+                    return found
+        return ""
+
+    return walk(value)
+
+
+def _uploads_url_for_path(path_or_url: str) -> str:
+    text = str(path_or_url or "").strip()
+    if not text:
+        return ""
+    parsed = urllib.parse.urlparse(text)
+    if parsed.scheme in {"http", "https"} or text.startswith("/uploads/"):
+        return text
+    return f"/uploads/{os.path.basename(text)}"
+
+
+def _workflow_flow_name(model_settings: Dict[str, Any]) -> str:
+    for key in ("model_workflow_flow_name", "workflow_flow_name", "agent_flow_active_flow", "flow_name"):
+        value = str((model_settings or {}).get(key) or "").strip()
+        if value:
+            return value
+    for key in ("video_runtime_params_json", "video_runtime_assets_json", "video_runtime_template_json", "image_runtime_params_json", "image_runtime_assets_json"):
+        raw = (model_settings or {}).get(key)
+        if isinstance(raw, dict):
+            nested = dict(raw)
+        else:
+            try:
+                nested = json.loads(str(raw or ""))
+            except Exception:
+                nested = {}
+        if not isinstance(nested, dict):
+            continue
+        for nested_key in ("model_workflow_flow_name", "workflow_flow_name", "agent_flow_active_flow", "flow_name", "template_flow_name"):
+            value = str(nested.get(nested_key) or "").strip()
+            if value:
+                return value
+    workflow_id = str((model_settings or {}).get("workflow_id") or "").strip()
+    loader_id = str((model_settings or {}).get("workflow_model_loader_id") or "").strip()
+    family = str((model_settings or {}).get("model_family") or "").strip()
+    compat = str((model_settings or {}).get("model_deck_compat_manifest_id") or "").strip()
+    if workflow_id == "unsloth_ltx23_gguf" or loader_id == "models.unsloth_ltx23_gguf" or family == "unsloth_ltx23_gguf" or compat == "unsloth_ltx_workflow":
+        return "Models / Unsloth LTX 2.3 GGUF"
+    return ""
+
+
+def _prefer_image_to_video_flow(flow_name: str, model_settings: Dict[str, Any], source_image: str) -> str:
+    if not str(source_image or "").strip():
+        return flow_name
+    fields = " ".join(
+        str((model_settings or {}).get(key) or "")
+        for key in (
+            "model_id",
+            "model_family",
+            "workflow_variant",
+            "workflow_id",
+            "workflow_model_loader_id",
+            "model_deck_compat_manifest_id",
+            "model_workflow_flow_name",
+            "model_workflow_template_flow_name",
+        )
+    ).lower()
+    current = str(flow_name or "").strip()
+    current_low = current.lower()
+    if "i2v" in current_low or "image-to-video" in current_low or "image_to_video" in current_low:
+        return current
+    if "wan2.2" in fields or "wan22" in fields or "wan_2.2" in fields:
+        return "Models / Wan2.2 I2V GGUF"
+    if "hunyuan" in fields and ("1.5" in fields or "15" in fields):
+        return "Models / HunyuanVideo 1.5 I2V GGUF"
+    return current
+
+
+def _load_model_workflow_blueprint_flows(settings: Dict[str, Any], model_settings: Dict[str, Any], flow_name: str) -> Dict[str, Any]:
+    app = get_server_app(settings, (settings or {}).get("__model_loader_registry"))
+    base = None
+    if app is not None:
+        base = getattr(app.state, "data_dir", None) or getattr(app.state, "workdir", None)
+    if not base:
+        base = os.path.join(os.getcwd(), "data")
+    root = os.path.join(str(base), "generated", "workflow_blueprints")
+    if not os.path.isdir(root):
+        return {}
+    wanted_names = {
+        str(flow_name or "").strip(),
+        str((model_settings or {}).get("model_workflow_flow_name") or "").strip(),
+        "Models / Unsloth LTX 2.3 GGUF",
+    }
+    wanted_names = {x for x in wanted_names if x}
+    wanted_ids = {
+        str((model_settings or {}).get("workflow_id") or "").strip(),
+        str((model_settings or {}).get("workflow_model_loader_id") or "").strip(),
+        "models.unsloth_ltx23_gguf",
+        "unsloth_ltx23_gguf",
+    }
+    wanted_ids = {x for x in wanted_ids if x}
+    matches: List[Tuple[float, Dict[str, Any]]] = []
+    try:
+        entries = list(os.scandir(root))
+    except Exception:
+        return {}
+    for entry in entries:
+        if not entry.is_dir():
+            continue
+        manifest_path = os.path.join(entry.path, "agent_flow_manifest.json")
+        if not os.path.isfile(manifest_path):
+            continue
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as fh:
+                manifest = json.load(fh)
+        except Exception:
+            continue
+        workflow_file = str(manifest.get("workflow_file") or "").strip()
+        if not workflow_file:
+            continue
+        flow_path = os.path.join(entry.path, workflow_file)
+        if not os.path.isfile(flow_path):
+            continue
+        try:
+            with open(flow_path, "r", encoding="utf-8") as fh:
+                doc = json.load(fh)
+        except Exception:
+            continue
+        flows = doc.get("flows") if isinstance(doc, dict) else None
+        if not isinstance(flows, dict) or not flows:
+            continue
+        score = 0.0
+        names = {str(manifest.get("root_flow") or "").strip(), *[str(x or "").strip() for x in (manifest.get("flow_names") or [])]}
+        names.update(str(k or "").strip() for k in flows.keys())
+        names = {x for x in names if x}
+        if names & wanted_names:
+            score += 10.0
+        for flow_def in flows.values():
+            if not isinstance(flow_def, dict):
+                continue
+            wf_id = str(flow_def.get("workflow_id") or flow_def.get("id") or "").strip()
+            if wf_id in wanted_ids:
+                score += 5.0
+            runtime = flow_def.get("runtime") if isinstance(flow_def.get("runtime"), dict) else {}
+            engine = str(runtime.get("engine") or "").strip()
+            if engine == "model_deck.workflow_model_loader":
+                score += 2.0
+        lower_name = entry.name.lower()
+        if "ltx" in lower_name and "unsloth" in " ".join(wanted_ids).lower():
+            score += 1.0
+        if score > 0:
+            try:
+                score += os.path.getmtime(flow_path) / 10000000000.0
+            except Exception:
+                pass
+            matches.append((score, flows))
+    if not matches:
+        return {}
+    flows = dict(sorted(matches, key=lambda item: item[0], reverse=True)[0][1])
+    if not flows:
+        return {}
+    source_flow = None
+    for name in (flow_name, *flows.keys()):
+        if str(name or "").strip() in flows and isinstance(flows.get(str(name or "").strip()), dict):
+            source_flow = dict(flows[str(name or "").strip()])
+            break
+    if source_flow is None:
+        first = next(iter(flows.values()))
+        source_flow = dict(first) if isinstance(first, dict) else {}
+    if source_flow:
+        for alias in wanted_names:
+            flows.setdefault(alias, dict(source_flow))
+    return flows
+
+
+def _run_agent_flow_model_workflow(
+    *,
+    settings: Dict[str, Any],
+    model_settings: Dict[str, Any],
+    model_type: str,
+    prompt: str,
+    params: Dict[str, Any],
+    suffixes: Tuple[str, ...],
+    timeout_s: int,
+    progress_callback: Optional[Any] = None,
+    cancel_cb: Optional[Any] = None,
+) -> Dict[str, Any]:
+    pid = str((settings or {}).get("__pid") or "").strip()
+    sid = str((settings or {}).get("__sid") or "").strip()
+    if not pid or not sid:
+        return {"ok": False, "error": "agent_flow_session_missing"}
+    headers = _request_headers_for_agent_flow(settings)
+    base_url = _agent_flow_base_url(settings).rstrip("/")
+    safe_pid = urllib.parse.quote(pid, safe="")
+    safe_sid = urllib.parse.quote(sid, safe="")
+    workflow_settings = dict(model_settings or {})
+    workflow_settings.update({k: v for k, v in (params or {}).items() if v not in (None, "")})
+    if prompt:
+        workflow_settings["prompt"] = prompt
+        workflow_settings["positive_prompt"] = prompt
+        workflow_settings["__request_prompt"] = prompt
+        workflow_settings["use_default_when_blank"] = False
+        workflow_settings["wan_optional_use_default_when_blank"] = False
+    workflow_settings.setdefault("model_workflow_use_model_deck_default_assets", True)
+    workflow_assets: Dict[str, Any] = {}
+    media_keys = {
+        "input_image_paths",
+        "image_paths",
+        "source_image_path",
+        "first_image_path",
+        "input_image_path",
+        "init_image_path",
+        "reference_image_path",
+        "last_image_path",
+        "target_image_path",
+        "end_image_path",
+        "input_video_paths",
+        "video_paths",
+        "source_video_path",
+        "first_video_path",
+        "input_video_path",
+        "init_video_path",
+        "reference_video_path",
+        "last_video_path",
+        "target_video_path",
+        "end_video_path",
+        "workflow_media_inputs",
+    }
+    for key in media_keys:
+        value = (params or {}).get(key)
+        if value not in (None, "", [], {}):
+            workflow_assets[key] = value
+    request_source_image = str(
+        (params or {}).get("source_image_path")
+        or (params or {}).get("input_image_path")
+        or (params or {}).get("image_path")
+        or ""
+    ).strip()
+    source_image = request_source_image
+    if source_image:
+        flow_name = _prefer_image_to_video_flow(_workflow_flow_name(workflow_settings), workflow_settings, source_image)
+        workflow_settings["model_workflow_flow_name"] = flow_name
+        workflow_settings["model_workflow_template_flow_name"] = flow_name
+        workflow_settings["source_image_path"] = source_image
+        workflow_settings["input_image_path"] = source_image
+        workflow_settings["image_path"] = source_image
+        workflow_assets["source_image_path"] = source_image
+        workflow_assets["input_image_path"] = source_image
+        workflow_assets["image_path"] = source_image
+        if request_source_image:
+            workflow_settings["__request_source_image_path"] = request_source_image
+            workflow_assets["__request_source_image_path"] = request_source_image
+        try:
+            print(
+                "[model_workflow] using source image "
+                f"flow={flow_name!r} source_image={source_image!r} request_source={bool(request_source_image)} prompt_len={len(prompt or '')}",
+                flush=True,
+            )
+        except Exception:
+            pass
+    else:
+        flow_name = _workflow_flow_name(workflow_settings)
+    if not flow_name:
+        return {"ok": False, "error": "workflow_flow_name_missing"}
+    if (
+        not request_source_image
+        and ("i2v" in str(flow_name or "").lower() or "image-to-video" in str(flow_name or "").lower())
+        and bool((settings or {}).get("__pid"))
+        and bool((settings or {}).get("__sid"))
+    ):
+        return {
+            "ok": False,
+            "error": "i2v_source_image_missing: no uploaded/request image reached the video workflow; refusing to use the saved default source image",
+        }
+    ext = {
+        "agent_flow_active_flow": flow_name,
+        "agent_flow_active_workflow_id": str(model_settings.get("workflow_id") or "").strip(),
+        "agent_flow_force_runtime_flow": False,
+        "agent_flow_internal_run": True,
+        "model_workflow_direct_request": True,
+        "model_workflow_request": {
+            "model_type": model_type,
+            "prompt": prompt,
+            "settings": workflow_settings,
+            "assets": workflow_assets,
+            **dict(params or {}),
+        },
+    }
+    runtime_flows = _load_model_workflow_blueprint_flows(settings, workflow_settings, flow_name)
+    if runtime_flows:
+        ext["agent_flow_flows"] = runtime_flows
+    start = _http_json(
+        "POST",
+        f"{base_url}/v1/projects/{safe_pid}/sessions/{safe_sid}/agent_flow/run",
+        {"text": prompt, "ext": ext},
+        headers,
+        timeout_s=30,
+    )
+    if not start.get("ok"):
+        return {"ok": False, "error": f"agent_flow_start_failed:{start}"}
+    run_id = str(start.get("run_id") or (start.get("state") or {}).get("run_id") or "").strip()
+    deadline = time.monotonic() + (int(timeout_s or 0) if int(timeout_s or 0) > 0 else 3600)
+    last_progress = 0.0
+    state: Dict[str, Any] = dict(start.get("state") or {})
+    while True:
+        if callable(cancel_cb) and cancel_cb():
+            return {"ok": False, "error": "canceled", "workflow_run_id": run_id}
+        status_url = f"{base_url}/v1/projects/{safe_pid}/sessions/{safe_sid}/agent_flow/status"
+        if run_id:
+            status_url += f"?run_id={urllib.parse.quote(run_id, safe='')}"
+        status = _http_json("GET", status_url, None, headers, timeout_s=30)
+        if isinstance(status.get("state"), dict):
+            state = dict(status.get("state") or {})
+        if callable(progress_callback) and time.monotonic() - last_progress >= 2.0:
+            try:
+                progress_callback(int(state.get("step_index") or 0), int(state.get("steps_total") or 0))
+            except Exception:
+                pass
+            last_progress = time.monotonic()
+        if not bool(state.get("running")):
+            break
+        if time.monotonic() > deadline:
+            return {"ok": False, "error": "workflow_timeout", "workflow_run_id": run_id}
+        time.sleep(1.0)
+    found = _find_media_result(state, suffixes)
+    if not found:
+        final_text = str(state.get("final_result") or state.get("status") or "").strip()
+        return {"ok": False, "error": final_text or "workflow_completed_without_media", "workflow_run_id": run_id}
+    return {
+        "ok": True,
+        "out_path": found if not urllib.parse.urlparse(found).scheme and not found.startswith("/uploads/") else "",
+        "url": _uploads_url_for_path(found),
+        "workflow_run_id": run_id,
+        "workflow_flow_name": flow_name,
+    }
 
 
 def _attachment_dict(item: Any) -> Dict[str, Any]:
@@ -56,6 +523,7 @@ def _extract_ordered_attachments(req: Any) -> List[Dict[str, Any]]:
         ext = req.get("ext") if isinstance(req.get("ext"), dict) else {}
         _add((ext or {}).get("attachments"))
         _add((ext or {}).get("media_attachments"))
+        router_msgs = (ext or {}).get("router_context_messages")
         msgs = req.get("messages")
     else:
         _add(getattr(req, "attachments", None))
@@ -63,7 +531,13 @@ def _extract_ordered_attachments(req: Any) -> List[Dict[str, Any]]:
         if isinstance(ext, dict):
             _add(ext.get("attachments"))
             _add(ext.get("media_attachments"))
+            router_msgs = ext.get("router_context_messages")
+        else:
+            router_msgs = None
         msgs = getattr(req, "messages", None)
+
+    if isinstance(router_msgs, list) and router_msgs:
+        msgs = list(router_msgs)
 
     if isinstance(msgs, list):
         for msg in msgs:
@@ -77,6 +551,16 @@ def _extract_ordered_attachments(req: Any) -> List[Dict[str, Any]]:
                 for part in content:
                     if isinstance(part, dict):
                         _add(part.get("attachment") or part.get("file") or part.get("media"))
+                        image_url = part.get("image_url")
+                        if isinstance(image_url, dict):
+                            _add({
+                                "url": image_url.get("url") or "",
+                                "mime": image_url.get("mime") or image_url.get("content_type") or "image/*",
+                                "kind": "image",
+                                "name": image_url.get("name") or image_url.get("filename") or "",
+                            })
+                        elif isinstance(image_url, str) and image_url.strip():
+                            _add({"url": image_url.strip(), "mime": "image/*", "kind": "image"})
 
     out: List[Dict[str, Any]] = []
     seen: set[str] = set()
@@ -97,7 +581,74 @@ def _extract_ordered_attachments(req: Any) -> List[Dict[str, Any]]:
     return out
 
 
-def normalize_workflow_media_inputs(req: Any) -> Dict[str, Any]:
+def _session_recent_media_attachments(req: Any, settings_override: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    settings = dict(settings_override or {})
+    if isinstance(req, dict):
+        if not settings and isinstance(req.get("settings"), dict):
+            settings = dict(req.get("settings") or {})
+        ext = req.get("ext") if isinstance(req.get("ext"), dict) else {}
+    else:
+        if not settings and isinstance(getattr(req, "settings", None), dict):
+            settings = dict(getattr(req, "settings", None) or {})
+        ext = getattr(req, "ext", None) if isinstance(getattr(req, "ext", None), dict) else {}
+    pid = str(settings.get("__pid") or ext.get("pid") or ext.get("project_id") or "").strip()
+    sid = str(settings.get("__sid") or ext.get("sid") or ext.get("session_id") or "").strip()
+    if not pid or not sid:
+        return []
+    app = get_server_app(settings, settings.get("__model_loader_registry"))
+    db = getattr(getattr(app, "state", None), "collab_db", None) if app is not None else None
+    if db is None or not hasattr(db, "list_messages"):
+        return []
+    try:
+        rows = db.list_messages(pid=pid, sid=sid, limit=20, order_desc=True)
+    except Exception:
+        return []
+    out: List[Dict[str, Any]] = []
+    for row in rows or []:
+        if str((row or {}).get("role") or "").lower() != "user":
+            continue
+        meta = row.get("meta") if isinstance(row, dict) else None
+        if not isinstance(meta, dict):
+            raw_meta = row.get("meta_json") if isinstance(row, dict) else ""
+            try:
+                meta = json.loads(str(raw_meta or "{}"))
+            except Exception:
+                meta = {}
+        attachments = None
+        if isinstance(meta, dict):
+            attachments = meta.get("attachments") or meta.get("media_attachments") or meta.get("files")
+        if isinstance(attachments, list) and attachments:
+            out.extend(_attachment_dict(item) for item in attachments)
+            break
+    return [item for item in out if item]
+
+
+def _localize_media_reference(req: Any, ref: str, settings_override: Optional[Dict[str, Any]] = None) -> str:
+    text = str(ref or "").strip()
+    if not text:
+        return ""
+    parsed = urllib.parse.urlparse(text)
+    if parsed.scheme in {"http", "https"}:
+        if parsed.path.startswith("/uploads/"):
+            text = parsed.path
+        else:
+            return text
+    if text.startswith("/uploads/"):
+        settings = dict(settings_override or {})
+        if isinstance(req, dict):
+            if not settings and isinstance(req.get("settings"), dict):
+                settings = dict(req.get("settings") or {})
+        else:
+            if not settings and isinstance(getattr(req, "settings", None), dict):
+                settings = dict(getattr(req, "settings", None) or {})
+        app = get_server_app(settings, settings.get("__model_loader_registry"))
+        data_dir = getattr(getattr(app, "state", None), "data_dir", None) if app is not None else None
+        if data_dir:
+            return os.path.join(str(data_dir), "uploads", os.path.basename(text))
+    return text
+
+
+def normalize_workflow_media_inputs(req: Any, settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Map chat-uploaded media into predictable first/last workflow inputs.
 
     Convention:
@@ -108,8 +659,12 @@ def normalize_workflow_media_inputs(req: Any) -> Dict[str, Any]:
     images: List[str] = []
     videos: List[str] = []
 
-    for item in _extract_ordered_attachments(req):
-        path = str(item.get("path") or item.get("url") or "").strip()
+    attachments = _extract_ordered_attachments(req)
+    if not attachments:
+        attachments = _session_recent_media_attachments(req, settings)
+
+    for item in attachments:
+        path = _localize_media_reference(req, str(item.get("path") or item.get("local_path") or item.get("url") or item.get("download_url") or "").strip(), settings)
         if not path:
             continue
         mime = str(item.get("mime") or "").lower()
@@ -158,6 +713,14 @@ def normalize_workflow_media_inputs(req: Any) -> Dict[str, Any]:
             })
     if images or videos:
         out["workflow_media_inputs"] = {"images": images, "videos": videos}
+        try:
+            print(
+                "[model_workflow] workflow_media_inputs "
+                f"images={images[:3]!r} videos={videos[:3]!r}",
+                flush=True,
+            )
+        except Exception:
+            pass
     return out
 
 
@@ -852,11 +1415,31 @@ class ImageGenRunner:
         from plugins.model_loader.model_deck.local_loaders.diffusers import routes as diffusers_routes
 
         loader_id = str(info.get("loader_id") or "")
+        model_settings = dict(info.get("settings") or {})
+        model_settings.update(self.settings.get("image_gen_model_settings") or {})
+        if _is_workflow_model_loader_settings(info, model_settings):
+            return _run_agent_flow_model_workflow(
+                settings=self.settings,
+                model_settings=model_settings,
+                model_type=self.model_type,
+                prompt=prompt,
+                params={
+                    "negative_prompt": negative_prompt,
+                    "num_inference_steps": num_inference_steps,
+                    "guidance_scale": guidance_scale,
+                    "width": width,
+                    "height": height,
+                    "seed": seed,
+                    "fmt": fmt,
+                },
+                suffixes=(".png", ".jpg", ".jpeg", ".webp", ".bmp"),
+                timeout_s=self.worker_timeout,
+                progress_callback=progress_callback,
+                cancel_cb=cancel_cb,
+            )
         allowed = {gguf_image_routes.LOADER_ID, diffusers_routes.LOADER_ID}
         if loader_id not in allowed:
             return {"ok": False, "error": f"unsupported_loader:{loader_id}"}
-        model_settings = dict(info.get("settings") or {})
-        model_settings.update(self.settings.get("image_gen_model_settings") or {})
         for key in (
             "image_gen_use_prompt_embeds",
             "debug_prompt_embeds",
@@ -1261,6 +1844,63 @@ class VideoGenRunner:
 
         model_settings = dict(info.get("settings") or {})
         model_settings.update(self.settings.get("video_gen_model_settings") or {})
+        if _is_workflow_model_loader_settings(info, model_settings):
+            runtime_params = {
+                "num_frames": num_frames,
+                "num_inference_steps": num_inference_steps,
+                "guidance_scale": guidance_scale,
+                "width": width,
+                "height": height,
+                "fps": fps,
+                "seed": seed,
+            }
+            for key in (
+                "input_image_paths",
+                "image_paths",
+                "source_image_path",
+                "first_image_path",
+                "input_image_path",
+                "init_image_path",
+                "reference_image_path",
+                "last_image_path",
+                "target_image_path",
+                "end_image_path",
+                "input_video_paths",
+                "video_paths",
+                "source_video_path",
+                "first_video_path",
+                "input_video_path",
+                "init_video_path",
+                "reference_video_path",
+                "last_video_path",
+                "target_video_path",
+                "end_video_path",
+                "workflow_media_inputs",
+            ):
+                value = self.settings.get(key)
+                if value not in (None, "", [], {}):
+                    runtime_params[key] = value
+            try:
+                print(
+                    "[video_gen.workflow] runtime_params "
+                    f"source={str(runtime_params.get('source_image_path') or runtime_params.get('input_image_path') or '')!r} "
+                    f"images={runtime_params.get('image_paths') or runtime_params.get('input_image_paths') or []!r} "
+                    f"prompt_len={len(prompt or '')}",
+                    flush=True,
+                )
+            except Exception:
+                pass
+            return _run_agent_flow_model_workflow(
+                settings=self.settings,
+                model_settings=model_settings,
+                model_type=self.model_type,
+                prompt=prompt,
+                params=runtime_params,
+                suffixes=(".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi", ".wmv"),
+                timeout_s=self.worker_timeout,
+                progress_callback=progress_callback,
+                cancel_cb=cancel_cb,
+            )
         if "__server_app" not in model_settings:
             app = get_server_app(self.settings, self.settings.get("__model_loader_registry"))
             if app is not None:
