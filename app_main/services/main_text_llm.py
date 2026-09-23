@@ -44,7 +44,27 @@ class MainTextLlmService:
                 return executor.submit(lambda: asyncio.run(res)).result()
         return res
 
+    def _get_active_remote_text_model(self):
+        try:
+            services = getattr(self.app.state, "plugin_services", None)
+            if not isinstance(services, dict):
+                return None
+            for plugin_id in sorted(services):
+                service = services.get(plugin_id)
+                if not isinstance(service, dict) or service.get("kind") != "remote_text_model":
+                    continue
+                getter = service.get("get_active_model")
+                model = getter() if callable(getter) else None
+                if model is not None:
+                    return model
+            return None
+        except Exception:
+            return None
+
     def _get_main_text_llm_if_loaded(self):
+        remote_model = self._get_active_remote_text_model()
+        if remote_model is not None:
+            return remote_model
         reg = getattr(self.app.state, "model_loader_registry", None)
         if not hasattr(reg, "get"):
             return None
@@ -68,6 +88,9 @@ class MainTextLlmService:
         return loaded
 
     def _ensure_main_text_llm_loaded(self):
+        remote_model = self._get_active_remote_text_model()
+        if remote_model is not None:
+            return remote_model
         reg = getattr(self.app.state, "model_loader_registry", None)
         if not hasattr(reg, "get"):
             try:
@@ -401,6 +424,13 @@ class MainTextLlmService:
         the base settings dict plus per-session plugin overrides.
         """
         backend_type = (req.backend_type or "auto").lower()
+        remote_model = self._get_active_remote_text_model()
+        if remote_model is not None:
+            settings = dict(self._settings_getter())
+            ext = req.ext or {}
+            settings["__remote_text_model"] = str(getattr(remote_model, "provider_id", None) or "remote_api")
+            settings["__server_app"] = self.app
+            return remote_model, "auto", settings
         chat_llm = self._model_getter()
         if chat_llm is None:
             main_loaded = ensure_main_text_llm_loaded()
