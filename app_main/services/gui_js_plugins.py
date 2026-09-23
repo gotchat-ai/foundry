@@ -110,8 +110,20 @@ class GuiJsPluginService:
             )
 
             app = self._app_getter()
-            summary = compute_effective_permissions(app, get_request_user(app, request))
-            out = [item for item in out if can_access_plugin(summary, str(item.get("id") or ""), action="view")]
+            request_user = get_request_user(app, request)
+            summary = compute_effective_permissions(app, request_user)
+            enabled_header = str(request.headers.get("X-Gui-Enabled-Plugins") or "")
+            explicitly_enabled = {part.strip() for part in enabled_header.split(",") if part.strip()}
+            embed_auth_plugins = {"sass_auth", "sass_customer_chat", "biz_auth"}
+            out = [
+                item
+                for item in out
+                if can_access_plugin(summary, str(item.get("id") or ""), action="view")
+                or (
+                    str(item.get("id") or "") in embed_auth_plugins
+                    and str(item.get("id") or "") in explicitly_enabled
+                )
+            ]
         except Exception:
             pass
         out.sort(key=lambda item: item["path"])
