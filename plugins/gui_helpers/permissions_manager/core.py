@@ -12,6 +12,7 @@ GUI_PLUGIN_ID = "permissions_manager"
 
 ROLE_ADMIN = "admin"
 ROLE_ANONYMOUS = "anonymous"
+ROLE_BUSINESS_ADMIN = "business_admin"
 ROLE_USER = "user"
 
 PLUGIN_DEFAULTS = {
@@ -120,6 +121,38 @@ DEFAULT_POLICY: Dict[str, Any] = {
             },
             "plugin_access": {
                 "auth_projects": {"view": True, "open": True, "settings": False},
+            },
+            "skill_access": {},
+            "builtin": True,
+        },
+        ROLE_BUSINESS_ADMIN: {
+            "label": "Business Admin",
+            "description": "Business or tenant administrator. The account owner controls this role's plugin and skill access.",
+            "permissions": {
+                "ui.account.view": True,
+                "ui.config.view": True,
+                "ui.plugins.view": True,
+                "ui.gui_plugins.view": True,
+                "projects.create": True,
+                "sessions.create": True,
+                "projects.members.manage": True,
+                "plugin_repo.view": True,
+                "plugins.manage.install": True,
+                "plugins.manage.uninstall": True,
+                "plugins.manage.upgrade": True,
+                "plugins.manage.restart": True,
+                "model_deck.view": True,
+                "model_deck.manage": True,
+                "permissions.view": True,
+                "permissions.manage": True,
+            },
+            "plugin_access": {
+                "*": {"view": True, "open": True, "settings": True},
+                "auth_projects": {"view": True, "open": True, "settings": False},
+                "biz_auth": {"view": True, "open": True, "settings": True},
+                "sass_auth": {"view": True, "open": True, "settings": True},
+                "agent_flow": {"view": True, "open": True, "settings": True},
+                "agent_workflow": {"view": True, "open": True, "settings": True},
             },
             "skill_access": {},
             "builtin": True,
@@ -336,8 +369,33 @@ def compute_effective_permissions(app: Any, user: Any = None) -> Dict[str, Any]:
     policy = get_policy(app)
     username = str(getattr(user, "username", "") or "").strip()
     role_value = str(getattr(user, "role", "") or "").strip().lower()
-    is_admin = _is_admin_like(user, username=username, role_value=role_value)
     role_ids = [ROLE_ANONYMOUS] if not username else get_user_roles(app, username)
+    sass_db = getattr(app.state, "sass_auth_db", None)
+    biz_db = getattr(app.state, "biz_auth_db", None)
+    account_role = ""
+    sass_context = {}
+    biz_context = {}
+    if username and sass_db is not None and hasattr(sass_db, "user_context"):
+        try:
+            sass_context = sass_db.user_context(username) or {}
+        except Exception:
+            sass_context = {}
+        account_role = str(sass_context.get("role") or "").strip().lower()
+    if not account_role and username and biz_db is not None and hasattr(biz_db, "user_context"):
+        try:
+            biz_context = biz_db.user_context(username) or {}
+        except Exception:
+            biz_context = {}
+        account_role = str(biz_context.get("role") or "").strip().lower()
+    tenant_is_superadmin = account_role in {"superadmin", "super_admin"}
+    tenant_is_scoped_admin = account_role in {"admin", "business_admin", "owner"}
+    is_admin = _is_admin_like(user, username=username, role_value=role_value)
+    if tenant_is_superadmin:
+        is_admin = True
+    elif tenant_is_scoped_admin:
+        is_admin = False
+    if account_role in {"admin", "business_admin", "owner"} and ROLE_BUSINESS_ADMIN not in role_ids:
+        role_ids.append(ROLE_BUSINESS_ADMIN)
     roles = _safe_dict(policy.get("roles"))
     caps: Dict[str, bool] = {}
     plugin_defaults = _normalize_plugin_rule(policy.get("plugin_defaults"), PLUGIN_DEFAULTS)
