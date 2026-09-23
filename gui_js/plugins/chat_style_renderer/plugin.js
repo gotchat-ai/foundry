@@ -15,10 +15,10 @@ const RELEVANT_TAG_RE = /<!--\s*is_relevant\s*:\s*(true|false)\s*-->/gi;
 const URL_RE = /https?:\/\/[^\s<>"')]+/gi;
 const MD_LINK_RE = /\[[^\]]*\]\((https?:\/\/[^\s)]+)\)/gi;
 const LONG_URL_MIN = 60;
-const DISPLAY_MATH_RE = /\$\$([\s\S]*?)\$\$/g;
+const DISPLAY_MATH_RE = /(?:\$\$([\s\S]*?)\$\$|\\{1,2}\[([\s\S]*?)\\{1,2}\])/g;
 const FENCED_CODE_RE = /```[\s\S]*?```/g;
 const MOJIBAKE_HINT_RE = /(?:Ãƒ.|Ã‚.|Ã¢.|Ã°[\u0080-\u00BF]|ð[\u0080-\u00BF]|Ã¯[\u0080-\u00BF]|Â[^\s]|â[^\s])/;
-const INLINE_MATH_DELIM_RE = /\$(?!\$)/;
+const INLINE_MATH_DELIM_RE = /\$(?!\$)|\\{1,2}\(/;
 const CP1252_EXTRA_BYTES = {
   0x20ac: 0x80,
   0x201a: 0x82,
@@ -278,12 +278,67 @@ function renderTexHtml(tex) {
   } catch (_err) {
     // ignore
   }
-  return `<span class="csr-math-tex">${escapeHtml(clean)}</span>`;
+  return `<span class="csr-math-tex">${escapeHtml(prettyTexFallback(clean))}</span>`;
+}
+
+function prettyTexFallback(tex) {
+  return String(tex || "")
+    .replace(/\\+frac\s*\{([^{}]+)\}\s*\{([^{}]+)\}/g, "($1)/($2)")
+    .replace(/\\+left\s*/g, "")
+    .replace(/\\+right\s*/g, "")
+    .replace(/\\+cdot\b/g, "·")
+    .replace(/\\+times\b/g, "×")
+    .replace(/\\+div\b/g, "÷")
+    .replace(/\\+pm\b/g, "±")
+    .replace(/\\+iiint\b/g, "∭")
+    .replace(/\\+iint\b/g, "∬")
+    .replace(/\\+int\b/g, "∫")
+    .replace(/\\+sum\b/g, "∑")
+    .replace(/\\+prod\b/g, "∏")
+    .replace(/\\+rho\b/g, "ρ")
+    .replace(/\\+sqrt\s*\{([^{}]+)\}/g, "√($1)")
+    .replace(/\^\{([^{}]+)\}/g, "^$1")
+    .replace(/_\{([^{}]+)\}/g, "_$1")
+    .replace(/\\+([a-zA-Z]+)\b/g, "$1")
+    .replace(/\\([()[\]{}])/g, "$1")
+    .replace(/\\+/g, "");
+}
+
+function cleanLatexDelimitersInTextNodes(root) {
+  if (!root) return;
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  const nodes = [];
+  let current;
+  while ((current = walker.nextNode())) {
+    const parentEl = current.parentElement;
+    if (
+      parentEl &&
+      parentEl.closest(".code-card, pre, code, .csr-math-inline, .csr-math-display, .think-card, script, style")
+    ) {
+      continue;
+    }
+    if (/\\{1,2}[()[\]]/.test(current.nodeValue || "")) nodes.push(current);
+  }
+  for (const node of nodes) {
+    node.nodeValue = String(node.nodeValue || "")
+      .replace(/\\{1,2}\(/g, "")
+      .replace(/\\{1,2}\)/g, "")
+      .replace(/\\{1,2}\[/g, "")
+      .replace(/\\{1,2}\]/g, "");
+  }
+}
+
+function normalizeMathDelimiters(text) {
+  return String(text || "")
+    .replace(/\\\\\[/g, "\\[")
+    .replace(/\\\\\]/g, "\\]")
+    .replace(/\\\\\(/g, "\\(")
+    .replace(/\\\\\)/g, "\\)");
 }
 
 function splitDisplayMath(text) {
   const out = [];
-  const raw = String(text || "");
+  const raw = normalizeMathDelimiters(text);
   let pos = 0;
   DISPLAY_MATH_RE.lastIndex = 0;
   let match;
@@ -291,7 +346,7 @@ function splitDisplayMath(text) {
     const start = match.index;
     const end = start + match[0].length;
     if (start > pos) out.push({ type: "text", text: raw.slice(pos, start) });
-    out.push({ type: "math_display", text: String(match[1] || "").trim() });
+    out.push({ type: "math_display", text: String(match[1] || match[2] || "").trim() });
     pos = end;
   }
   if (pos < raw.length) out.push({ type: "text", text: raw.slice(pos) });
@@ -355,12 +410,34 @@ function decodeMessageMojibake(msg) {
 }
 
 function splitInlineMathSegments(text) {
-  const raw = String(text || "");
+  const raw = normalizeMathDelimiters(text);
   if (!raw || !INLINE_MATH_DELIM_RE.test(raw)) return null;
   const parts = [];
   let last = 0;
   let i = 0;
   while (i < raw.length) {
+    const slashParen = raw[i] === "\\" && raw[i + 1] === "(";
+    if (slashParen) {
+      let j = i + 2;
+      while (j < raw.length) {
+        if (raw[j] === "\\" && raw[j + 1] === ")") break;
+        j += 1;
+      }
+      if (j >= raw.length || raw[j] !== "\\" || raw[j + 1] !== ")" || j === i + 2) {
+        i += 1;
+        continue;
+      }
+      const expr = raw.slice(i + 2, j).trim();
+      if (!expr) {
+        i = j + 2;
+        continue;
+      }
+      if (i > last) parts.push({ type: "text", text: raw.slice(last, i) });
+      parts.push({ type: "math", text: expr });
+      last = j + 2;
+      i = j + 2;
+      continue;
+    }
     if (raw[i] !== "$" || raw[i - 1] === "\\" || raw[i + 1] === "$" || raw[i - 1] === "$") {
       i += 1;
       continue;
@@ -450,10 +527,11 @@ function sweepTranscriptInlineMath(root) {
   for (const node of candidates) {
     if (!(node instanceof HTMLElement)) continue;
     const text = String(node.textContent || "");
-    if (!text || text.indexOf("$") === -1) continue;
+    if (!text || (text.indexOf("$") === -1 && !/\\{1,2}\(/.test(text))) continue;
     const fp = blockInlineMathFingerprint(node);
     if (node.dataset.csrInlineMathFingerprint === fp) continue;
     enhanceInlineMath(node);
+    cleanLatexDelimitersInTextNodes(node);
     node.dataset.csrInlineMathFingerprint = blockInlineMathFingerprint(node);
   }
 }
@@ -636,6 +714,19 @@ function renderMathDisplayBlock(block) {
   return wrap;
 }
 
+function renderTextBlock(block, renderMarkdown) {
+  const raw = String(block?.text || "");
+  if (!raw || (!INLINE_MATH_DELIM_RE.test(raw) && !/\\{1,2}\[/.test(raw))) return null;
+  INLINE_MATH_DELIM_RE.lastIndex = 0;
+  ensureStyles();
+  const wrap = document.createElement("div");
+  wrap.className = "block block-text";
+  wrap.innerHTML = renderMarkdown ? renderMarkdown(raw) : escapeHtml(raw).replace(/\n/g, "<br>");
+  enhanceInlineMath(wrap);
+  cleanLatexDelimitersInTextNodes(wrap);
+  return wrap;
+}
+
 const plugin = {
   id: meta.plugin_id,
   name: meta.name,
@@ -651,6 +742,7 @@ const plugin = {
     host.addBlockRenderer((block, _msg, ctx) => {
       const type = String(block?.type || "text").toLowerCase();
       if (type === "math_display") return renderMathDisplayBlock(block);
+      if (type === "text") return renderTextBlock(block, ctx?.renderMarkdown);
       if (type !== "think") return null;
       const renderMarkdown = ctx?.renderMarkdown;
       return renderThinkBlock(block, renderMarkdown);
