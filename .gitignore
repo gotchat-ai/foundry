@@ -1,3 +1,4 @@
 gui_js/plugins/manifest.json
 gui_js/plugins/manifest.json
 plugins/ai_routes/image_gen/__init__.py
+plugins/ai_routes/video_gen/__init__.py
