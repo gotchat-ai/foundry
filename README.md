@@ -25,7 +25,7 @@ This version also includes workflow and agent-management features. The included 
 
 Additional workflow plugin releases can be added from GitHub or through the in-app plugin repository. You can also build and install your own plugins on top of the platform.
 
-Version: `1.0.4`  
+Version: `1.0.5`  
 License: Apache 2.0  
 Contributors: thy.nguyen
 
@@ -152,6 +152,14 @@ Essential core plugins included in this version:
 - Workflow Exchange: Discover and download workflows over the network
 
 ## Changelog
+
+### 1.0.5
+
+- File changes
+- Playground added for plugin space
+- Agent Flow Workflow performance update
+- Added room for MPC skills
+- Updated Video/Image workflow template files 
 
 ### 1.0.4
 
