@@ -9,16 +9,13 @@
 //     data-server="https://YOUR_API_DOMAIN"
 //     data-rev="timestamp"
 //     data-dev="true"
-//     data-token="OPTIONAL_AUTH_TOKEN"
+//     data-token="<token>"
 //     data-pid="default"
 //     data-sid="main"
-//     data-alias="Optional display name"
+//     data-alias="SIGNED_IN_EMAIL_OR_LOGIN_ID"
+//     data-identifier-key="ACCOUNT_IDENTIFIER_KEY"
 //     data-sass-mode="business|customer"
-//     data-sass-account-id="fitsoft"
-//     data-sass-business-id="example-business"
-//     data-sass-user-id="current-dashboard-user"
 //     data-biz-package="business_starter"
-//     data-biz-business-id="example-business"
 //     data-height="80vh"
 //     data-topbar="hidden|visible"
 //   ></script>
@@ -81,6 +78,19 @@
     role: (data.bizRole || data.biz_role || "").trim(),
     signature: (data.bizSignature || data.biz_signature || data.bizSig || data.biz_sig || "").trim(),
   };
+  const legacyBusinessStarter =
+    String(sass.packageId || "").trim().toLowerCase() === "business_starter" ||
+    String(sass.packageId || "").trim().toLowerCase() === "business-starter";
+  if (legacyBusinessStarter) {
+    // Backward compatibility: early Business Starter snippets used data-sass-*.
+    // Treat those as business embeds so admin dashboards load biz_auth/admin menus
+    // instead of SaaS tenant/customer behavior.
+    for (const key of Object.keys(sass)) {
+      if (!biz[key] && sass[key]) biz[key] = sass[key];
+      sass[key] = "";
+    }
+    biz.packageId = biz.packageId || "business_starter";
+  }
   const devMode = /^(1|true|yes|on)$/i.test(String(data.dev || "").trim());
   const revRaw = (data.rev || data.cacheBust || "").trim();
   const identifierKey = (data.identifierKey || data.identifier_key || "").trim();
@@ -1702,6 +1712,8 @@
 
   start();
 })();
+
+
 
 
 
