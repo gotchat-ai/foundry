@@ -21,7 +21,7 @@ class ChatJsHandler(SimpleHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header(
             "Access-Control-Allow-Headers",
-            "Content-Type, Authorization, X-Auth-Token, X-Gui-Enabled-Plugins",
+            "Content-Type, Authorization, X-Auth-Token, X-Gui-Enabled-Plugins, X-Upload-Filename, X-ARTalk-FLAME-License-Accepted",
         )
         self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
         self.send_header("Cross-Origin-Resource-Policy", "cross-origin")
@@ -61,18 +61,20 @@ class ChatJsHandler(SimpleHTTPRequestHandler):
             "X-Session-Id",
             "X-Guest-Id",
             "X-Events-Token",
+            "X-Upload-Filename",
+            "X-ARTalk-FLAME-License-Accepted",
         ):
             value = self.headers.get(key)
             if value:
                 headers[key] = value
+        path = urllib.parse.urlsplit(self.path).path
+        expects_sse = path.endswith("/events") or str(self.headers.get("Accept") or "").lower().find("text/event-stream") >= 0
         req = urllib.request.Request(
             target,
             data=body,
             headers=headers,
             method=self.command,
         )
-        path = urllib.parse.urlsplit(self.path).path
-        expects_sse = path.endswith("/events") or str(self.headers.get("Accept") or "").lower().find("text/event-stream") >= 0
         try:
             with urllib.request.urlopen(req, timeout=None if expects_sse else 60) as resp:
                 content_type = resp.headers.get("Content-Type", "application/json")
@@ -313,7 +315,7 @@ class ChatJsHandler(SimpleHTTPRequestHandler):
         if self.path.startswith(self.CLIENT_PROXY_PATH) or self.path.startswith(self.API_PROXY_PATH):
             self.send_response(200)
             self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Auth-Token, X-Gui-Enabled-Plugins, X-User-Alias, X-Project-Id, X-Session-Id")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Auth-Token, X-Gui-Enabled-Plugins, X-User-Alias, X-Project-Id, X-Session-Id, X-Upload-Filename, X-ARTalk-FLAME-License-Accepted")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
             self.end_headers()
             return None
@@ -340,7 +342,7 @@ class ChatJsHandler(SimpleHTTPRequestHandler):
         if self.path.startswith(self.CLIENT_PROXY_PATH) or self.path.startswith(self.API_PROXY_PATH):
             self.send_response(204)
             self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Auth-Token, X-Gui-Enabled-Plugins, X-User-Alias, X-Project-Id, X-Session-Id")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Auth-Token, X-Gui-Enabled-Plugins, X-User-Alias, X-Project-Id, X-Session-Id, X-Upload-Filename, X-ARTalk-FLAME-License-Accepted")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
             self.end_headers()
             return None
