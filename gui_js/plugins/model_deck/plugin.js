@@ -297,7 +297,7 @@ let deckBadge = null;
 let deckPopover = null;
 let deckOpen = false;
 let deckOutsideHandler = null;
-let deckState = { processes: {} };
+let deckState = { processes: {}, deck: null };
 const deckPending = new Map();
 const DECK_POLL_MS = 4000;
 let deckNavRequest = null; // { action: "open" | "edit-model", typeId?: string, modelId?: string }
@@ -1678,7 +1678,7 @@ function hasBytes(value) {
 }
 
 function buildPluginHeaders(ctx) {
-  const headers = { "X-Gui-Enabled-Plugins": "collab_chat,model_deck,llama_server_manager" };
+  const headers = { "X-Gui-Enabled-Plugins": "collab_chat,model_deck,llama_server_manager,openai_api" };
   const token = ctx?.state?.auth?.token;
   if (token) headers.Authorization = `Bearer ${token}`;
   const alias = ctx?.state?.auth?.alias;
@@ -1756,6 +1756,7 @@ function getRouterSettings(ctx, sid, pluginId) {
 
 function formatStatus(entry) {
   if (!entry) return "";
+  if (entry.remote) return "";
   if (entry.kind === "worker") return entry.alive ? "running" : "stopped";
   if (entry.phase) return String(entry.phase);
   if (entry.loaded) return "loaded";
@@ -1765,6 +1766,7 @@ function formatStatus(entry) {
 
 function isRunning(entry) {
   if (!entry) return false;
+  if (entry.remote) return false;
   if (entry.kind === "worker") return Boolean(entry.alive);
   const phase = String(entry.phase || "").trim().toLowerCase();
   if (phase === "stopped" || phase === "failed" || phase === "unsupported") return false;
@@ -1788,18 +1790,34 @@ function deckEntryKey(entry) {
   return `${entry.kind || "model"}:${entry.type_id || ""}`;
 }
 
-function buildProcessEntries(processes) {
+function buildProcessEntries(processes, deck = null) {
   const data = processes || {};
   const out = [];
   const main = data.main || null;
   const defaults = Array.isArray(data.defaults) ? data.defaults : [];
   const workers = Array.isArray(data.workers) ? data.workers : [];
+  const textType = deck?.types?.text_llm && typeof deck.types.text_llm === "object" ? deck.types.text_llm : {};
+  const mainTextModel = (Array.isArray(textType.models) ? textType.models : [])
+    .find((model) => sameModelId(model?.model_id, textType.main_model_id)) || null;
+  const mainTextRemote = String(mainTextModel?.settings?.model_location || "").toLowerCase() === "remote"
+    || String(mainTextModel?.loader_id || "").startsWith("remote_model.");
   if (main && typeof main === "object") {
+    const mainTypeId = main.type_id || "text_llm";
+    const mainModelId = main.model_id || "";
+    const deckModel = _findModelInDeck(deck, mainTypeId, mainModelId)?.model || null;
+    const deckSettings = deckModel?.settings && typeof deckModel.settings === "object" ? deckModel.settings : {};
+    const deckLoaderId = String(deckModel?.loader_id || "");
+    const processLoaderId = String(main.loader_id || "");
+    const remote = String(deckSettings.model_location || "").toLowerCase() === "remote"
+      || deckLoaderId.startsWith("remote_model.")
+      || processLoaderId.startsWith("remote_model.");
     out.push({
       kind: "main",
       name: main.label || "Main text LLM",
-      type_id: main.type_id || "text_llm",
-      model_id: main.model_id || "",
+      type_id: mainTypeId,
+      model_id: mainModelId,
+      loader_id: processLoaderId,
+      remote,
       persist: Boolean(main.persist),
       supports_load: Boolean(main.supports_load),
       loaded: Boolean(main.loaded),
@@ -1810,6 +1828,7 @@ function buildProcessEntries(processes) {
   }
   defaults.forEach((entry) => {
     if (!entry || typeof entry !== "object") return;
+    if (mainTextRemote && String(entry.type_id || "").toLowerCase() === "text_llm") return;
     out.push({
       kind: "default",
       name: `Default: ${entry.label || entry.type_id || ""}`,
@@ -1883,10 +1902,12 @@ function positionDeckPopover() {
 async function refreshDeckProcesses(ctx, { render } = {}) {
   deckState.loading = true;
   try {
-    const [proc, managed] = await Promise.all([
+    const [proc, managed, deck] = await Promise.all([
       apiJson(ctx, "/v1/model_deck/processes?include_managed=0"),
       apiJson(ctx, "/v1/model_deck/processes?managed_detail=light").catch(() => ({})),
+      _getDeckCached(ctx),
     ]);
+    deckState.deck = deck;
     deckState.processes = mergeManagedProcessSnapshot(
       stabilizeManagedProcessSnapshot(deckState.processes, proc || {}),
       managed || {}
@@ -1895,7 +1916,7 @@ async function refreshDeckProcesses(ctx, { render } = {}) {
   } catch (_err) {
     deckState.processes = {};
   }
-  const entries = buildProcessEntries(deckState.processes);
+  const entries = buildProcessEntries(deckState.processes, deckState.deck);
   entries.forEach((entry) => {
     const key = deckEntryKey(entry);
     const pending = deckPending.get(key);
@@ -1918,7 +1939,8 @@ function applyCachedDeckProcesses(ctx) {
   const cached = cacheGet(ctx, CACHE_KEY_POPOVER_PROCESSES);
   if (!cached || typeof cached !== "object") return false;
   deckState.processes = cached;
-  updateDeckBadge(countRunning(buildProcessEntries(deckState.processes)));
+  deckState.deck = cacheGet(ctx, CACHE_KEY_DECK) || deckState.deck;
+  updateDeckBadge(countRunning(buildProcessEntries(deckState.processes, deckState.deck)));
   return true;
 }
 
@@ -1978,7 +2000,7 @@ function renderDeckPopover(ctx) {
   title.appendChild(titleBtn);
   deckPopover.appendChild(title);
 
-  const entries = buildProcessEntries(deckState.processes);
+  const entries = buildProcessEntries(deckState.processes, deckState.deck);
   if (!entries.length) {
     const empty = document.createElement("div");
     empty.className = "md-deck-muted";
@@ -1992,7 +2014,7 @@ function renderDeckPopover(ctx) {
   entries.forEach((entry) => {
     const card = document.createElement("div");
     card.className = "md-deck-item";
-    if (isRunning(entry)) card.classList.add("running");
+    if (!entry.remote && isRunning(entry)) card.classList.add("running");
     const titleRow = document.createElement("div");
     titleRow.className = "md-deck-item-title";
     const name = document.createElement("button");
@@ -2010,10 +2032,12 @@ function renderDeckPopover(ctx) {
       closeDeckPopover();
       if (ctx?.openPluginPanel) ctx.openPluginPanel(meta.plugin_id, { openModal: true });
     });
-    const status = document.createElement("div");
-    status.textContent = formatStatus(entry);
     titleRow.appendChild(name);
-    titleRow.appendChild(status);
+    if (!entry.remote) {
+      const status = document.createElement("div");
+      status.textContent = formatStatus(entry);
+      titleRow.appendChild(status);
+    }
     card.appendChild(titleRow);
 
     const metaRow = document.createElement("div");
@@ -2028,7 +2052,7 @@ function renderDeckPopover(ctx) {
 
     const actions = document.createElement("div");
     actions.className = "md-deck-item-actions";
-    const canToggle = entry.kind === "worker" || (entry.supports_load && entry.persist);
+    const canToggle = !entry.remote && (entry.kind === "worker" || (entry.supports_load && entry.persist));
     if (canToggle) {
       const btn = document.createElement("button");
       btn.type = "button";
@@ -2221,6 +2245,7 @@ function renderPanel(container, ctx) {
     processActionPending: {},
     activeTab: "overview",
     activeTypeId: "",
+    remoteProviders: [],
   };
 
   const root = document.createElement("div");
@@ -2462,6 +2487,13 @@ function renderPanel(container, ctx) {
       if (!model || typeof model !== "object") continue;
       const mid = String(model.model_id || "");
       const loaderId = String(model.loader_id || "");
+      const modelSettings = model.settings && typeof model.settings === "object" ? model.settings : {};
+      const remoteProviderId = String(modelSettings.remote_provider_id || "").trim();
+      const isRemoteModel = String(modelSettings.model_location || "").toLowerCase() === "remote" || loaderId.startsWith("remote_model.");
+      const remoteProvider = (state.remoteProviders || []).find((provider) => provider.id === remoteProviderId) || null;
+      const loaderLabel = isRemoteModel
+        ? `Remote API: ${remoteProvider?.name || remoteProviderId || loaderId.replace(/^remote_model\./, "")}`
+        : loaderId;
       const isDefault = sameModelId(mid, t.default_model_id || "");
       const isMain = state.activeTypeId === "text_llm" && sameModelId(mid, t.main_model_id || "");
       const midBtn = document.createElement("button");
@@ -2495,32 +2527,37 @@ function renderPanel(container, ctx) {
           label: "Clone",
           onSelect: () => void cloneModel(state.activeTypeId, mid),
         },
-        {
+        ...(!isRemoteModel ? [{
           value: "pre-download",
           label: "Pre-download",
           onSelect: () => void preDownloadModel(state.activeTypeId, mid),
-        },
+        }] : []),
         {
           value: "delete",
           label: "Delete",
           onSelect: () => void deleteModel(state.activeTypeId, mid),
         }
       );
-      const flagsLine = createInlinePairs([
+      const flags = [
         { label: "Default:", value: isDefault ? "Yes" : "No" },
         { label: "Main:", value: isMain ? "Yes" : "No" },
-        { label: "Lazy:", value: model.lazy === false ? "No" : "Yes" },
-        { label: "Persist:", value: model.persist ? "Yes" : "No" },
-      ]);
+      ];
+      if (!isRemoteModel) {
+        flags.push(
+          { label: "Lazy:", value: model.lazy === false ? "No" : "Yes" },
+          { label: "Persist:", value: model.persist ? "Yes" : "No" }
+        );
+      }
+      const flagsLine = createInlinePairs(flags);
       const row = buildRow(
         template,
         [
           midBtn,
-          { mobileLabel: "Loader:", text: loaderId },
+          { mobileLabel: "Loader:", text: loaderLabel },
           isDefault ? "yes" : "no",
           isMain ? "yes" : "no",
-          model.lazy === false ? "no" : "yes",
-          model.persist ? "yes" : "no",
+          isRemoteModel ? "" : (model.lazy === false ? "no" : "yes"),
+          isRemoteModel ? "" : (model.persist ? "yes" : "no"),
           createActionSelect(actions),
         ],
         false,
@@ -2604,7 +2641,13 @@ function renderPanel(container, ctx) {
       list.appendChild(row);
     }
 
-    if (main && typeof main === "object") {
+    const textLlmType = state.deck?.types?.text_llm || {};
+    const mainDeckModel = (Array.isArray(textLlmType.models) ? textLlmType.models : [])
+      .find((model) => sameModelId(model?.model_id, textLlmType.main_model_id)) || null;
+    const mainDeckSettings = mainDeckModel?.settings && typeof mainDeckModel.settings === "object" ? mainDeckModel.settings : {};
+    const remoteMainSelected = String(mainDeckSettings.model_location || "").toLowerCase() === "remote"
+      || String(mainDeckModel?.loader_id || "").startsWith("remote_model.");
+    if (!remoteMainSelected && main && typeof main === "object") {
       const loaded = Boolean(main.loaded);
       const supports = Boolean(main.supports_load);
       const status = main.phase || (supports
@@ -2634,6 +2677,7 @@ function renderPanel(container, ctx) {
 
     for (const entry of defaults) {
       if (!entry || typeof entry !== "object") continue;
+      if (remoteMainSelected && String(entry.type_id || "").toLowerCase() === "text_llm") continue;
       const loaded = Boolean(entry.loaded);
       const supports = Boolean(entry.supports_load);
       const status = entry.phase || (supports
@@ -2707,6 +2751,8 @@ function renderPanel(container, ctx) {
     state.templates = bootstrap.templates || {};
     state.schemas = bootstrap.schemas || {};
     state.deck = bootstrap.deck || {};
+    deckState.deck = state.deck;
+    modelDeckCache = { ts: Date.now(), deck: state.deck };
     state.loaderIds = bootstrap.loaderIds || [];
     state.processes = bootstrap.processes || {};
     deckState.processes = state.processes || {};
@@ -2724,6 +2770,8 @@ function renderPanel(container, ctx) {
   function applyDeckOnlyCache(deck) {
     if (!deck || typeof deck !== "object") return false;
     state.deck = deck;
+    deckState.deck = deck;
+    modelDeckCache = { ts: Date.now(), deck };
     if (!state.activeTypeId) {
       const ordered = sortTypes(state.deck?.types || {});
       if (ordered.length) state.activeTypeId = ordered[0][0];
@@ -2733,10 +2781,38 @@ function renderPanel(container, ctx) {
     return true;
   }
 
+  async function discoverRemoteProviders() {
+    const result = await apiJson(ctx, "/v1/model_deck/remote_providers").catch(() => null);
+    const providers = Array.isArray(result?.providers) ? result.providers : [];
+    if (providers.length) return providers;
+
+    const shared = ctx?.getSharedObjects?.({ type: "remote_model_provider" }) || [];
+    const discovered = [];
+    for (const item of shared) {
+      const providerId = String(item?.provider_id || item?.id || item?.pluginId || "").trim();
+      if (!providerId) continue;
+      const providerResult = await apiJson(ctx, item?.provider_path || `/v1/${encodeURIComponent(providerId)}/provider`).catch(() => null);
+      const provider = providerResult?.provider && typeof providerResult.provider === "object"
+        ? providerResult.provider
+        : {};
+      discovered.push({
+        id: String(provider.id || providerId),
+        name: String(provider.name || item?.name || providerId),
+        kind: "remote_text_model",
+        active: Boolean(provider.active),
+        configured: Boolean(provider.configured),
+        model: String(provider.model || ""),
+        activate_path: String(item?.activate_path || `/v1/${providerId}/activate`),
+      });
+    }
+    return discovered;
+  }
+
   async function reloadAll() {
     statusLabel.textContent = "Loading...";
     try {
       const deckPromise = apiJson(ctx, "/v1/model_deck/deck");
+      const remoteProviderPromise = discoverRemoteProviders();
       const metaPromise = Promise.all([
         apiJson(ctx, "/v1/model_deck/type_templates"),
         apiJson(ctx, "/v1/model_deck_loader/schema"),
@@ -2744,6 +2820,7 @@ function renderPanel(container, ctx) {
       ]);
 
       const deck = await deckPromise;
+      state.remoteProviders = await remoteProviderPromise;
       const nextDeck = deck?.deck || {};
       applyDeckOnlyCache(nextDeck);
       cacheSet(ctx, CACHE_KEY_DECK, nextDeck, CACHE_TTL_DECK_MS);
@@ -2859,6 +2936,26 @@ function renderPanel(container, ctx) {
   }
 
   async function setMainModel(typeId, modelId) {
+    if (typeId === "text_llm") {
+      const type = state.deck?.types?.[typeId] || {};
+      const selectedModel = (Array.isArray(type.models) ? type.models : []).find((item) => String(item?.model_id || "") === String(modelId || ""));
+      const settings = selectedModel?.settings && typeof selectedModel.settings === "object" ? selectedModel.settings : {};
+      const loaderId = String(selectedModel?.loader_id || "");
+      const isRemote = String(settings.model_location || "").toLowerCase() === "remote" || loaderId.startsWith("remote_model.");
+      const remoteProviderId = String(settings.remote_provider_id || loaderId.replace(/^remote_model\./, "")).trim();
+      const selectedProvider = (state.remoteProviders || []).find((provider) => provider.id === remoteProviderId) || null;
+      if (isRemote && (!selectedProvider || !selectedProvider.configured)) {
+        alert("Configure and save the selected Remote Models plugin before setting this model as Main.");
+        return;
+      }
+      for (const provider of state.remoteProviders || []) {
+        const shouldActivate = isRemote && provider.id === remoteProviderId;
+        await apiJson(ctx, provider.activate_path || `/v1/${encodeURIComponent(provider.id)}/activate`, {
+          method: "POST",
+          body: { active: shouldActivate },
+        });
+      }
+    }
     await apiJson(ctx, "/v1/model_deck/model/set_main", {
       method: "POST",
       body: { type_id: typeId, model_id: modelId },
@@ -3039,7 +3136,14 @@ function renderPanel(container, ctx) {
     const schema = state.schemas?.[typeId] || {};
     const fields = Array.isArray(schema.fields) ? schema.fields : [];
     const loaderIds = Array.isArray(state.loaderIds) ? state.loaderIds : [];
-    const selectedLoaderId = model?.loader_id || schema.recommended_loader_id || loaderIds[0] || "";
+    const storedModelSettings = model?.settings && typeof model.settings === "object" ? model.settings : {};
+    const isRemoteDeckModel = typeId === "text_llm" && (
+      String(storedModelSettings.model_location || "").toLowerCase() === "remote" ||
+      String(model?.loader_id || "").startsWith("remote_model.")
+    );
+    const selectedLoaderId = isRemoteDeckModel
+      ? (schema.recommended_loader_id || loaderIds[0] || "")
+      : (model?.loader_id || schema.recommended_loader_id || loaderIds[0] || "");
     const visibleLoaderIds = getVisibleLoaderIds(loaderIds, selectedLoaderId);
     const managedServers = [];
     let managedServersLoaded = false;
@@ -3090,11 +3194,45 @@ function renderPanel(container, ctx) {
     );
     const lazyField = createCheckboxField("Lazy load", model ? model.lazy !== false : true);
     const persistField = createCheckboxField("Persist", model ? Boolean(model.persist) : false);
+    const editorRemoteProviders = typeId === "text_llm" && Array.isArray(state.remoteProviders)
+      ? state.remoteProviders.filter((provider) => provider && provider.id)
+      : [];
+    const activeEditorRemoteProvider = editorRemoteProviders.find((provider) => provider.active) || null;
+    const modelLocationField = editorRemoteProviders.length
+      ? createSelectField("Model Location", [
+        { value: "local", label: "Local" },
+        { value: "remote", label: "Remote API" },
+      ], isRemoteDeckModel || (!model && activeEditorRemoteProvider) ? "remote" : "local")
+      : null;
+    const remoteProviderField = editorRemoteProviders.length
+      ? createSelectField("Remote Model API", editorRemoteProviders.map((provider) => ({
+        value: provider.id,
+        label: `${provider.name || provider.id}${provider.model ? ` — ${provider.model}` : " — configure model in plugin settings"}`,
+      })), storedModelSettings.remote_provider_id || activeEditorRemoteProvider?.id || editorRemoteProviders[0]?.id || "")
+      : null;
+    const remoteProviderHint = document.createElement("div");
+    remoteProviderHint.className = "md-muted";
+    remoteProviderHint.textContent = "Remote API replaces the local Text LLM. Agent Flow and workflows continue to use the selected Text LLM normally.";
+    const localModelFields = document.createElement("div");
+    localModelFields.className = "md-card";
+    localModelFields.style.padding = "10px";
+    const remoteDefaultField = modelLocationField
+      ? createCheckboxField("Set as default Text LLM", Boolean(model?.model_id && state.deck?.types?.text_llm?.default_model_id === model.model_id))
+      : null;
+    const remoteMainField = modelLocationField
+      ? createCheckboxField("Set as main Text LLM", Boolean(model?.model_id && state.deck?.types?.text_llm?.main_model_id === model.model_id))
+      : null;
 
+    if (modelLocationField) form.appendChild(modelLocationField.wrap);
     form.appendChild(modelIdField.wrap);
-    form.appendChild(loaderField.wrap);
-    form.appendChild(lazyField.wrap);
-    form.appendChild(persistField.wrap);
+    if (remoteProviderField) form.appendChild(remoteProviderField.wrap);
+    if (modelLocationField) form.appendChild(remoteProviderHint);
+    if (remoteDefaultField) form.appendChild(remoteDefaultField.wrap);
+    if (remoteMainField) form.appendChild(remoteMainField.wrap);
+    localModelFields.appendChild(loaderField.wrap);
+    localModelFields.appendChild(lazyField.wrap);
+    localModelFields.appendChild(persistField.wrap);
+    form.appendChild(localModelFields);
 
     const settingsWrap = document.createElement("div");
     settingsWrap.className = "md-card";
@@ -5637,7 +5775,7 @@ function renderPanel(container, ctx) {
         attachedModelWorkflowRows = attachedModelWorkflowRows
           .map((row) => ({
             name: String(row?.name || "").trim(),
-            workflow_id: String(row?.workflow_id || "").trim(),
+            workflow_id: String(idsByName.get(String(row?.name || "").trim()) || row?.workflow_id || "").trim(),
           }))
           .filter((row) => row.name && (seen.has(row.name) || (row.workflow_id && namesById.has(row.workflow_id))));
         const resolvedById = currentId ? namesById.get(currentId) || "" : "";
@@ -5838,35 +5976,21 @@ function renderPanel(container, ctx) {
         }
         syncWorkflowPickerVisibility();
         const activePid = String(ctx?.state?.ui?.activePid || "default").trim() || "default";
-        const activeSid = String(ctx?.state?.ui?.activeSid || "main").trim() || "main";
         try {
           workflowRefreshBtn.disabled = true;
-          const payload = await apiJson(ctx, `/v1/projects/${encodeURIComponent(activePid)}/sessions/${encodeURIComponent(activeSid)}/agent_flow/flows`, {
+          const payload = await apiJson(ctx, "/v1/model_deck/model/workflow/list", {
+            method: "POST",
+            body: {
+              type_id: typeId,
+              model_id: currentDeckModelId(),
+              pid: activePid,
+              settings: snapshotEditorSettings(),
+            },
             headers: { "X-Gui-Enabled-Plugins": "collab_chat,agent_flow,model_deck,agent_workflow_member" },
           });
-          const flows = payload?.flows && typeof payload.flows === "object" ? payload.flows : {};
-          const ids = payload?.flow_ids_by_name && typeof payload.flow_ids_by_name === "object" ? payload.flow_ids_by_name : {};
-          const rawModelIdText = currentDeckModelId();
-          const modelIdText = rawModelIdText.toLowerCase();
-          const saved = String(selectedModelWorkflowFlowName || "").trim();
-          const legacyOwnedPrefix = modelIdText ? `models / ${modelIdText} /` : "";
-          let rows = Object.keys(flows).filter((name) => {
-            const flow = flows[name] && typeof flows[name] === "object" ? flows[name] : {};
-            const meta = flow.metadata && typeof flow.metadata === "object" ? flow.metadata : {};
-            const deckMeta = meta.model_deck && typeof meta.model_deck === "object" ? meta.model_deck : {};
-            const deckType = String(deckMeta.type_id || "").trim();
-            const deckModel = String(deckMeta.model_id || "").trim();
-            const low = String(name || "").toLowerCase();
-            if (saved && name === saved) return true;
-            if (deckType && deckModel) {
-              return deckType === String(typeId || "").trim() && deckModel === rawModelIdText;
-            }
-            // Older model-owned flows may not have metadata yet, but the
-            // generated name is still exact: Models / <model id> / ...
-            if (legacyOwnedPrefix && low.startsWith(legacyOwnedPrefix)) return true;
-            return false;
-          }).sort((a, b) => a.localeCompare(b)).map((name) => ({ name, workflow_id: ids[name] || "" }));
-          rows = mergeAttachedWorkflowRows(rows, flows, ids).sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")));
+          const rows = (Array.isArray(payload?.rows) ? payload.rows : [])
+            .map((row) => ({ name: String(row?.name || "").trim(), workflow_id: String(row?.workflow_id || "").trim() }))
+            .filter((row) => row.name);
           updateWorkflowSelectOptions(rows);
           await refreshWorkflowReadiness();
         } catch (err) {
@@ -6070,19 +6194,23 @@ function renderPanel(container, ctx) {
       workflowRefreshBtn.addEventListener("click", () => { void refreshModelWorkflowList(); });
       workflowAddExistingBtn.addEventListener("click", async () => {
         const activePid = String(ctx?.state?.ui?.activePid || "default").trim() || "default";
-        const activeSid = String(ctx?.state?.ui?.activeSid || "main").trim() || "main";
         try {
           workflowAddExistingBtn.disabled = true;
-          const payload = await apiJson(ctx, `/v1/projects/${encodeURIComponent(activePid)}/sessions/${encodeURIComponent(activeSid)}/agent_flow/flows`, {
+          const payload = await apiJson(ctx, "/v1/model_deck/model/workflow/list", {
+            method: "POST",
+            body: {
+              type_id: typeId,
+              model_id: currentDeckModelId(),
+              pid: activePid,
+              settings: snapshotEditorSettings(),
+            },
             headers: { "X-Gui-Enabled-Plugins": "collab_chat,agent_flow,model_deck,agent_workflow_member" },
           });
-          const flows = payload?.flows && typeof payload.flows === "object" ? payload.flows : {};
-          const ids = payload?.flow_ids_by_name && typeof payload.flow_ids_by_name === "object" ? payload.flow_ids_by_name : {};
           const listed = new Set(workflowRows.map((row) => String(row?.name || "").trim()).filter(Boolean));
-          const candidates = Object.keys(flows)
-            .filter((name) => !listed.has(name) && flowMatchesMediaType(name, flows[name]))
-            .sort((a, b) => a.localeCompare(b))
-            .map((name) => ({ value: name, label: name, workflow_id: String(ids[name] || "") }));
+          const candidates = (Array.isArray(payload?.rows) ? payload.rows : [])
+            .map((row) => ({ value: String(row?.name || "").trim(), label: String(row?.name || "").trim(), workflow_id: String(row?.workflow_id || "").trim() }))
+            .filter((row) => row.value && !listed.has(row.value))
+            .sort((a, b) => a.label.localeCompare(b.label));
           if (!candidates.length) {
             toast(ctx, "No additional compatible workflows found for this model type.", true);
             return;
@@ -6098,12 +6226,12 @@ function renderPanel(container, ctx) {
             const name = String(pickField.input.value || "").trim();
             if (!name) return false;
             const opt = candidates.find((row) => row.value === name) || null;
-            const workflowId = String(opt?.workflow_id || ids[name] || "").trim();
+            const workflowId = String(opt?.workflow_id || "").trim();
             attachedModelWorkflowRows = attachedModelWorkflowRows.filter((row) => String(row?.name || "").trim() !== name);
             attachedModelWorkflowRows.push({ name, workflow_id: workflowId });
             selectedModelWorkflowFlowName = name;
             selectedModelWorkflowId = workflowId;
-            updateWorkflowSelectOptions(mergeAttachedWorkflowRows(workflowRows, flows, ids));
+            updateWorkflowSelectOptions([...workflowRows, { name, workflow_id: workflowId }]);
             workflowSelectField.input.value = name;
             if (entriesByKey["model_workflow_flow_name"]?.input) entriesByKey["model_workflow_flow_name"].input.value = name;
             if (entriesByKey["model_workflow_id"]?.input) entriesByKey["model_workflow_id"].input.value = workflowId;
@@ -6205,10 +6333,38 @@ function renderPanel(container, ctx) {
             toast(ctx, msg, true);
             return;
           }
-          const selectedFlow = String(workflowSelectField.input.value || selectedModelWorkflowFlowName || "").trim();
+          const selectedFlow = String(workflowSelectField.input.value || "").trim();
           if (selectedFlow) {
             const selectedOpt = workflowSelectField.input.selectedOptions && workflowSelectField.input.selectedOptions[0];
-            const opened = await openNamedWorkflowInAgentFlow(selectedFlow, String(selectedOpt?.dataset?.workflowId || selectedModelWorkflowId || ""));
+            const activePid = String(ctx?.state?.ui?.activePid || "default").trim() || "default";
+            const editorSettings = {
+              ...snapshotEditorSettings(),
+              model_workflow_flow_name: selectedFlow,
+            };
+            const editorModelId = String(model?.model_id || entriesByKey["model_id"]?.input?.value || "").trim();
+            let workflowId = String(selectedOpt?.dataset?.workflowId || selectedModelWorkflowId || "");
+            if (editorModelId) {
+              try {
+                const ensured = await apiJson(ctx, "/v1/model_deck/model/workflow/ensure", {
+                  method: "POST",
+                  body: {
+                    type_id: typeId,
+                    model_id: editorModelId,
+                    pid: activePid,
+                    template_flow_name: selectedFlow,
+                    settings: editorSettings,
+                  },
+                  headers: { "X-Gui-Enabled-Plugins": "collab_chat,agent_flow,model_deck,agent_workflow_member" },
+                });
+                workflowId = String(ensured?.workflow_id || workflowId || "");
+                selectedModelWorkflowFlowName = String(ensured?.flow_name || selectedFlow);
+                selectedModelWorkflowId = workflowId;
+                if (entriesByKey["model_workflow_flow_name"]?.input) entriesByKey["model_workflow_flow_name"].input.value = selectedModelWorkflowFlowName;
+                if (entriesByKey["model_workflow_id"]?.input) entriesByKey["model_workflow_id"].input.value = selectedModelWorkflowId;
+                if (entriesByKey["agent_flow_default_workflow_id"]?.input) entriesByKey["agent_flow_default_workflow_id"].input.value = selectedModelWorkflowId;
+              } catch (_err) {}
+            }
+            const opened = await openNamedWorkflowInAgentFlow(selectedModelWorkflowFlowName || selectedFlow, workflowId);
             status.textContent = opened
               ? `Opened Agent Flow for ${selectedFlow}.`
               : `Prepared ${selectedFlow}, but Agent Flow did not open. Open the Agent Flow panel manually and select this workflow.`;
@@ -6240,7 +6396,7 @@ function renderPanel(container, ctx) {
               type_id: typeId,
               model_id: editorModelId,
               pid: activePid,
-              template_flow_name: String(manifest?.workflow_json?.active_flow || manifest?.workflow_json?.default_flow || "Models / Unsloth LTX 2.3 GGUF"),
+              template_flow_name: String(manifest?.workflow_json?.active_flow || manifest?.workflow_json?.default_flow || manifest?.workflow_json?.flow_name || ""),
               settings: editorSettings,
             },
             headers: { "X-Gui-Enabled-Plugins": "collab_chat,agent_flow,model_deck,agent_workflow_member" },
@@ -7319,6 +7475,7 @@ function renderPanel(container, ctx) {
         "model_workflow_attached_flows",
         "model_workflow_flow_name",
         "model_workflow_id",
+        "model_workflow_template_flow_name",
         "workflow_loader_mode",
         "workflow_node_lifecycle_policy",
         "workflow_node_timeout_s",
@@ -7415,6 +7572,37 @@ function renderPanel(container, ctx) {
     modal.body.appendChild(form);
     modal.body.appendChild(settingsWrap);
     modal.body.appendChild(customWrap);
+
+    function syncModelLocationEditor() {
+      const useRemote = modelLocationField?.input?.value === "remote";
+      localModelFields.style.display = useRemote ? "none" : "";
+      settingsWrap.style.display = useRemote ? "none" : "";
+      customWrap.style.display = useRemote ? "none" : (shouldShowCustom() ? "block" : "none");
+      if (remoteProviderField?.wrap) remoteProviderField.wrap.style.display = useRemote ? "" : "none";
+      remoteProviderHint.style.display = useRemote ? "" : "none";
+      if (remoteDefaultField?.wrap) remoteDefaultField.wrap.style.display = useRemote ? "" : "none";
+      if (remoteMainField?.wrap) remoteMainField.wrap.style.display = useRemote ? "" : "none";
+    }
+
+    modelLocationField?.input?.addEventListener("change", syncModelLocationEditor);
+    remoteProviderField?.input?.addEventListener("change", syncModelLocationEditor);
+    syncModelLocationEditor();
+
+    async function activateEditorRemoteProvider(useRemote) {
+      const selectedId = String(remoteProviderField?.input?.value || "").trim();
+      const selected = editorRemoteProviders.find((provider) => provider.id === selectedId) || null;
+      if (useRemote && (!selected || !selected.configured)) {
+        alert("Configure and save an API key and model in the selected Remote Models plugin first.");
+        return false;
+      }
+      for (const provider of editorRemoteProviders) {
+        await apiJson(ctx, provider.activate_path || `/v1/${encodeURIComponent(provider.id)}/activate`, {
+          method: "POST",
+          body: { active: useRemote && provider.id === selectedId },
+        });
+      }
+      return true;
+    }
 
     function normalizeManagedServerUrlForCompare(value) {
       const raw = String(value || "").trim().replace(/\/+$/, "");
@@ -7549,10 +7737,52 @@ function renderPanel(container, ctx) {
     syncLoraFieldVisibility();
 
     modal.open(async () => {
+      const useRemote = modelLocationField?.input?.value === "remote";
       const mid = modelIdField.input.value.trim();
       if (!mid) {
         alert("Model ID is required.");
         return false;
+      }
+      if (useRemote) {
+        const selectedProviderId = String(remoteProviderField?.input?.value || "").trim();
+        const selectedProvider = editorRemoteProviders.find((provider) => provider.id === selectedProviderId) || null;
+        if (!selectedProvider || !selectedProvider.configured) {
+          alert("Configure and save an API key and model in the selected Remote Models plugin first.");
+          return false;
+        }
+        await apiJson(ctx, "/v1/model_deck/model/upsert", {
+          method: "POST",
+          body: {
+            type_id: typeId,
+            model: {
+              model_id: mid,
+              loader_id: `remote_model.${selectedProviderId}`,
+              settings: {
+                model_location: "remote",
+                remote_provider_id: selectedProviderId,
+                remote_model_id: String(selectedProvider.model || ""),
+              },
+              lazy: true,
+              persist: false,
+              tags: ["remote_api", selectedProviderId],
+            },
+          },
+        });
+        if (remoteDefaultField?.input?.checked) {
+          await apiJson(ctx, "/v1/model_deck/model/set_default", {
+            method: "POST",
+            body: { type_id: typeId, model_id: mid },
+          });
+        }
+        if (remoteMainField?.input?.checked) {
+          if (!await activateEditorRemoteProvider(true)) return false;
+          await apiJson(ctx, "/v1/model_deck/model/set_main", {
+            method: "POST",
+            body: { type_id: typeId, model_id: mid },
+          });
+        }
+        await reloadAll();
+        return true;
       }
       const loaderId = loaderField.input.value.trim();
       if (!loaderId) {
@@ -7674,6 +7904,7 @@ function renderPanel(container, ctx) {
         alert(`Missing required fields:\n${requiredErrors.join("\n")}`);
         return false;
       }
+      if (modelLocationField && !await activateEditorRemoteProvider(false)) return false;
       await apiJson(ctx, "/v1/model_deck/model/upsert", {
         method: "POST",
         body: {
@@ -8038,6 +8269,14 @@ function renderPanel(container, ctx) {
       statusLabel.textContent = "Cached deck";
     }
   }
+  const refreshRemoteProviders = () => {
+    if (root.isConnected) {
+      void reloadAll();
+    } else {
+      window.removeEventListener("gotchat:remote-model-provider-changed", refreshRemoteProviders);
+    }
+  };
+  window.addEventListener("gotchat:remote-model-provider-changed", refreshRemoteProviders);
   void reloadAll().then(() => consumeNavRequestIfAny());
   startProcessStream();
 }
