@@ -3,7 +3,7 @@
 Name: GotChat Foundry Framework Release
 Contributors: thy.nguyen
 type: framework
-Version: 1.0.4
+Version: 1.0.5
 License: Apache 2.0
 
 Core release for the GotChat Foundry platform. Go to the website gotchat.ai and check out the setup tutorials.
@@ -38,6 +38,13 @@ Model Deck 2
 This release should be deployed with compatible backend services, CMS components, and runtime dependencies for the same release line.
 
 == Changelog ==
+= 1.0.5 =
+- File changes
+- Playground added for plugin space
+- Agent Flow Workflow performance update
+- Added room for MPC skills
+- Updated Video/Image workflow template files 
+
 = 1.0.4 =
 - File changes
 - Improved video/image LLM workflow resource cleanup and move it into worker process
