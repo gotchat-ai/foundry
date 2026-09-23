@@ -269,6 +269,56 @@ def _start_host_service() -> None:
         print("[launch] host service failed to start:", exc)
 
 
+def _start_llama_manager_service() -> None:
+    if os.environ.get("LLMLOADER2_SKIP_LLAMA_MANAGER_SERVICE") == "1":
+        return
+    root = os.path.dirname(__file__)
+    env = _prepare_runtime_env(os.environ.copy())
+    env.setdefault("LLMLOADER2_LLAMA_MANAGER_BIND", "127.0.0.1")
+    env.setdefault("LLMLOADER2_LLAMA_MANAGER_PORT", "8767")
+    port = int(env.get("LLMLOADER2_LLAMA_MANAGER_PORT") or "8767")
+    if _port_in_use("127.0.0.1", port):
+        return
+    try:
+        if os.name == "nt":
+            script = os.path.join(root, "llama_server", "start_host_service.ps1")
+            cmd = [
+                "powershell",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                script,
+                "start",
+                "-Python",
+                sys.executable,
+                "-Port",
+                str(port),
+            ]
+        else:
+            script = os.path.join(root, "llama_server", "start_host_service.sh")
+            cmd = ["bash", script, "start", "--python", sys.executable, "--port", str(port)]
+        print(f"[launch] starting llama manager service on 127.0.0.1:{port}")
+        result = subprocess.run(
+            cmd,
+            cwd=root,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            print(f"[launch] llama manager service start failed with exit code {result.returncode}")
+            if result.stdout:
+                print(result.stdout.strip())
+            if result.stderr:
+                print(result.stderr.strip())
+        elif _port_in_use("127.0.0.1", port):
+            print(f"[launch] llama manager service ready on 127.0.0.1:{port}")
+    except Exception as exc:
+        print("[launch] llama manager service failed to start:", exc)
+
+
 def _write_stack_pids(procs: list) -> None:
     payload = {"ts": time.time()}
     for p in procs:
@@ -293,6 +343,7 @@ def main():
     print(f"[launch] backend_type={backend_type!r}, model={model_id!r}, gguf={is_gguf}")
 
     _start_host_service()
+    _start_llama_manager_service()
 
     procs = []
 
