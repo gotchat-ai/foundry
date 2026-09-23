@@ -1372,8 +1372,8 @@ def install(app) -> None:
             deck_settings, deck_model_id = {}, ""
         if not isinstance(deck_settings, dict) or not deck_settings:
             return flows, False
-        template_flow_name = "Models / Unsloth LTX 2.3 GGUF"
         model_flow_name = str(deck_settings.get("model_workflow_flow_name") or "").strip()
+        template_flow_name = str(deck_settings.get("model_workflow_template_flow_name") or "").strip()
         candidate_flow_names = []
         for candidate in (model_flow_name, template_flow_name):
             if candidate and candidate in flows and candidate not in candidate_flow_names:
@@ -1403,6 +1403,42 @@ def install(app) -> None:
 
         runtime_assets = _parse_json_dict(overlay_settings.get("video_runtime_assets_json"))
         runtime_params = _parse_json_dict(overlay_settings.get("video_runtime_params_json"))
+        family_probe = " ".join(
+            str(overlay_settings.get(key) or "").replace("_", " ").replace("-", " ").lower()
+            for key in (
+                "model_id",
+                "model_family",
+                "workflow_variant",
+                "model_deck_compat_manifest_id",
+                "tested_profile_id",
+                "model_workflow_flow_name",
+                "model_workflow_template_flow_name",
+            )
+        )
+        model_family_tokens = set()
+        if "wan2.2" in family_probe or "wan22" in family_probe:
+            model_family_tokens.add("wan")
+        if "ltx-2.3" in family_probe or "ltx 2.3" in family_probe or "ltx23" in family_probe or "unsloth ltx" in family_probe:
+            model_family_tokens.add("ltx")
+        if "hunyuan" in family_probe:
+            model_family_tokens.add("hunyuan")
+        if "minimax" in family_probe or "ref2va" in family_probe or "fl2va" in family_probe:
+            model_family_tokens.add("minimax")
+
+        def _setting_key_matches_overlay_family(key: str) -> bool:
+            lower = str(key or "").strip().lower()
+            if not lower or not model_family_tokens:
+                return True
+            key_families = set()
+            if lower.startswith(("ltx_", "gemma_", "distilled_lora_", "native_stage1_", "native_stage2_")):
+                key_families.add("ltx")
+            if lower.startswith(("wan_", "wan22_", "i2v_", "t2v_", "high_noise_", "low_noise_", "use_wan")):
+                key_families.add("wan")
+            if lower.startswith("hunyuan_"):
+                key_families.add("hunyuan")
+            if lower.startswith(("minimax_", "ref2va_", "fl2va_")):
+                key_families.add("minimax")
+            return not key_families or bool(key_families & model_family_tokens)
 
         asset_key_names = {
             "python_bin",
@@ -1418,12 +1454,44 @@ def install(app) -> None:
             "distilled_lora_path",
             "spatial_upscaler_path",
         }
+        per_run_media_keys = {
+            "__request_source_image_path",
+            "source_image_path",
+            "image_path",
+            "input_image_path",
+            "init_image_path",
+            "start_image_path",
+            "reference_image_path",
+            "first_image_path",
+            "last_image_path",
+            "target_image_path",
+            "end_image_path",
+            "reference_image_1_path",
+            "reference_image_2_path",
+            "ref_image_1_path",
+            "ref_image_2_path",
+            "input_image_paths",
+            "image_paths",
+            "workflow_media_inputs",
+        }
+        per_run_prompt_keys = {
+            "__request_prompt",
+            "prompt",
+            "positive_prompt",
+            "default_prompt",
+            "wan_optional_default_prompt",
+            "regression_test_note",
+        }
         asset_values: Dict[str, Any] = {}
         for source in (runtime_assets, overlay_settings):
             for key, value in source.items():
                 if value in (None, "", [], {}):
                     continue
                 key_text = str(key)
+                if not _setting_key_matches_overlay_family(key_text):
+                    continue
+                if key_text in per_run_media_keys or key_text in per_run_prompt_keys:
+                    continue
                 if key_text in asset_key_names or key_text.endswith("_path"):
                     asset_values[key_text] = value
 
@@ -1433,7 +1501,13 @@ def install(app) -> None:
                 if value in (None, "", [], {}):
                     continue
                 key_text = str(key)
+                if key_text in {"model_workflow_id", "agent_flow_default_workflow_id", "model_workflow_attached_flows"}:
+                    continue
+                if not _setting_key_matches_overlay_family(key_text):
+                    continue
                 if key_text in {"video_runtime_template_json", "video_runtime_assets_json", "video_runtime_params_json"}:
+                    continue
+                if key_text in per_run_media_keys or key_text in per_run_prompt_keys:
                     continue
                 settings_values[key_text] = value
         # First-class Model Deck asset fields should beat stale nested preset
@@ -1450,6 +1524,8 @@ def install(app) -> None:
 
         def _merged_json(raw_value: Any, updates: Dict[str, Any]) -> str:
             blob = _parse_json_dict(raw_value)
+            for key in [*per_run_media_keys, *per_run_prompt_keys]:
+                blob.pop(str(key), None)
             for key, value in updates.items():
                 if value not in (None, "", [], {}):
                     blob[str(key)] = value
@@ -1479,7 +1555,7 @@ def install(app) -> None:
                 settings_values,
             )
             if overlay_settings.get("video_runtime_template_json") not in (None, ""):
-                settings["video_runtime_template_json"] = overlay_settings.get("video_runtime_template_json")
+                settings["video_runtime_template_json"] = _merged_json(overlay_settings.get("video_runtime_template_json"), {})
 
             params["settings"] = settings
             params["assets"] = assets
@@ -2808,12 +2884,31 @@ def install(app) -> None:
         return []
 
     def _extract_text_from_route(out: Any) -> str:
+        def _is_status_only_text(value: str) -> bool:
+            text = str(value or "").strip().lower()
+            return text in {
+                "ok",
+                "done",
+                "ready",
+                "loaded",
+                "executed",
+                "preloaded",
+                "declared",
+                "status: ok",
+                "status: done",
+                "status: ready",
+                "status: loaded",
+                "status: executed",
+                "status: preloaded",
+                "status: declared",
+            }
+
         if isinstance(out, str):
-            return out
+            return "" if _is_status_only_text(out) else out
         if isinstance(out, dict):
             for key in ("answer", "text", "final_text", "content", "result", "description"):
                 v = out.get(key)
-                if isinstance(v, str):
+                if isinstance(v, str) and not _is_status_only_text(v):
                     return v
             tr = out.get("tool_results")
             if isinstance(tr, list):
@@ -2825,10 +2920,11 @@ def install(app) -> None:
                         v = data.get(key)
                         if v is None:
                             v = row.get(key)
-                        if isinstance(v, str) and str(v).strip():
+                        if isinstance(v, str) and str(v).strip() and not _is_status_only_text(v):
                             return str(v).strip()
             try:
-                return out["choices"][0]["message"]["content"]
+                final_content = str(out["choices"][0]["message"]["content"] or "")
+                return "" if _is_status_only_text(final_content) else final_content
             except Exception:
                 return ""
         return ""
@@ -3102,6 +3198,24 @@ def install(app) -> None:
         ext = dict(req.ext or {})
         flows = ext.get("agent_flow_flows") or {}
         force_runtime_flow = bool(ext.get("agent_flow_force_runtime_flow"))
+        try:
+            ext_attachments_dbg = ext.get("attachments") if isinstance(ext.get("attachments"), list) else ext.get("media_attachments")
+            ext_attachment_labels_dbg = []
+            for item in list(ext_attachments_dbg or [])[:3]:
+                if isinstance(item, dict):
+                    ext_attachment_labels_dbg.append(str(item.get("path") or item.get("url") or item.get("name") or ""))
+                else:
+                    ext_attachment_labels_dbg.append(str(item))
+            print(
+                "[agent_flow.run] request_start "
+                f"pid={pid!r} sid={sid!r} text_len={len(str(req.text or ''))} "
+                f"ext_keys={sorted(str(k) for k in ext.keys())[:24]!r} "
+                f"attachments={ext_attachment_labels_dbg!r} "
+                f"has_model_workflow_request={isinstance(ext.get('model_workflow_request'), dict)}",
+                flush=True,
+            )
+        except Exception:
+            pass
         if not isinstance(flows, dict) or not flows:
             project_doc = _load_project_flows(pid)
             project_flows = project_doc.get("flows") if isinstance(project_doc, dict) and isinstance(project_doc.get("flows"), dict) else {}
@@ -3123,8 +3237,6 @@ def install(app) -> None:
         )
         if not flow_name and len(flows) == 1:
             flow_name = next(iter(flows.keys()))
-        if not flow_name or flow_name not in flows:
-            raise HTTPException(status_code=400, detail="agent_flow_active_flow missing or invalid")
 
         flows, _model_deck_hydrated_for_run = _hydrate_model_deck_ltx_workflow_flows(flows)
         try:
@@ -3137,6 +3249,8 @@ def install(app) -> None:
                     flow_workflow_id = ""
         except Exception:
             pass
+        if not flow_name or flow_name not in flows:
+            raise HTTPException(status_code=400, detail="agent_flow_active_flow missing or invalid")
         flow_for_run = dict(flows.get(flow_name) or {})
         _require_flow_access(u, str(flow_name), flow_for_run, action="run")
         user_text = str(req.text or "").strip()
@@ -3231,12 +3345,565 @@ def install(app) -> None:
             "steers": [],
             "ts": _now_ts(),
         }
+        pre_run_media_trace_lines: List[str] = []
+        try:
+            ext_attachments_for_diag = ext.get("attachments") if isinstance(ext.get("attachments"), list) else ext.get("media_attachments")
+            diag_items: List[str] = []
+            for item in list(ext_attachments_for_diag or [])[:5]:
+                if isinstance(item, dict):
+                    diag_items.append(str(item.get("path") or item.get("local_path") or item.get("url") or item.get("download_url") or item.get("name") or ""))
+                else:
+                    diag_items.append(str(item))
+            state.setdefault("diagnostics", []).append({
+                "node": "agent_flow_run_request",
+                "message": "received agent flow run request media",
+                "client_msg_id": str(req.client_msg_id or ""),
+                "ext_attachment_count": len(ext_attachments_for_diag or []) if isinstance(ext_attachments_for_diag, list) else 0,
+                "ext_attachment_samples": diag_items,
+                "has_model_workflow_request": isinstance(ext.get("model_workflow_request"), dict),
+                "text_len": len(user_text),
+            })
+        except Exception:
+            pass
+
+        def _model_run_attachment_image_path(item: Any) -> str:
+            if not isinstance(item, dict):
+                return ""
+            raw = str(
+                item.get("path")
+                or item.get("local_path")
+                or item.get("file_path")
+                or item.get("abs_path")
+                or item.get("url")
+                or item.get("download_url")
+                or ""
+            ).strip()
+            if not raw:
+                return ""
+            if raw.startswith("/uploads/"):
+                raw = os.path.join(str(getattr(app.state, "data_dir", "") or "data"), "uploads", os.path.basename(raw))
+            mime = str(item.get("mime") or item.get("content_type") or "").lower()
+            kind = str(item.get("kind") or item.get("media_type") or "").lower()
+            name = str(item.get("name") or item.get("filename") or raw).lower()
+            ext_name = os.path.splitext(name.split("?", 1)[0])[1].lower()
+            if kind == "image" or mime.startswith("image/") or ext_name in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}:
+                return raw
+            return ""
+
+        def _model_run_row_meta(row: Any) -> Dict[str, Any]:
+            row_get = row.get if hasattr(row, "get") else None
+            meta_raw = row_get("meta") if callable(row_get) else None
+            if isinstance(meta_raw, dict):
+                return meta_raw
+            if isinstance(meta_raw, str) and meta_raw.strip():
+                try:
+                    parsed = json.loads(meta_raw)
+                    if isinstance(parsed, dict):
+                        return parsed
+                except Exception:
+                    pass
+            try:
+                parsed = json.loads(str(row_get("meta_json") if callable(row_get) else "{}") or "{}")
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                return {}
+
+        def _model_run_current_user_attachments(*, wait_s: float = 0.0) -> List[Any]:
+            client_msg_id = str(req.client_msg_id or "").strip()
+            if not client_msg_id:
+                try:
+                    print(
+                        "[agent_flow.run] model_media_db_skip "
+                        f"pid={pid!r} sid={sid!r} reason='missing_client_msg_id'",
+                        flush=True,
+                    )
+                    state.setdefault("diagnostics", []).append({
+                        "node": "agent_flow_media_trace",
+                        "label": "db_skip_missing_client_msg_id",
+                        "client_msg_id": "",
+                        "attachment_count": 0,
+                    })
+                except Exception:
+                    pass
+                return []
+            deadline = time.monotonic() + max(0.0, float(wait_s or 0.0))
+            last_error: Any = None
+            while True:
+                try:
+                    collab_db_for_media = getattr(app.state, "collab_db", None)
+                    recent_rows = collab_db_for_media.list_messages(pid=pid, sid=sid, limit=12, order_desc=True) if collab_db_for_media is not None else []
+                    for row in recent_rows or []:
+                        row_get = row.get if hasattr(row, "get") else None
+                        if str((row_get("role") if callable(row_get) else "") or "").lower() != "user":
+                            continue
+                        row_msg_id = str((row_get("msg_id") if callable(row_get) else "") or "").strip()
+                        meta = _model_run_row_meta(row)
+                        row_client_msg_id = str(meta.get("client_msg_id") or "").strip()
+                        if client_msg_id not in {row_msg_id, row_client_msg_id}:
+                            continue
+                        attachments = meta.get("attachments") or meta.get("media_attachments") or meta.get("files") or []
+                        if isinstance(attachments, list) and attachments:
+                            try:
+                                print(
+                                    "[agent_flow.run] model_media_db_hit "
+                                    f"pid={pid!r} sid={sid!r} msg_id={str((row_get('msg_id') if callable(row_get) else '') or '')!r} "
+                                    f"client_msg_id={client_msg_id!r} "
+                                    f"attachment_count={len(attachments)}",
+                                    flush=True,
+                                )
+                                state.setdefault("diagnostics", []).append({
+                                    "node": "agent_flow_media_trace",
+                                    "label": "db_hit",
+                                    "client_msg_id": client_msg_id,
+                                    "row_msg_id": str((row_get("msg_id") if callable(row_get) else "") or ""),
+                                    "attachment_count": len(attachments),
+                                })
+                            except Exception:
+                                pass
+                            return attachments
+                    last_error = None
+                except Exception as exc:
+                    last_error = exc
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.05)
+            try:
+                if last_error is not None:
+                    print(
+                        "[agent_flow.run] model_media_db_error "
+                        f"pid={pid!r} sid={sid!r} client_msg_id={client_msg_id!r} error={last_error!r}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        "[agent_flow.run] model_media_db_miss "
+                        f"pid={pid!r} sid={sid!r} client_msg_id={client_msg_id!r} waited_s={max(0.0, float(wait_s or 0.0))}",
+                        flush=True,
+                    )
+                    state.setdefault("diagnostics", []).append({
+                        "node": "agent_flow_media_trace",
+                        "label": "db_miss",
+                        "client_msg_id": client_msg_id,
+                        "waited_s": max(0.0, float(wait_s or 0.0)),
+                        "attachment_count": 0,
+                    })
+            except Exception:
+                pass
+            return []
+
+        def _is_live_request_source(value: Any) -> bool:
+            text = str(value or "").replace("\\", "/").lower()
+            return bool(text and "/data/uploads/" in text)
+
+        def _model_run_attachment_image_paths(items: Any) -> List[str]:
+            paths: List[str] = []
+            seen: set[str] = set()
+            if not isinstance(items, list):
+                return paths
+            for item in items:
+                image_path = _model_run_attachment_image_path(item)
+                if not image_path:
+                    continue
+                dedupe_key = image_path.replace("\\", "/").lower()
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                paths.append(image_path)
+            return paths
+
+        model_workflow_media_keys = (
+            "__request_source_image_path",
+            "source_image_path",
+            "image_path",
+            "input_image_path",
+            "init_image_path",
+            "start_image_path",
+            "reference_image_path",
+            "first_image_path",
+            "last_image_path",
+            "target_image_path",
+            "end_image_path",
+            "reference_image_1_path",
+            "reference_image_2_path",
+            "ref_image_1_path",
+            "ref_image_2_path",
+            "input_image_paths",
+            "image_paths",
+            "workflow_media_inputs",
+        )
+
+        def _model_workflow_accepts_request_images(settings_seed: Any = None, assets_seed: Any = None) -> bool:
+            settings_dict = settings_seed if isinstance(settings_seed, dict) else {}
+            assets_dict = assets_seed if isinstance(assets_seed, dict) else {}
+            probe_parts = [
+                flow_name,
+                settings_dict.get("workflow_variant"),
+                settings_dict.get("hunyuan_conditioning_mode"),
+                settings_dict.get("wan_conditioning_mode"),
+                settings_dict.get("minimax_conditioning_mode"),
+                settings_dict.get("model_family"),
+                settings_dict.get("model_workflow_flow_name"),
+                settings_dict.get("model_workflow_template_flow_name"),
+                assets_dict.get("workflow_variant"),
+                assets_dict.get("hunyuan_conditioning_mode"),
+                assets_dict.get("wan_conditioning_mode"),
+                assets_dict.get("minimax_conditioning_mode"),
+                assets_dict.get("model_family"),
+            ]
+            probe = " ".join(str(part or "").replace("_", " ").replace("-", " ").lower() for part in probe_parts)
+            if any(token in probe for token in (" i2v", "i2v ", "image to video", "ref2v", "ref2va", "fl2va", "first last")):
+                return True
+            if any(token in probe for token in (" t2v", "t2v ", "text to video")):
+                return False
+            return True
+
+        def _model_workflow_request_image_limit(settings_seed: Any = None, assets_seed: Any = None) -> int:
+            settings_dict = settings_seed if isinstance(settings_seed, dict) else {}
+            assets_dict = assets_seed if isinstance(assets_seed, dict) else {}
+            probe_parts = [
+                flow_name,
+                settings_dict.get("workflow_variant"),
+                settings_dict.get("hunyuan_conditioning_mode"),
+                settings_dict.get("wan_conditioning_mode"),
+                settings_dict.get("minimax_conditioning_mode"),
+                settings_dict.get("model_family"),
+                settings_dict.get("model_workflow_flow_name"),
+                settings_dict.get("model_workflow_template_flow_name"),
+                assets_dict.get("workflow_variant"),
+                assets_dict.get("hunyuan_conditioning_mode"),
+                assets_dict.get("wan_conditioning_mode"),
+                assets_dict.get("minimax_conditioning_mode"),
+                assets_dict.get("model_family"),
+            ]
+            probe = " ".join(str(part or "").replace("_", " ").replace("-", " ").lower() for part in probe_parts)
+            if "minimax" in probe or "ref2va" in probe or "fl2va" in probe or "first last" in probe:
+                return 2
+            if "hunyuan" in probe or "wan" in probe or " i2v" in probe or "i2v " in probe or "image to video" in probe:
+                return 1
+            return 1
+
+        def _clear_model_workflow_request_media(settings_seed: Dict[str, Any], assets_seed: Dict[str, Any]) -> None:
+            for key in model_workflow_media_keys:
+                settings_seed.pop(key, None)
+                assets_seed.pop(key, None)
+
+        def _media_trace(label: str, *, attachments: Any = None, note: str = "") -> None:
+            try:
+                items = attachments if isinstance(attachments, list) else []
+                samples: List[str] = []
+                resolved: List[str] = []
+                for item in list(items or [])[:5]:
+                    if isinstance(item, dict):
+                        samples.append(str(item.get("path") or item.get("local_path") or item.get("url") or item.get("download_url") or item.get("name") or ""))
+                        image_path = _model_run_attachment_image_path(item)
+                        if image_path:
+                            resolved.append(image_path)
+                    else:
+                        samples.append(str(item))
+                current_artifacts = state.get("artifacts") if isinstance(state.get("artifacts"), dict) else {}
+                current_settings = current_artifacts.get("settings") if isinstance(current_artifacts.get("settings"), dict) else {}
+                current_assets = current_artifacts.get("assets") if isinstance(current_artifacts.get("assets"), dict) else {}
+                state_settings_source = str(
+                    current_settings.get("__request_source_image_path")
+                    or current_settings.get("source_image_path")
+                    or ""
+                )
+                state_assets_source = str(
+                    current_assets.get("__request_source_image_path")
+                    or current_assets.get("source_image_path")
+                    or ""
+                )
+                state_first = str(current_settings.get("first_image_path") or current_settings.get("reference_image_1_path") or "")
+                state_last = str(current_settings.get("last_image_path") or current_settings.get("reference_image_2_path") or "")
+                ext_items = ext.get("attachments") if isinstance(ext.get("attachments"), list) else ext.get("media_attachments")
+                ext_count = len(ext_items or []) if isinstance(ext_items, list) else 0
+                line = (
+                    "[agent_flow.media_trace] "
+                    f"label={label!r} pid={pid!r} sid={sid!r} client_msg_id={str(req.client_msg_id or '')!r} "
+                    f"ext_attachment_count={ext_count} attachment_count={len(items or [])} "
+                    f"samples={samples!r} resolved={resolved!r} "
+                    f"state_settings_source={state_settings_source!r} state_assets_source={state_assets_source!r} "
+                    f"state_first={state_first!r} state_last={state_last!r}"
+                    f"{(' note=' + repr(note)) if note else ''}"
+                )
+                print(line, flush=True)
+                pre_run_media_trace_lines.append(line)
+                state.setdefault("diagnostics", []).append({
+                    "node": "agent_flow_media_trace",
+                    "label": label,
+                    "client_msg_id": str(req.client_msg_id or ""),
+                    "ext_attachment_count": ext_count,
+                    "attachment_count": len(items or []),
+                    "attachment_samples": samples,
+                    "resolved_image_paths": resolved,
+                    "state_settings_source": state_settings_source,
+                    "state_assets_source": state_assets_source,
+                    "state_first_image_path": state_first,
+                    "state_last_image_path": state_last,
+                    "note": note,
+                })
+            except Exception as exc:
+                try:
+                    print(
+                        "[agent_flow.media_trace] "
+                        f"label={label!r} pid={pid!r} sid={sid!r} error={exc!r}",
+                        flush=True,
+                    )
+                except Exception:
+                    pass
+
+        def _seed_model_run_media_artifacts(seed_attachments: List[Any], *, source_label: str) -> str:
+            if not str(flow_name or "").strip().lower().startswith("models /"):
+                return ""
+            _media_trace(f"{source_label}:seed_input", attachments=seed_attachments)
+            seed_images = _model_run_attachment_image_paths(seed_attachments)
+            seed_source = seed_images[0] if seed_images else ""
+            seed_last = seed_images[1] if len(seed_images) > 1 else ""
+            artifacts_seed = state.setdefault("artifacts", {})
+            if not isinstance(artifacts_seed, dict):
+                artifacts_seed = {}
+                state["artifacts"] = artifacts_seed
+            settings_artifact_seed = artifacts_seed.setdefault("settings", {})
+            assets_artifact_seed = artifacts_seed.setdefault("assets", {})
+            if not isinstance(settings_artifact_seed, dict):
+                settings_artifact_seed = {}
+                artifacts_seed["settings"] = settings_artifact_seed
+            if not isinstance(assets_artifact_seed, dict):
+                assets_artifact_seed = {}
+                artifacts_seed["assets"] = assets_artifact_seed
+            accepts_request_images = _model_workflow_accepts_request_images(settings_artifact_seed, assets_artifact_seed)
+            if not accepts_request_images:
+                _clear_model_workflow_request_media(settings_artifact_seed, assets_artifact_seed)
+                if user_text:
+                    settings_artifact_seed["__request_prompt"] = user_text
+                    settings_artifact_seed["prompt"] = user_text
+                    settings_artifact_seed["positive_prompt"] = user_text
+                    settings_artifact_seed["default_prompt"] = ""
+                    settings_artifact_seed["wan_optional_default_prompt"] = ""
+                    settings_artifact_seed["regression_test_note"] = ""
+                    settings_artifact_seed["use_default_when_blank"] = False
+                    settings_artifact_seed["wan_optional_use_default_when_blank"] = False
+                    settings_artifact_seed["model_workflow_use_model_deck_default_assets"] = True
+                try:
+                    print(
+                        "[agent_flow.run] model_media_seed_skipped_for_text_only_workflow "
+                        f"pid={pid!r} sid={sid!r} source={source_label!r} flow={str(flow_name)!r} "
+                        f"ignored_image_count={len(seed_images)} prompt_len={len(user_text or '')}",
+                        flush=True,
+                    )
+                    pre_run_media_trace_lines.append(
+                        "[agent_flow] skipped request media for text-only model workflow "
+                        f"source={source_label} ignored_image_count={len(seed_images)} prompt_len={len(user_text or '')}"
+                    )
+                except Exception:
+                    pass
+                _media_trace(f"{source_label}:seed_skipped_text_only", attachments=seed_attachments)
+                return ""
+            image_limit = max(1, _model_workflow_request_image_limit(settings_artifact_seed, assets_artifact_seed))
+            if len(seed_images) > image_limit:
+                try:
+                    print(
+                        "[agent_flow.run] model_media_seed_limited "
+                        f"pid={pid!r} sid={sid!r} source={source_label!r} flow={str(flow_name)!r} "
+                        f"original_image_count={len(seed_images)} image_limit={image_limit}",
+                        flush=True,
+                    )
+                    pre_run_media_trace_lines.append(
+                        "[agent_flow] limited request media for model workflow "
+                        f"source={source_label} original_image_count={len(seed_images)} image_limit={image_limit}"
+                    )
+                except Exception:
+                    pass
+                seed_images = seed_images[:image_limit]
+                seed_source = seed_images[0] if seed_images else ""
+                seed_last = seed_images[1] if len(seed_images) > 1 else ""
+            if not seed_source:
+                if user_text:
+                    _clear_model_workflow_request_media(settings_artifact_seed, assets_artifact_seed)
+                    settings_artifact_seed["__request_prompt"] = user_text
+                    settings_artifact_seed["prompt"] = user_text
+                    settings_artifact_seed["positive_prompt"] = user_text
+                    settings_artifact_seed["default_prompt"] = ""
+                    settings_artifact_seed["wan_optional_default_prompt"] = ""
+                    settings_artifact_seed["regression_test_note"] = ""
+                    settings_artifact_seed["use_default_when_blank"] = False
+                    settings_artifact_seed["wan_optional_use_default_when_blank"] = False
+                    settings_artifact_seed["model_workflow_use_model_deck_default_assets"] = True
+                try:
+                    print(
+                        "[agent_flow.run] model_media_seed_empty "
+                        f"pid={pid!r} sid={sid!r} source={source_label!r} attachment_count={len(seed_attachments or [])}",
+                        flush=True,
+                    )
+                except Exception:
+                    pass
+                _media_trace(f"{source_label}:seed_empty", attachments=seed_attachments)
+                return ""
+            for key in (
+                "__request_source_image_path",
+                "source_image_path",
+                "image_path",
+                "input_image_path",
+                "start_image_path",
+                "reference_image_path",
+                "first_image_path",
+                "reference_image_1_path",
+                "ref_image_1_path",
+            ):
+                settings_artifact_seed[key] = seed_source
+                assets_artifact_seed[key] = seed_source
+            if seed_last:
+                for key in (
+                    "last_image_path",
+                    "end_image_path",
+                    "target_image_path",
+                    "reference_image_2_path",
+                    "ref_image_2_path",
+                ):
+                    settings_artifact_seed[key] = seed_last
+                    assets_artifact_seed[key] = seed_last
+            if seed_images:
+                media_inputs = {
+                    "images": seed_images,
+                    "first_image_path": seed_source,
+                    "source_image_path": seed_source,
+                }
+                if seed_last:
+                    media_inputs["last_image_path"] = seed_last
+                for target in (settings_artifact_seed, assets_artifact_seed):
+                    target["image_paths"] = list(seed_images)
+                    target["input_image_paths"] = list(seed_images)
+                    target["workflow_media_inputs"] = dict(media_inputs)
+            if user_text:
+                settings_artifact_seed["__request_prompt"] = user_text
+                settings_artifact_seed["prompt"] = user_text
+                settings_artifact_seed["positive_prompt"] = user_text
+                settings_artifact_seed["default_prompt"] = ""
+                settings_artifact_seed["wan_optional_default_prompt"] = ""
+                settings_artifact_seed["regression_test_note"] = ""
+                settings_artifact_seed["use_default_when_blank"] = False
+                settings_artifact_seed["wan_optional_use_default_when_blank"] = False
+                settings_artifact_seed["model_workflow_use_model_deck_default_assets"] = True
+            try:
+                print(
+                    "[agent_flow.run] model_media_seeded "
+                    f"pid={pid!r} sid={sid!r} source={source_label!r} source_image={seed_source!r} "
+                    f"last_image={seed_last!r} image_count={len(seed_images)} "
+                    f"prompt_len={len(user_text or '')}",
+                    flush=True,
+                )
+                pre_run_media_trace_lines.append(
+                    "[agent_flow] seeded current model workflow media "
+                    f"source={source_label} source_image={seed_source!r} last_image={seed_last!r} "
+                    f"image_count={len(seed_images)} prompt_len={len(user_text or '')}"
+                )
+                state.setdefault("diagnostics", []).append({
+                    "node": "agent_flow_run_request",
+                    "message": "seeded current model workflow media",
+                    "source_label": source_label,
+                    "source_image_path": seed_source,
+                    "last_image_path": seed_last,
+                    "image_paths": list(seed_images),
+                    "prompt_len": len(user_text or ""),
+                })
+            except Exception:
+                pass
+            _media_trace(f"{source_label}:seed_result", attachments=seed_attachments)
+            return seed_source
+
+        model_workflow_request = ext.get("model_workflow_request") if isinstance(ext.get("model_workflow_request"), dict) else {}
+        ext_attachments_initial = ext.get("attachments") if isinstance(ext.get("attachments"), list) else ext.get("media_attachments")
+        _media_trace("A_request_boundary", attachments=ext_attachments_initial)
+        if model_workflow_request:
+            run_settings = model_workflow_request.get("settings")
+            run_assets = model_workflow_request.get("assets")
+            artifacts: Dict[str, Any] = {}
+            if isinstance(run_settings, dict) and run_settings:
+                artifacts["settings"] = dict(run_settings)
+            if isinstance(run_assets, dict) and run_assets:
+                artifacts["assets"] = dict(run_assets)
+            if artifacts:
+                # Seed request media into the same artifacts object the run will
+                # use. Previously _seed_model_run_media_artifacts wrote into
+                # state["artifacts"], then this branch overwrote state with the
+                # stale model_workflow_request artifacts, discarding the live
+                # upload before workflow nodes could see it.
+                state["artifacts"] = artifacts
+                settings_artifact_seed = artifacts.setdefault("settings", {})
+                assets_artifact_seed = artifacts.setdefault("assets", {})
+                existing_source = str(
+                    settings_artifact_seed.get("__request_source_image_path")
+                    or settings_artifact_seed.get("source_image_path")
+                    or assets_artifact_seed.get("__request_source_image_path")
+                    or assets_artifact_seed.get("source_image_path")
+                    or ""
+                ).strip()
+                accepts_request_images = _model_workflow_accepts_request_images(settings_artifact_seed, assets_artifact_seed)
+                if (not accepts_request_images) or (not _is_live_request_source(existing_source)):
+                    seed_attachments = []
+                    if isinstance(ext.get("attachments"), list):
+                        seed_attachments = list(ext.get("attachments") or [])
+                    elif isinstance(ext.get("media_attachments"), list):
+                        seed_attachments = list(ext.get("media_attachments") or [])
+                    _media_trace("B_before_db_lookup", attachments=seed_attachments)
+                    if not seed_attachments:
+                        seed_attachments = _model_run_current_user_attachments(wait_s=1.5)
+                        _media_trace("C_after_db_lookup", attachments=seed_attachments)
+                    _seed_model_run_media_artifacts(seed_attachments, source_label="model_workflow_request")
+                _media_trace("D_after_model_workflow_request_seed", attachments=ext_attachments_initial)
+                try:
+                    asset_keys = sorted(str(k) for k in artifacts.get("assets", {}).keys())
+                    setting_keys = sorted(str(k) for k in artifacts.get("settings", {}).keys())
+                    pre_run_media_trace_lines.append(
+                        "[agent_flow] seeded model workflow request "
+                        f"settings_keys={setting_keys[:16]!r} asset_keys={asset_keys[:16]!r}"
+                    )
+                    try:
+                        pre_run_media_trace_lines.append(
+                            "[agent_flow] model workflow request values "
+                            f"settings_source={str((artifacts.get('settings') or {}).get('__request_source_image_path') or (artifacts.get('settings') or {}).get('source_image_path') or '')!r} "
+                            f"assets_source={str((artifacts.get('assets') or {}).get('__request_source_image_path') or (artifacts.get('assets') or {}).get('source_image_path') or '')!r} "
+                            f"prompt_len={len(str((artifacts.get('settings') or {}).get('__request_prompt') or (artifacts.get('settings') or {}).get('prompt') or ''))}"
+                        )
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+        elif str(flow_name or "").strip().lower().startswith("models /"):
+            direct_attachments = []
+            if isinstance(ext.get("attachments"), list):
+                direct_attachments = list(ext.get("attachments") or [])
+            elif isinstance(ext.get("media_attachments"), list):
+                direct_attachments = list(ext.get("media_attachments") or [])
+            if not direct_attachments:
+                try:
+                    _media_trace("B_before_db_lookup", attachments=direct_attachments)
+                    direct_attachments = _model_run_current_user_attachments(wait_s=1.5)
+                    _media_trace("C_after_db_lookup", attachments=direct_attachments)
+                except Exception:
+                    direct_attachments = []
+            direct_source_image = _seed_model_run_media_artifacts(direct_attachments, source_label="direct_model")
+            _media_trace("D_after_direct_model_seed", attachments=direct_attachments)
+            try:
+                image_count = len(_model_run_attachment_image_paths(direct_attachments))
+                pre_run_media_trace_lines.append(
+                    "[agent_flow] seeded direct model workflow request "
+                    f"source_image={direct_source_image!r} image_count={image_count} prompt_len={len(user_text or '')}"
+                )
+                print(
+                    "[agent_flow.run] direct_model_seed "
+                    f"pid={pid!r} sid={sid!r} flow={str(flow_name)!r} "
+                    f"source_image={direct_source_image!r} image_count={image_count} prompt_len={len(user_text or '')}",
+                    flush=True,
+                )
+            except Exception:
+                pass
         _agent_flow_set_state(pid, sid, state)
         try:
             runtime_nodes_dbg = flow_for_run.get("nodes") if isinstance(flow_for_run.get("nodes"), dict) else {}
             planned_dbg = " -> ".join(str(s.get("label") or s.get("node_id") or "").strip() for s in steps[:12] if str(s.get("label") or s.get("node_id") or "").strip())
             node_keys_dbg = ",".join(str(k or "").strip() for k in list(runtime_nodes_dbg.keys())[:24] if str(k or "").strip())
-            _publish_step_stream(
+            pre_run_media_trace_lines.append(
                 f"[agent_flow] planned steps: count={len(steps)} nodes={len(runtime_nodes_dbg)} path={planned_dbg or '-'} node_keys={node_keys_dbg or '-'}"
             )
         except Exception:
@@ -3277,6 +3944,7 @@ def install(app) -> None:
                 _agent_flow_set_state(pid, sid, state)
                 _publish_flow_status({})
                 print(f"[agent_flow] worker entered run_id={run_id} flow_name={flow_name}", flush=True)
+                _media_trace("H_worker_entered_before_first_step", attachments=ext_attachments_initial)
             except Exception:
                 pass
             def _is_canceled() -> bool:
@@ -3606,8 +4274,44 @@ def install(app) -> None:
                         )
                     except Exception:
                         pass
+                if str(flow_name or "").strip().lower().startswith("models /"):
+                    try:
+                        current_artifacts = state.get("artifacts") if isinstance(state.get("artifacts"), dict) else {}
+                        current_settings_artifact = current_artifacts.get("settings") if isinstance(current_artifacts.get("settings"), dict) else {}
+                        current_assets_artifact = current_artifacts.get("assets") if isinstance(current_artifacts.get("assets"), dict) else {}
+                        current_source = (
+                            current_settings_artifact.get("__request_source_image_path")
+                            or current_settings_artifact.get("source_image_path")
+                            or current_assets_artifact.get("__request_source_image_path")
+                            or current_assets_artifact.get("source_image_path")
+                            or ""
+                        )
+                        if not _is_live_request_source(current_source):
+                            post_persist_attachments = list(attachments or [])
+                            _media_trace("E_post_persist_before_db_lookup", attachments=post_persist_attachments)
+                            if not post_persist_attachments:
+                                post_persist_attachments = _model_run_current_user_attachments(wait_s=1.5)
+                                _media_trace("F_post_persist_after_db_lookup", attachments=post_persist_attachments)
+                            seeded_source = _seed_model_run_media_artifacts(
+                                post_persist_attachments,
+                                source_label="post_user_persist",
+                            )
+                            if seeded_source:
+                                _agent_flow_set_state(pid, sid, state)
+                        _media_trace("G_post_persist_before_workflow_banner", attachments=attachments)
+                    except Exception as exc:
+                        try:
+                            print(
+                                "[agent_flow.run] post_persist_media_seed_error "
+                                f"pid={pid!r} sid={sid!r} error={exc!r}",
+                                flush=True,
+                            )
+                        except Exception:
+                            pass
                 _publish_run_line(f"[agent_flow] flow_name: {flow_name}")
                 _publish_run_line(f"[agent_flow] run_id: {run_id}")
+                for media_line in pre_run_media_trace_lines:
+                    _publish_run_line(media_line)
                 try:
                     _persist_run_stream_snapshot(force=True)
                 except Exception:
@@ -3844,6 +4548,13 @@ def install(app) -> None:
                     return out
 
                 def _ensure_main_text_model_loaded(preferred_sid: str | None = None) -> Any:
+                    try:
+                        ensure_main = getattr(app.state, "ensure_main_text_llm_loaded", None)
+                        preferred = ensure_main() if callable(ensure_main) else None
+                        if getattr(preferred, "is_remote_api_model", False):
+                            return preferred
+                    except Exception:
+                        pass
                     lreg = getattr(app.state, "model_loader_registry", None)
                     provider_fn = getattr(app.state, "main_text_llm_provider", None)
                     if not hasattr(lreg, "get"):
@@ -3900,6 +4611,13 @@ def install(app) -> None:
                         return None
 
                 def _resolve_chat_model() -> Any:
+                    try:
+                        ensure_main = getattr(app.state, "ensure_main_text_llm_loaded", None)
+                        preferred = ensure_main() if callable(ensure_main) else None
+                        if getattr(preferred, "is_remote_api_model", False):
+                            return preferred
+                    except Exception:
+                        pass
                     model_obj = None
                     try:
                         mf = getattr(app.state, "model", None)
@@ -5466,6 +6184,7 @@ def install(app) -> None:
                             "path",
                             "file",
                             "file_path",
+                            "output",
                             "output_path",
                             "final_path",
                             "zip_path",
@@ -5542,6 +6261,7 @@ def install(app) -> None:
                                 "file",
                                 "path",
                                 "file_path",
+                                "output",
                                 "output_path",
                                 "download_path",
                                 "workflow_file",
@@ -6849,6 +7569,61 @@ def install(app) -> None:
                                 except Exception:
                                     pass
 
+                            if str(tool_name or "").startswith("models."):
+                                seed_artifacts = state.get("artifacts") if isinstance(state.get("artifacts"), dict) else {}
+                                if isinstance(seed_artifacts, dict) and seed_artifacts:
+                                    merged_params["model_workflow_seed_artifacts"] = json.loads(json.dumps(seed_artifacts, default=str))
+                                    merged_params["run_id"] = run_id
+                                    try:
+                                        seed_settings = seed_artifacts.get("settings") if isinstance(seed_artifacts.get("settings"), dict) else {}
+                                        seed_assets = seed_artifacts.get("assets") if isinstance(seed_artifacts.get("assets"), dict) else {}
+                                        seed_source = str(
+                                            seed_settings.get("__request_source_image_path")
+                                            or seed_settings.get("source_image_path")
+                                            or seed_settings.get("first_image_path")
+                                            or seed_settings.get("reference_image_1_path")
+                                            or seed_assets.get("__request_source_image_path")
+                                            or seed_assets.get("source_image_path")
+                                            or seed_assets.get("first_image_path")
+                                            or seed_assets.get("reference_image_1_path")
+                                            or ""
+                                        )
+                                        if seed_source:
+                                            model_settings = merged_params.get("settings") if isinstance(merged_params.get("settings"), dict) else {}
+                                            model_settings = dict(model_settings)
+                                            for image_key in (
+                                                "__request_source_image_path",
+                                                "source_image_path",
+                                                "image_path",
+                                                "input_image_path",
+                                                "start_image_path",
+                                                "reference_image_path",
+                                                "first_image_path",
+                                                "reference_image_1_path",
+                                                "ref_image_1_path",
+                                            ):
+                                                model_settings[image_key] = seed_source
+                                                merged_params[image_key] = seed_source
+                                            for image_key in (
+                                                "last_image_path",
+                                                "end_image_path",
+                                                "target_image_path",
+                                                "reference_image_2_path",
+                                                "ref_image_2_path",
+                                                "input_image_paths",
+                                                "image_paths",
+                                                "workflow_media_inputs",
+                                            ):
+                                                image_value = seed_settings.get(image_key)
+                                                if image_value in (None, "", [], {}):
+                                                    image_value = seed_assets.get(image_key)
+                                                if image_value not in (None, "", [], {}):
+                                                    model_settings[image_key] = image_value
+                                                    merged_params[image_key] = image_value
+                                            merged_params["settings"] = model_settings
+                                    except Exception:
+                                        pass
+
                             tool_settings = dict(settings)
                             tool_settings["__agent_flow_progress_callback"] = _model_tool_progress
                             tool_ctx = {
@@ -6861,6 +7636,10 @@ def install(app) -> None:
                                 "original_request": request_seed_text,
                                 "progress": _model_tool_progress,
                             }
+                            if str(tool_name or "").startswith("models."):
+                                seed_artifacts = state.get("artifacts") if isinstance(state.get("artifacts"), dict) else {}
+                                if isinstance(seed_artifacts, dict) and seed_artifacts:
+                                    tool_ctx["model_workflow_seed_artifacts"] = json.loads(json.dumps(seed_artifacts, default=str))
                             worker_enabled = False
                             model_settings_for_worker: Dict[str, Any] = {}
                             if str(tool_name or "").startswith("models."):
@@ -7415,6 +8194,61 @@ def install(app) -> None:
                                     "original_request": request_seed_text,
                                 }
                                 if str(tool_name or "").startswith("models."):
+                                    seed_artifacts = state.get("artifacts") if isinstance(state.get("artifacts"), dict) else {}
+                                    if isinstance(seed_artifacts, dict) and seed_artifacts:
+                                        safe_seed_artifacts = json.loads(json.dumps(seed_artifacts, default=str))
+                                        merged_params["model_workflow_seed_artifacts"] = safe_seed_artifacts
+                                        merged_params["run_id"] = run_id
+                                        tool_ctx["model_workflow_seed_artifacts"] = safe_seed_artifacts
+                                        try:
+                                            seed_settings = seed_artifacts.get("settings") if isinstance(seed_artifacts.get("settings"), dict) else {}
+                                            seed_assets = seed_artifacts.get("assets") if isinstance(seed_artifacts.get("assets"), dict) else {}
+                                            seed_source = str(
+                                                seed_settings.get("__request_source_image_path")
+                                                or seed_settings.get("source_image_path")
+                                                or seed_settings.get("first_image_path")
+                                                or seed_settings.get("reference_image_1_path")
+                                                or seed_assets.get("__request_source_image_path")
+                                                or seed_assets.get("source_image_path")
+                                                or seed_assets.get("first_image_path")
+                                                or seed_assets.get("reference_image_1_path")
+                                                or ""
+                                            )
+                                            if seed_source:
+                                                model_settings = merged_params.get("settings") if isinstance(merged_params.get("settings"), dict) else {}
+                                                model_settings = dict(model_settings)
+                                                for image_key in (
+                                                    "__request_source_image_path",
+                                                    "source_image_path",
+                                                    "image_path",
+                                                    "input_image_path",
+                                                    "start_image_path",
+                                                    "reference_image_path",
+                                                    "first_image_path",
+                                                    "reference_image_1_path",
+                                                    "ref_image_1_path",
+                                                ):
+                                                    model_settings[image_key] = seed_source
+                                                    merged_params[image_key] = seed_source
+                                                for image_key in (
+                                                    "last_image_path",
+                                                    "end_image_path",
+                                                    "target_image_path",
+                                                    "reference_image_2_path",
+                                                    "ref_image_2_path",
+                                                    "input_image_paths",
+                                                    "image_paths",
+                                                    "workflow_media_inputs",
+                                                ):
+                                                    image_value = seed_settings.get(image_key)
+                                                    if image_value in (None, "", [], {}):
+                                                        image_value = seed_assets.get(image_key)
+                                                    if image_value not in (None, "", [], {}):
+                                                        model_settings[image_key] = image_value
+                                                        merged_params[image_key] = image_value
+                                                merged_params["settings"] = model_settings
+                                        except Exception:
+                                            pass
                                     mgr = getattr(app.state, "model_workflow_process_manager", None)
                                     if mgr is None:
                                         workspace_root = str(Path(__file__).resolve().parents[3])
@@ -8294,8 +9128,12 @@ def install(app) -> None:
                         if (
                             isinstance(out, dict)
                             and bool(out.get("ok")) is not False
-                            and str(out.get("tool_node_direct_skill") or "").strip().lower()
-                            in {"models.video_encode", "models.image_encode", "models.media_encode"}
+                            and (
+                                str(out.get("tool_node_direct_skill") or "").strip().lower()
+                                in {"models.video_encode", "models.image_encode", "models.media_encode"}
+                                or str(out.get("tool_node_direct_skill") or "").strip().lower().startswith("models.")
+                                and str(out.get("tool_node_direct_skill") or "").strip().lower().endswith(("_media_encode", "_video_encode", "_image_encode", "media_encode", "video_encode", "image_encode"))
+                            )
                         ):
                             tr_now = out.get("tool_results") if isinstance(out.get("tool_results"), list) else []
                             output_path_hint = ""
@@ -8305,7 +9143,7 @@ def install(app) -> None:
                                     continue
                                 data_row = tr_row.get("data") if isinstance(tr_row.get("data"), dict) else {}
                                 output_video_hint = data_row.get("output_video") if isinstance(data_row.get("output_video"), dict) else output_video_hint
-                                output_path_hint = str(data_row.get("output_path") or output_video_hint.get("output_path") or output_path_hint or "").strip()
+                                output_path_hint = str(data_row.get("output_path") or data_row.get("output") or output_video_hint.get("output_path") or output_path_hint or "").strip()
                             if output_path_hint:
                                 final_result_mode = "files"
                                 final_result_text = f"Generated video: {output_path_hint}"
