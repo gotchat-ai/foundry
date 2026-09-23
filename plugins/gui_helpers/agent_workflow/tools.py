@@ -95,6 +95,15 @@ def register_default_tools(app, registry: WorkflowToolRegistry) -> None:
         if isinstance(diag, dict):
             diag.setdefault("model_resolver", {})
             diag["model_resolver"]["preferred_sid"] = str(preferred_sid or "").strip() or "_default"
+        try:
+            ensure_main = getattr(app.state, "ensure_main_text_llm_loaded", None)
+            preferred = ensure_main() if callable(ensure_main) else None
+            if getattr(preferred, "is_remote_api_model", False):
+                if isinstance(diag, dict):
+                    diag["model_resolver"]["from_remote_provider"] = True
+                return preferred
+        except Exception:
+            pass
         reg = getattr(app.state, "model_loader_registry", None)
         provider_fn = getattr(app.state, "main_text_llm_provider", None)
         if not hasattr(reg, "get"):
@@ -188,6 +197,15 @@ def register_default_tools(app, registry: WorkflowToolRegistry) -> None:
             return None
 
     def _resolve_chat_model(preferred_sid: str | None = None, diag: Dict[str, Any] | None = None) -> Any:
+        try:
+            ensure_main = getattr(app.state, "ensure_main_text_llm_loaded", None)
+            preferred = ensure_main() if callable(ensure_main) else None
+            if getattr(preferred, "is_remote_api_model", False):
+                if isinstance(diag, dict):
+                    diag.setdefault("model_resolver", {})["from_remote_provider"] = True
+                return preferred
+        except Exception:
+            pass
         mf = getattr(app.state, "model", None)
         model_obj = None
         try:
