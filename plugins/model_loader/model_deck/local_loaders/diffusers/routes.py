@@ -19,7 +19,7 @@ from plugins.gui_helpers._framework.utils import require_gui_plugin_enabled
 from plugins.ai_routes.model_deck_utils import get_server_app
 from plugins.model_loader.model_deck import compat_registry
 from plugins.model_loader.gguf.plugin import _resolve_gguf_path
-from plugins.model_loader.model_deck.local_loaders.diffusers_manifest import build_pipeline_from_runtime_profile, build_transformer_and_pipeline, resolve_manifest, resolve_runtime_profile
+from plugins.model_loader.model_deck.local_loaders.diffusers_manifest import build_pipeline_from_runtime_profile, build_transformer_and_pipeline, resolve_manifest, resolve_runtime_profile 
 try:
     from plugins.gui_helpers._framework.event_bus import publish_gui_event
 except Exception:
