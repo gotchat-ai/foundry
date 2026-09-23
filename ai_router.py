@@ -29,6 +29,12 @@ class AIRouter:
         # Load *all* plugins once; enable/disable is per-request in try_route().
         self.routes: List[BaseRoute] = load_routes(self.core)
 
+    def _debug(self, msg: str) -> None:
+        try:
+            print(f"[ai_router] {msg}", flush=True)
+        except Exception:
+            pass
+
     def try_route(self, req: Any) -> Tuple[bool, Any]:
         """Try to route a request to one of the plugins.
 
@@ -39,7 +45,19 @@ class AIRouter:
             if route._is_canceled():
                 return True, {"route_id": "chat", "reason": "canceled"}
             self._emit_router_status(route.route_id, "Routing to plugin...")
-            result = route.handle(req)
+            try:
+                result = route.handle(req)
+            except Exception as exc:
+                status_code = getattr(exc, "status_code", None)
+                detail = getattr(exc, "detail", None)
+                err_text = str(detail or exc or "route_failed")
+                self._debug(f"route_error route_id={route.route_id!r} error={err_text!r}")
+                return True, {
+                    "route_id": route.route_id,
+                    "ok": False,
+                    "error": err_text,
+                    "status_code": status_code,
+                }
             if route._is_canceled():
                 return True, {"route_id": "chat", "reason": "canceled"}
             return True, result
@@ -48,8 +66,6 @@ class AIRouter:
 
         # Figure out which plugins are enabled for *this* request
         enabled_ids = self._get_enabled_plugins_from_req(req)
-        print(2342342)
-        print(enabled_ids)
         if enabled_ids is not None:
             enabled_set = {rid.lower() for rid in enabled_ids}
             candidate_routes = [
@@ -57,19 +73,22 @@ class AIRouter:
             ]
         else:
             candidate_routes = list(self.routes)
-        print(234234)
+        self._debug(
+            "start "
+            f"route_id={route_id!r} backend_type={backend_type!r} "
+            f"enabled_ids={enabled_ids!r} "
+            f"candidates={[r.route_id for r in candidate_routes]!r}"
+        )
         # Explicit route selection
-        
-        print("route_id", route_id)
         if route_id != "auto":
             route = self._find_route_by_id(route_id, candidate_routes)
             if route is None:
+                self._debug(f"explicit_route_missing route_id={route_id!r}")
                 return False, None
             if not route.can_handle(req):
+                self._debug(f"explicit_route_cannot_handle route_id={route_id!r}")
                 return False, None
             return _handle_route(route)
-        print(2342234234234)
-        print("candidate_routes", candidate_routes)
         # Prefer attachment-capable routes when attachments are present,
         # but only auto-short-circuit on clear "read/describe" intent.
         att_kinds = self._extract_attachment_kinds(req)
@@ -87,14 +106,17 @@ class AIRouter:
 
         # Only auto-route when using an "assist" style meta-backend
         if backend_type not in ("auto", "hf_assist"):
+            self._debug(f"skip_backend_type backend_type={backend_type!r}")
             return False, None
         if not candidate_routes:
+            self._debug("skip_no_candidate_routes")
             return False, None  # no plugins enabled
         decision = self._classify_route(req, candidate_routes)
         if not isinstance(decision, dict):
             decision = {"route_id": "chat", "reason": "invalid_decision"}
         rid = (decision.get("route_id") or "chat").lower()
         reason = str(decision.get("reason") or "").lower()
+        self._debug(f"classifier_decision route_id={rid!r} reason={reason!r}")
 
         # Fallback to web search when available and user likely needs fresh info.
         # If there is RAG then go to direct chat.
@@ -102,6 +124,7 @@ class AIRouter:
             web_route = self._find_web_search_route(candidate_routes)
             if web_route is not None:
                 if self._has_rag_context(req):
+                    self._debug("fallback_web_search_blocked_by_rag_context")
                     return False, None
                 user_text = self._extract_user_text(req)
                 has_ctx = self._has_recent_assistant_context(req)
@@ -109,16 +132,22 @@ class AIRouter:
                 if not (has_ctx and is_followup):
                     if self._needs_web_search(user_text):
                         rid = web_route.route_id
+                        self._debug(f"fallback_web_search_by_need route_id={rid!r}")
                     elif any(k in reason for k in ("not enough", "insufficient", "unknown", "not sure", "need more")):
                         rid = web_route.route_id
+                        self._debug(f"fallback_web_search_by_reason route_id={rid!r}")
 
         if rid == "chat":
+            self._debug(f"skip_classifier_chat reason={reason!r}")
             return False, None
         route = self._find_route_by_id(rid, candidate_routes)
         if route is None:
+            self._debug(f"selected_route_not_enabled_or_missing route_id={rid!r}")
             return False, None
         if not route.can_handle(req):
+            self._debug(f"selected_route_cannot_handle route_id={rid!r}")
             return False, None
+        self._debug(f"handle route_id={route.route_id!r}")
         return _handle_route(route)
 
     # ------------ helpers ------------ #
@@ -176,12 +205,12 @@ class AIRouter:
             else:
                 enabled_list = [str(enabled).strip()]
             enabled_list = [rid for rid in enabled_list if rid]
-
-            if router_mode == "agent_flow_only":
-                return ["agent_flow"]
-            if router_mode == "exclude_agent_flow":
-                return [rid for rid in enabled_list if rid.lower() != "agent_flow"]
-            return enabled_list
+            if enabled_list:
+                if router_mode == "agent_flow_only":
+                    return ["agent_flow"]
+                if router_mode == "exclude_agent_flow":
+                    return [rid for rid in enabled_list if rid.lower() != "agent_flow"]
+                return enabled_list
 
         if isinstance(ext, dict) and "router_enabled_plugins" in ext:
             value = ext.get("router_enabled_plugins")
@@ -190,12 +219,32 @@ class AIRouter:
             else:
                 enabled_list = [str(value).strip()]
             enabled_list = [rid for rid in enabled_list if rid]
+            if enabled_list:
+                if router_mode == "agent_flow_only":
+                    return ["agent_flow"]
+                if router_mode == "exclude_agent_flow":
+                    return [rid for rid in enabled_list if rid.lower() != "agent_flow"]
+                return enabled_list
 
+        headers = {}
+        try:
+            headers = (self.core.settings or {}).get("__request_headers") or {}
+        except Exception:
+            headers = {}
+        header_enabled_raw = ""
+        if isinstance(headers, dict):
+            header_enabled_raw = str(
+                headers.get("X-Gui-Enabled-Plugins")
+                or headers.get("x-gui-enabled-plugins")
+                or ""
+            )
+        header_enabled = [rid.strip() for rid in header_enabled_raw.split(",") if rid.strip()]
+        if header_enabled:
             if router_mode == "agent_flow_only":
                 return ["agent_flow"]
             if router_mode == "exclude_agent_flow":
-                return [rid for rid in enabled_list if rid.lower() != "agent_flow"]
-            return enabled_list
+                return [rid for rid in header_enabled if rid.lower() != "agent_flow"]
+            return header_enabled
 
         if router_mode == "agent_flow_only":
             return ["agent_flow"]
@@ -480,23 +529,20 @@ class AIRouter:
         for opt in options:
             system_content += f'- "{opt["route_id"]}": {opt["description"]}\n'
         system_msg = {"role": "system", "content": system_content}
-        print("32423423423----", req)
         context = self._extract_router_context(req)
         include_context = bool(context) and (
             self._is_followup_query(user_text) or self._has_rag_context(req)
         )
         if include_context:
             user_msg = {"role": "user", "content": f"User request: {user_text}\nRAG context:\n{context}"}
-            print("router messages__________: ", user_msg)
         else:
             user_msg = {"role": "user", "content": user_text}
-        print("3224324232")
 
         resp = self.core.chat_llm.chat(
             messages=[system_msg, user_msg],
             max_new_tokens=400,
             temperature=0.0,
-            top_p=0.0,
+            top_p=1.0,
         )
 
         if isinstance(resp, dict):
@@ -504,7 +550,6 @@ class AIRouter:
         else:
             raw = str(resp or "").strip()
 
-        print("raw:", raw)
         if raw.startswith("```"):
             raw = raw.strip("`")
             if "\n" in raw:
