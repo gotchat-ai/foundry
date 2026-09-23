@@ -127,9 +127,12 @@ const app = {
       transcriptTopbar: [],
       transcriptBottombar: [],
       composerLeft: [],
+      playgrounds: [],
+      playgroundAssets: [],
       panels: [],
       messagePreRenderers: [],
       messageRenderers: [],
+      messageAttachments: [],
       blockTransformers: [],
       blockRenderers: [],
       messageFooterItems: [],
@@ -196,6 +199,7 @@ const TRANSCRIPT_CACHE_PREFIX = "transcript_v1:";
 const TRANSCRIPT_CACHE_TTL_MS = 10 * 60 * 1000;
 const PLUGIN_CACHE_STORAGE_KEY = "llmloader2_gui_plugin_cache_v1";
 const PLUGIN_DISCOVERY_CACHE_KEY = "llmloader2_gui_plugin_discovery_v3";
+const PLAYGROUND_CHANNEL_NAME = "llmloader2.plugin-playground.v1";
 const PLUGIN_DISCOVERY_CACHE_TTL_MS = 5 * 60 * 1000;
 const TRANSCRIPT_SNAPSHOT_SETTLE_MS = 260;
 const TRANSCRIPT_SNAPSHOT_MAX_WAIT_MS = 1400;
@@ -203,6 +207,98 @@ const TRANSCRIPT_RENDER_CACHE_VERSION = 5;
 const STORAGE_QUOTA_WARN_THROTTLE_MS = 30000;
 const AGENT_FLOW_NO_FLOW_VALUE = "__none__";
 const GEO_CONTEXT_FETCH_TIMEOUT_MS = 4500;
+
+const playgroundChannel = typeof BroadcastChannel === "function"
+  ? new BroadcastChannel(PLAYGROUND_CHANNEL_NAME)
+  : null;
+const activePluginPlaygrounds = new Map();
+
+function playgroundScopeSnapshot() {
+  const pid = String(app.state?.ui?.activePid || "");
+  const sid = String(app.state?.ui?.activeSid || "");
+  return {
+    pid,
+    sid,
+    projectName: String(app.state?.projects?.[pid]?.name || pid || "No project"),
+    sessionName: String(app.state?.sessions?.[sid]?.title || sid || "No session"),
+  };
+}
+
+function publishPlaygroundMessage(type, payload = {}) {
+  if (!playgroundChannel) return;
+  try {
+    const nextPayload = type === "plugin-event"
+      ? { origin: "chat_js", ...(payload || {}) }
+      : payload;
+    playgroundChannel.postMessage({ type, scope: playgroundScopeSnapshot(), payload: nextPayload, at: Date.now() });
+  } catch (_err) {}
+}
+
+function dispatchPluginEvent(event, data = {}, options = {}) {
+  const payload = { ...(data || {}) };
+  if (options.broadcast !== false) publishPlaygroundMessage("plugin-event", { event, data: payload });
+  for (const handler of app.plugins.slots.eventHandlers) {
+    try {
+      const fn = handler.fn || handler;
+      fn(event, payload, getPluginContext());
+    } catch (_err) {}
+  }
+}
+
+function openPluginPlayground(pluginId, options = {}) {
+  const target = String(pluginId || "").trim();
+  if (!target) return null;
+  const scope = playgroundScopeSnapshot();
+  const url = new URL("./playground.html", window.location.href);
+  url.searchParams.set("plugin", target);
+  if (scope.pid) url.searchParams.set("pid", scope.pid);
+  if (scope.sid) url.searchParams.set("sid", scope.sid);
+  const mode = String(options.mode || options.target || "tab").toLowerCase();
+  const name = `plugin-playground-${target.replace(/[^a-z0-9_-]+/gi, "-")}`;
+  const features = mode === "window"
+    ? `popup=yes,width=${Math.max(420, Number(options.width) || 980)},height=${Math.max(560, Number(options.height) || 820)},resizable=yes,scrollbars=no`
+    : undefined;
+  const opened = window.open(url.toString(), mode === "tab" ? "_blank" : name, features);
+  publishPlaygroundMessage("scope", scope);
+  return opened;
+}
+
+if (playgroundChannel) {
+  playgroundChannel.addEventListener("message", (event) => {
+    const message = event.data || {};
+    if (message.type === "request-scope") publishPlaygroundMessage("scope", playgroundScopeSnapshot());
+    if (message.type === "playground-presence") {
+      const pluginId = String(message.pluginId || "").trim();
+      if (!pluginId) return;
+      const active = message.active !== false;
+      if (active) activePluginPlaygrounds.set(pluginId, Date.now());
+      else activePluginPlaygrounds.delete(pluginId);
+      dispatchPluginEvent("playground_presence", { pluginId, active }, { broadcast: false });
+    }
+  });
+  setInterval(() => {
+    const cutoff = Date.now() - 15000;
+    for (const [pluginId, seenAt] of activePluginPlaygrounds) {
+      if (seenAt >= cutoff) continue;
+      activePluginPlaygrounds.delete(pluginId);
+      dispatchPluginEvent("playground_presence", { pluginId, active: false }, { broadcast: false });
+    }
+  }, 5000);
+}
+
+window.addEventListener("storage", (event) => {
+  if (event.key !== STORAGE_PREFS_KEY || !event.newValue) return;
+  try {
+    const incoming = JSON.parse(event.newValue);
+    if (incoming.pluginPrefs && typeof incoming.pluginPrefs === "object") {
+      app.state.pluginPrefs = mergeDeep(app.state.pluginPrefs || {}, incoming.pluginPrefs);
+      enforceProjectPluginDefaults();
+      pruneRestrictedPlugins();
+      renderPluginPanels();
+    }
+  } catch (_err) {}
+});
+
 const GEO_CONTEXT_PROVIDERS = [
   {
     name: "ipapi",
@@ -401,6 +497,7 @@ function tryRestoreTranscriptSnapshot(pid, sid, session, messages, fingerprints)
     markTranscriptCacheStatus("miss", "empty_snapshot_html");
     return false;
   }
+  transcript.querySelectorAll(".message").forEach((node) => disposeMessageAttachments(node));
   transcript.innerHTML = snap.html;
   restoreTranscriptNodesFromDom();
   if (pluginsActuallyReady()) {
@@ -1472,10 +1569,9 @@ function applyQueryParams() {
   if (embedCfg.token) app.state.auth.token = embedCfg.token;
   if (embedCfg.pid) app.embedDefaults.pid = String(embedCfg.pid || "").trim();
   if (embedCfg.sid) app.embedDefaults.sid = String(embedCfg.sid || "").trim();
-  // Embed pid/sid act as fallbacks only. Do not overwrite a saved session
-  // selection on every refresh.
-  if (!app.state.ui.activePid && app.embedDefaults.pid) app.state.ui.activePid = app.embedDefaults.pid;
-  if (!app.state.ui.activeSid && app.embedDefaults.sid) app.state.ui.activeSid = app.embedDefaults.sid;
+  const forceEmbedScope = String(embedCfg.sass?.mode || "").trim().toLowerCase() === "superadmin";
+  if ((forceEmbedScope || !app.state.ui.activePid) && app.embedDefaults.pid) app.state.ui.activePid = app.embedDefaults.pid;
+  if ((forceEmbedScope || !app.state.ui.activeSid) && app.embedDefaults.sid) app.state.ui.activeSid = app.embedDefaults.sid;
   if (embedCfg.alias) app.state.auth.alias = embedCfg.alias;
   if (embedCfg.pluginRepoApiBase) {
     if (!app.state.pluginRepo || typeof app.state.pluginRepo !== "object") app.state.pluginRepo = {};
@@ -2689,10 +2785,8 @@ function adjustSubmenuPosition(group, sub) {
   try {
     const mount = getEmbedMount?.();
     if (mount && mount !== document.body && mount !== document.documentElement) {
-      const rect = mount.getBoundingClientRect();
-      // Respect the actual visible viewport first. Narrow browser widths can
-      // otherwise report a wider host/mount box and incorrectly keep nested
-      // flyouts opening off the right edge.
+      const panel = mount.closest?.(".llm-chat-embed-panel-host, .superadmin-chat-shell") || mount;
+      const rect = panel.getBoundingClientRect();
       if (Number.isFinite(rect.left)) boundsLeft = Math.max(0, Math.min(window.innerWidth - 24, rect.left));
       if (Number.isFinite(rect.right)) boundsRight = Math.min(window.innerWidth, Math.max(boundsLeft + 120, rect.right));
     }
@@ -3458,6 +3552,7 @@ function clearPermissionsState() {
 }
 
 function hasPermission(permissionKey, fallback = false) {
+  if (isBusinessAdminTenantEmbed()) return true;
   const perms = ensurePermissionsState();
   if (perms.isAdmin || normalizePermissionFlag(perms.permissions?.["*"], false)) return true;
   const key = String(permissionKey || "").trim();
@@ -3506,6 +3601,7 @@ function pluginAccessRule(pluginId) {
 function canAccessPlugin(pluginId, action = "view") {
   const key = String(pluginId || "").trim();
   if (!key) return true;
+  if (isBusinessAdminTenantEmbed()) return true;
   const rule = pluginAccessRule(key);
   const mode = String(action || "view").trim().toLowerCase();
   if (mode === "settings") return Boolean(rule.settings);
@@ -3543,6 +3639,57 @@ function applyPermissionVisibility() {
   }
 }
 
+function pruneRestrictedPlugins() {
+  if (!app.state.permissions?.ready) return;
+  for (const id of Object.keys(app.plugins.meta || {})) {
+    if (canAccessPlugin(id, "view")) continue;
+    const instance = app.plugins.instances?.[id];
+    try {
+      if (instance && typeof instance.dispose === "function") {
+        instance.dispose(getPluginContext());
+      } else if (instance && typeof instance.unregister === "function") {
+        instance.unregister(getPluginContext());
+      }
+    } catch (err) {
+      appendLog(`[plugin] restricted cleanup failed: ${err.message || err}`, "warn");
+    }
+    unregisterPluginSlots(id);
+    delete app.plugins.registry[id];
+    delete app.plugins.instances[id];
+    if (app.plugins.meta[id]) {
+      app.plugins.meta[id].status = "restricted";
+      app.plugins.meta[id].error = "";
+    }
+  }
+  app.plugins.list = (app.plugins.list || []).filter((info) => canAccessPlugin(info.id, "view"));
+}
+
+function pruneTenantDisallowedPlugins() {
+  if (!isTenantEmbedActive()) return;
+  for (const id of Object.keys(app.plugins.meta || {})) {
+    if (isTenantPluginAllowed(id)) continue;
+    const instance = app.plugins.instances?.[id];
+    try {
+      if (instance && typeof instance.dispose === "function") {
+        instance.dispose(getPluginContext());
+      } else if (instance && typeof instance.unregister === "function") {
+        instance.unregister(getPluginContext());
+      }
+    } catch (err) {
+      appendLog(`[plugin] tenant cleanup failed: ${err.message || err}`, "warn");
+    }
+    unregisterPluginSlots(id);
+    delete app.plugins.registry[id];
+    delete app.plugins.instances[id];
+    if (app.plugins.meta[id]) {
+      app.plugins.meta[id].status = "not_in_tier";
+      app.plugins.meta[id].error = "";
+      app.plugins.meta[id].enabled = false;
+    }
+  }
+  app.plugins.list = (app.plugins.list || []).filter((info) => isTenantPluginAllowed(info.id));
+}
+
 async function refreshPermissionState(options = {}) {
   const silent = options?.silent === true;
   try {
@@ -3552,6 +3699,8 @@ async function refreshPermissionState(options = {}) {
     if (!silent) appendLog(`[permissions] ${err.message || err}`, "warn");
     clearPermissionsState();
   }
+  pruneTenantDisallowedPlugins();
+  pruneRestrictedPlugins();
   applyPermissionVisibility();
   renderTopRightIconRow();
   renderTranscriptBars();
@@ -3752,6 +3901,8 @@ function renderToolbar() {
   }
   app.dom.toolbarActions.innerHTML = "";
   for (const item of app.plugins.slots.toolbar) {
+    if (item.pluginId && !isPluginEnabled(item.pluginId)) continue;
+    if (item.pluginId && !canAccessPlugin(item.pluginId, "view")) continue;
     const action = item.action || item;
     const btn = document.createElement("button");
     btn.className = "ghost";
@@ -3849,6 +4000,7 @@ function renderTranscript() {
   }
 
   // Full rerender fallback.
+  transcript.querySelectorAll(".message").forEach((node) => disposeMessageAttachments(node));
   transcript.innerHTML = "";
   app.dom.messageNodes = {};
 
@@ -3895,6 +4047,7 @@ function renderTranscript() {
       const node = renderer(msg, getPluginContext());
       if (node) {
         attachMessageFooter(node, msg);
+        attachMessageAttachments(node, msg, "render");
         return node;
       }
     }
@@ -3918,6 +4071,7 @@ function renderTranscript() {
     renderMessageBubbleContent(bubble, msg);
     wrap.appendChild(bubble);
     attachMessageFooter(wrap, msg);
+    attachMessageAttachments(wrap, msg, "render");
 
     return wrap;
   }
@@ -4210,6 +4364,122 @@ function renderTranscript() {
     attachMessageFooter(container, msg);
   }
 
+  function normalizeMessageAttachmentPlacement(value) {
+    const placement = String(value || "bottom-left").trim().toLowerCase();
+    return ["bottom-left", "bottom-right", "top-left", "top-right"].includes(placement)
+      ? placement
+      : "bottom-left";
+  }
+
+  function messageAttachmentRoleMatches(msg, roles) {
+    const role = String(msg?.role || "assistant").trim().toLowerCase();
+    const allowed = Array.isArray(roles) && roles.length ? roles : ["assistant"];
+    return allowed.some((value) => String(value || "").trim().toLowerCase() === role);
+  }
+
+  function ensureMessageAttachmentViewportTracking() {
+    const transcript = app.dom?.transcript;
+    if (!transcript || app.messageAttachmentViewportObserver) return;
+    const update = () => {
+      const height = Math.max(0, transcript.clientHeight || 0);
+      transcript.style.setProperty(
+        "--message-attachment-sticky-top",
+        `max(10px, calc(${height}px - var(--message-attachment-size) - 12px))`,
+      );
+    };
+    app.messageAttachmentViewportObserver = new ResizeObserver(update);
+    app.messageAttachmentViewportObserver.observe(transcript);
+    window.visualViewport?.addEventListener?.("resize", update, { passive: true });
+    update();
+  }
+
+  function disposeMessageAttachments(container) {
+    const instances = Array.isArray(container?.__messageAttachmentInstances)
+      ? container.__messageAttachmentInstances
+      : [];
+    instances.forEach((instance) => {
+      try { instance?.dispose?.(); } catch (_err) {}
+    });
+    if (container) container.__messageAttachmentInstances = [];
+  }
+
+  function attachMessageAttachments(container, msg, phase = "render") {
+    if (!container) return;
+    ensureMessageAttachmentViewportTracking();
+    disposeMessageAttachments(container);
+    container.querySelectorAll(":scope > .message-body-with-attachments").forEach((body) => {
+      const existingBubble = body.querySelector(":scope > .bubble");
+      if (existingBubble) body.replaceWith(existingBubble);
+      else body.remove();
+    });
+    container.classList.remove("has-message-attachments");
+    container.classList.remove("attachment-bottom-left", "attachment-bottom-right", "attachment-top-left", "attachment-top-right");
+    const entries = app.plugins.slots.messageAttachments || [];
+    if (!entries.length) return;
+    const bubble = container.querySelector(":scope > .bubble");
+    if (!bubble) return;
+    const ctx = getPluginContext();
+    const rendered = [];
+    for (const entry of entries) {
+      if (!messageAttachmentRoleMatches(msg, entry.roles)) continue;
+      try {
+        if (typeof entry.shouldRender === "function" && !entry.shouldRender(msg, ctx)) continue;
+        const placement = normalizeMessageAttachmentPlacement(
+          typeof entry.placement === "function" ? entry.placement(msg, ctx) : entry.placement,
+        );
+        const result = entry.render?.(msg, ctx, { phase, placement });
+        const node = result instanceof Element ? result : result?.node;
+        if (!(node instanceof Element)) continue;
+        rendered.push({ entry, result, node, placement });
+      } catch (err) {
+        appendLog(`[render] message attachment failed: ${err.message || err}`, "warn");
+      }
+    }
+    if (!rendered.length) return;
+
+    const body = document.createElement("div");
+    body.className = "message-body-with-attachments";
+    bubble.replaceWith(body);
+    body.appendChild(bubble);
+    const instances = [];
+    rendered.forEach(({ entry, result, node, placement }) => {
+      const rail = document.createElement("div");
+      rail.className = `message-attachment-rail ${placement}`;
+      rail.dataset.pluginId = entry.pluginId || "";
+      const sticky = document.createElement("div");
+      sticky.className = "message-attachment-sticky";
+      sticky.appendChild(node);
+      rail.appendChild(sticky);
+      body.appendChild(rail);
+      const update = result?.update || entry.update;
+      const dispose = result?.dispose || entry.dispose;
+      instances.push({
+        update: typeof update === "function"
+          ? (nextMsg, nextPhase) => update(nextMsg, ctx, { phase: nextPhase, node, placement })
+          : null,
+        dispose: typeof dispose === "function" ? () => dispose(node, ctx) : null,
+      });
+    });
+    container.__messageAttachmentInstances = instances;
+    container.classList.add("has-message-attachments");
+    rendered.forEach(({ placement }) => container.classList.add(`attachment-${placement}`));
+  }
+
+  function updateMessageAttachments(container, msg, phase = "stream") {
+    const instances = Array.isArray(container?.__messageAttachmentInstances)
+      ? container.__messageAttachmentInstances
+      : [];
+    if (!instances.length) {
+      attachMessageAttachments(container, msg, phase);
+      return;
+    }
+    instances.forEach((instance) => {
+      try { instance?.update?.(msg, phase); } catch (err) {
+        appendLog(`[render] message attachment update failed: ${err.message || err}`, "warn");
+      }
+    });
+  }
+
   function rehydrateRestoredTranscriptInteractions(session, messages) {
     if (!session || !Array.isArray(messages) || !app?.dom?.transcript) return;
     const byId = new Map();
@@ -4221,6 +4491,7 @@ function renderTranscript() {
       const msg = byId.get(String(node?.dataset?.msgId || "").trim());
       if (!msg) return;
       refreshMessageFooter(node, msg);
+      attachMessageAttachments(node, msg, "restore");
       rebindRestoredTranscriptVideos(node, msg);
     });
   }
@@ -4769,6 +5040,7 @@ function updateMessageElement(msg) {
         app.dom.messageNodes[msg.msg_id] = nextNode;
       }
       refreshMessageFooter(app.dom.messageNodes[msg.msg_id] || node, msg);
+      attachMessageAttachments(app.dom.messageNodes[msg.msg_id] || node, msg, msg.streaming ? "stream" : "done");
       if (autoScroll) scrollToBottom();
       return;
     }
@@ -4780,6 +5052,7 @@ function updateMessageElement(msg) {
   if (!msg.streaming) {
     refreshMessageFooter(node, msg);
   }
+  updateMessageAttachments(node, msg, msg.streaming ? "stream" : "done");
   if (autoScroll) scrollToBottom();
 }
 
@@ -4908,6 +5181,7 @@ async function selectProject(pid) {
   scheduleSave();
   renderProjectList();
   renderSessionList();
+  publishPlaygroundMessage("scope", playgroundScopeSnapshot());
   if (canUseRemoteServer()) {
     await refreshSessions();
   }
@@ -4946,6 +5220,7 @@ async function selectSession(sid) {
   renderPluginPanels();
   renderRouterPluginsList();
   emitSessionChange();
+  publishPlaygroundMessage("scope", playgroundScopeSnapshot());
   await loadSessionMessages();
   if (app.state.ui.activeSid !== sid || app.state.ui.__sessionSwitchToken !== switchToken) return;
   renderTranscript();
@@ -5518,6 +5793,7 @@ async function loadSessionMessages() {
     try {
       appendLog(`[send] handled before backend pid=${pid || ""} sid=${sid || ""}`, "warn");
     } catch (_err) {}
+    consumeCurrentPendingUploads();
     return;
   }
 
@@ -5532,6 +5808,7 @@ async function loadSessionMessages() {
   } catch (_err) {}
 
   await startCompletionStream(pid, sid, payload.text, clientMsgId);
+  consumeCurrentPendingUploads();
 }
 
 function prettyRouteName(routeId) {
@@ -5649,6 +5926,27 @@ function updateStreamMessageContent(sid, msgId, content, force, options = {}) {
   scheduleSave();
   if (sid === app.state.ui.activeSid) {
     updateMessageElement(msg);
+  }
+}
+
+function consumeCurrentPendingUploads(maxAgeMs = 10 * 60 * 1000) {
+  const list = Array.isArray(app.state.pendingUploads) ? app.state.pendingUploads : [];
+  if (!list.length) return;
+  const nowMs = Date.now();
+  const keep = [];
+  let changed = false;
+  for (const att of list) {
+    const ts = Number(att?.ts_ms || att?.ts || 0);
+    const ready = Boolean(String(att?.download_url || att?.url || "").trim() || String(att?.path || att?.local_path || "").trim());
+    if (Number.isFinite(ts) && ts > 0 && nowMs - ts <= maxAgeMs && ready) {
+      changed = true;
+      continue;
+    }
+    keep.push(att);
+  }
+  if (changed) {
+    app.state.pendingUploads = keep;
+    scheduleSave();
   }
 }
 
@@ -5836,6 +6134,14 @@ async function startModelStream(pid, sid, prompt, clientMsgId) {
 
   const url = `/v1/projects/${encodeURIComponent(pid)}/sessions/${encodeURIComponent(sid)}/model_turn_stream`;
   const controller = new AbortController();
+  let pluginDoneNotified = false;
+  const notifyPluginEvent = (event, data = {}) => {
+    if (event === "assistant_done") {
+      if (pluginDoneNotified) return;
+      pluginDoneNotified = true;
+    }
+    dispatchPluginEvent(event, { ...(data || {}), sid, local: true });
+  };
   app.streams.active[streamId] = controller;
   incrementSessionStream(sid);
 
@@ -5855,7 +6161,9 @@ async function startModelStream(pid, sid, prompt, clientMsgId) {
           handleSessionEvent("message", data);
         } else if (event === "token") {
           const msgId = data?.msg_id || streamId;
-          appendToken(sid, msgId, data?.text || "");
+          const text = data?.text || "";
+          appendToken(sid, msgId, text);
+          notifyPluginEvent("token", { ...(data || {}), msg_id: msgId, text });
         } else if (event === "diag") {
           if (handleRouterDiag(sid, data, streamId)) {
             return;
@@ -5865,14 +6173,17 @@ async function startModelStream(pid, sid, prompt, clientMsgId) {
         } else if (event === "done") {
           const msgId = data?.msg_id || streamId;
           markStreamDone(sid, msgId);
+          notifyPluginEvent("assistant_done", { msg_id: msgId });
         }
       },
     });
+    notifyPluginEvent("assistant_done", { msg_id: app.streams.placeholderBySid[sid] || streamId });
   } catch (err) {
     appendLog(`[stream] ${err.message || err}`, "error");
     surfaceStreamErrorToAssistant(sid, streamId, err);
     markStreamDone(sid, streamId, { removeEmpty: false });
   } finally {
+    notifyPluginEvent("assistant_done", { msg_id: app.streams.placeholderBySid[sid] || streamId });
     delete app.streams.active[streamId];
     decrementSessionStream(sid);
   }
@@ -5905,34 +6216,59 @@ async function startCompletionStream(pid, sid, prompt, clientMsgId) {
   app.streams.active[streamId] = controller;
   incrementSessionStream(sid);
 
+  const extractRemoteStreamText = (event, data) => {
+    if (typeof data === "string") return event === "token" || event === "tokens" || data !== "[DONE]" ? data : "";
+    if (!data || typeof data !== "object") return "";
+    for (const key of ["text", "token", "content", "delta"]) {
+      const value = data[key];
+      if (typeof value === "string" && value) return value;
+      if (value && typeof value === "object" && typeof value.content === "string") return value.content;
+    }
+    const choices = Array.isArray(data.choices) ? data.choices : [];
+    const first = choices[0] && typeof choices[0] === "object" ? choices[0] : null;
+    const delta = first?.delta && typeof first.delta === "object" ? first.delta : null;
+    if (typeof delta?.content === "string") return delta.content;
+    const message = first?.message && typeof first.message === "object" ? first.message : null;
+    if (typeof message?.content === "string") return message.content;
+    return "";
+  };
+
+  const emitCompletionToken = (data, text) => {
+    if (!text) return;
+    appendToken(sid, streamId, text);
+    dispatchPluginEvent("token", {
+      ...(data && typeof data === "object" ? data : {}),
+      sid,
+      msg_id: streamId,
+      text,
+      local: true,
+    });
+  };
+
   const onEvent = (event, data) => {
     if (data === "[DONE]") {
       sawDone = true;
       if (mode === "local") {
         markStreamDone(sid, streamId);
-        for (const handler of app.plugins.slots.eventHandlers) {
-          try {
-            const fn = handler.fn || handler;
-            fn("assistant_done", { sid, msg_id: streamId, local: true }, getPluginContext());
-          } catch (_err) {}
-        }
+        dispatchPluginEvent("assistant_done", { sid, msg_id: streamId, local: true });
       }
       try {
         controller.abort();
       } catch (_err) {}
       return;
     }
-    if (event === "token") {
+    if (event === "token" || event === "tokens") {
       if (mode === "local") {
-        appendToken(sid, streamId, data?.text || "");
-        for (const handler of app.plugins.slots.eventHandlers) {
-          try {
-            const fn = handler.fn || handler;
-            fn("token", { ...(data || {}), sid, msg_id: streamId, local: true }, getPluginContext());
-          } catch (_err) {}
-        }
+        emitCompletionToken(data, extractRemoteStreamText(event, data));
       }
       return;
+    }
+    if (event === "message") {
+      const text = extractRemoteStreamText(event, data);
+      if (text && !data?.msg && !data?.message) {
+        if (mode === "local") emitCompletionToken(data, text);
+        return;
+      }
     }
     if (event === "diag") {
       if (handleRouterDiag(sid, data, streamId)) {
@@ -5959,12 +6295,7 @@ async function startCompletionStream(pid, sid, prompt, clientMsgId) {
           }
         }
         markStreamDone(sid, streamId);
-        for (const handler of app.plugins.slots.eventHandlers) {
-          try {
-            const fn = handler.fn || handler;
-            fn("assistant_done", { sid, msg_id: streamId, local: true }, getPluginContext());
-          } catch (_err) {}
-        }
+        dispatchPluginEvent("assistant_done", { sid, msg_id: streamId, local: true });
       }
       try {
         controller.abort();
@@ -5992,6 +6323,23 @@ async function startCompletionStream(pid, sid, prompt, clientMsgId) {
   const shouldRetryWithoutSession = (err) => {
     const raw = String(err?.message || err || "");
     return /HTTP\s+404\b/i.test(raw) && /session not found/i.test(raw);
+  };
+
+  const recoverDroppedCompletion = async (err) => {
+    const raw = String(err?.message || err || "");
+    if (!/(?:load failed|failed to fetch|network error|network request failed)/i.test(raw)) return false;
+    if (app.state.ui.activePid !== pid || app.state.ui.activeSid !== sid) return false;
+    await new Promise((resolve) => setTimeout(resolve, 900));
+    await loadSessionMessages();
+    const session = app.state.sessions[sid] || {};
+    const recovered = (session.messages || []).find((msg) => (
+      msg?.role === "assistant" && getMessageClientMsgId(msg) === String(clientMsgId || "") && String(msg?.content || "").trim()
+    ));
+    if (!recovered) return false;
+    renderTranscript();
+    dispatchPluginEvent("message", { sid, msg: recovered, recovered: true });
+    appendLog("[stream] recovered completed response after connection interruption", "warn");
+    return true;
   };
 
   const buildDirectPayload = (basePayload) => {
@@ -6025,10 +6373,15 @@ async function startCompletionStream(pid, sid, prompt, clientMsgId) {
       markStreamDone(sid, streamId);
       return;
     }
+    if (await recoverDroppedCompletion(err)) return;
     appendLog(`[stream] ${err.message || err}`, "error");
     surfaceStreamErrorToAssistant(sid, streamId, err);
     markStreamDone(sid, streamId, { removeEmpty: false });
   } finally {
+    if (!sawDone) {
+      markStreamDone(sid, streamId);
+      dispatchPluginEvent("assistant_done", { sid, msg_id: streamId, local: true, stream_closed: true });
+    }
     delete app.streams.active[streamId];
     decrementSessionStream(sid);
   }
@@ -6115,6 +6468,25 @@ function buildCompletionPayload(sid) {
       sid,
     };
   }
+  const nowMs = Date.now();
+  const currentUploads = (Array.isArray(app.state.pendingUploads) ? app.state.pendingUploads : [])
+    .filter((att) => {
+      if (!att || typeof att !== "object") return false;
+      const ts = Number(att.ts_ms || att.ts || 0);
+      if (!Number.isFinite(ts) || ts <= 0 || nowMs - ts > 10 * 60 * 1000) return false;
+      return Boolean(String(att.download_url || att.url || "").trim() || String(att.path || att.local_path || "").trim());
+    })
+    .map((att) => ({
+      name: att.name || att.filename || "image",
+      mime: att.mime || "",
+      path: att.path || att.local_path || "",
+      url: att.download_url || att.url || "",
+      kind: "image",
+      source: att.source || "chat_upload",
+    }));
+  if (currentUploads.length) {
+    payload.ext.attachments = currentUploads;
+  }
   const contextMode = String(app.state.prefs.contextMode || "").trim();
   if (contextMode) {
     payload.ext = { ...payload.ext, context_mode: contextMode };
@@ -6150,7 +6522,31 @@ function buildCompletionPayload(sid) {
   const maxTokens = getEffectiveMaxTokensPreference();
   if (!Number.isNaN(temp)) payload.temperature = temp;
   if (maxTokens != null) payload.max_tokens = maxTokens;
-  return applyCompletionPayloadHooks(payload);
+  const hooked = applyCompletionPayloadHooks(payload);
+  const finalRouterCfg = getCompletionRouterConfig(sid);
+  const hookRouterEnabled = Array.isArray(hooked.router_enabled_plugins)
+    ? hooked.router_enabled_plugins.map((item) => String(item || "").trim()).filter(Boolean)
+    : [];
+  const hookExtRouterEnabled = Array.isArray(hooked.ext?.router_enabled_plugins)
+    ? hooked.ext.router_enabled_plugins.map((item) => String(item || "").trim()).filter(Boolean)
+    : [];
+  const hookedRouteId = String(hooked.route_id || "").trim().toLowerCase();
+  const hookRequestedRouter = hookRouterEnabled.length
+    || hookExtRouterEnabled.length
+    || (hookedRouteId && !["auto", "chat", "none", "__none__"].includes(hookedRouteId));
+  if (!finalRouterCfg.enabled.length && !hookRequestedRouter) {
+    delete hooked.route_id;
+    hooked.router_enabled_plugins = [];
+    hooked.ext = hooked.ext && typeof hooked.ext === "object" ? hooked.ext : {};
+    hooked.ext.router_enabled_plugins = [];
+    delete hooked.ext.agent_flow_active_flow;
+    delete hooked.ext.__route_debug;
+  } else if (!finalRouterCfg.enabled.length) {
+    hooked.ext = hooked.ext && typeof hooked.ext === "object" ? hooked.ext : {};
+    delete hooked.ext.agent_flow_active_flow;
+    delete hooked.ext.__route_debug;
+  }
+  return hooked;
 }
 
 function agentFlowNoFlowSelected(settings) {
@@ -6160,12 +6556,23 @@ function agentFlowNoFlowSelected(settings) {
   return active === "" || active === AGENT_FLOW_NO_FLOW_VALUE;
 }
 
+function agentFlowSpecialRoute(settings) {
+  if (!settings || typeof settings !== "object") return "";
+  const active = String(settings.agent_flow_active_flow || "").trim();
+  if (active === "__llm_autoflow__") return "llm_autoflow";
+  if (active === "__llm_skill_autoflow__") return "llm_skill_autoflow";
+  return "";
+}
+
 function getCompletionRouterConfig(sid, pid = app.state?.ui?.activePid) {
   const cfg = getRouterConfig(sid, pid);
   const settings = cfg.settings && typeof cfg.settings === "object" ? cfg.settings : {};
   let enabled = Array.isArray(cfg.enabled) ? cfg.enabled.slice() : [];
-  if (enabled.includes("agent_flow") && agentFlowNoFlowSelected(settings.agent_flow)) {
-    enabled = enabled.filter((item) => item !== "agent_flow");
+  const specialRoute = agentFlowSpecialRoute(settings.agent_flow);
+  if (specialRoute) {
+    enabled = enabled.filter((item) => !["llm_autoflow", "llm_skill_autoflow"].includes(item) || item === specialRoute);
+  } else {
+    enabled = enabled.filter((item) => !["llm_autoflow", "llm_skill_autoflow"].includes(item));
   }
   return { enabled, settings };
 }
@@ -6206,10 +6613,7 @@ function startSessionEvents() {
           signal: controller.signal,
           onEvent: (event, data) => {
             handleSessionEvent(event, data);
-            for (const handler of app.plugins.slots.eventHandlers) {
-              const fn = handler.fn || handler;
-              fn(event, data, getPluginContext());
-            }
+            dispatchPluginEvent(event, data);
           },
         });
       } catch (err) {
@@ -6627,6 +7031,7 @@ function applyLoginResponse(data, fallbackUser) {
   clearRequestCaches();
   app.state.auth.token = data.token;
   app.state.auth.username = data.username || fallbackUser || "";
+  app.state.auth.alias = data.alias || data.display_name || data.displayName || "";
   app.state.auth.role = data.role || "user";
   app.state.auth.mustChange = Boolean(data.must_change_pw);
   app.state.remote.enabled = true;
@@ -6740,6 +7145,8 @@ async function handleUpload() {
           name: file.name,
           size: file.size,
           mime: file.type,
+          ts_ms: Date.now(),
+          source: "chat_upload",
         });
         appendLog(`[upload] staged ${file.name}`, "info");
       }
@@ -6769,6 +7176,10 @@ async function uploadFile(file) {
       size: data.size || file.size,
       mime: file.type,
       download_url: data.download_url,
+      path: data.path || data.local_path || "",
+      local_path: data.local_path || data.path || "",
+      ts_ms: Date.now(),
+      source: "chat_upload",
     });
     appendLog(`[upload] uploaded ${file.name}`, "info");
   } catch (err) {
@@ -6778,12 +7189,43 @@ async function uploadFile(file) {
 
 function buildHeaders(extra = {}) {
   const headers = {};
-  if (isAuthEnabled() || app.state.auth.token) {
+  const embedCfg = window.__CHAT_JS_EMBED_CONFIG || {};
+  const sassEmbed = embedCfg.sass && typeof embedCfg.sass === "object" ? embedCfg.sass : null;
+  const bizEmbed = embedCfg.biz && typeof embedCfg.biz === "object" ? embedCfg.biz : null;
+  if (isAuthEnabled() || app.state.auth.token || sassEmbed || bizEmbed || isPersonalAccountEmbed()) {
     const enabled = new Set(["collab_chat", "plugin_repo"]);
+    if (isPersonalAccountEmbed()) {
+      enabled.add("auth_projects");
+    }
+    if (sassEmbed) {
+      enabled.add("sass_auth");
+      if (String(sassEmbed.mode || "").trim().toLowerCase() === "superadmin") {
+        enabled.add("auth_projects");
+      }
+      if (String(sassEmbed.mode || "").trim().toLowerCase() === "customer") {
+        enabled.add("sass_customer_chat");
+      } else {
+        enabled.add("openai_api");
+      }
+    }
+    if (bizEmbed) {
+      enabled.add("biz_auth");
+      if (
+        String(bizEmbed.mode || "").trim().toLowerCase() === "business" &&
+        String(bizEmbed.role || "admin").trim().toLowerCase() === "admin"
+      ) {
+        enabled.add("auth_projects");
+      }
+      if (String(bizEmbed.mode || "").trim().toLowerCase() !== "customer") {
+        enabled.add("openai_api");
+      }
+    }
     for (const plugin of app.plugins.list || []) {
       const pid = String(plugin?.id || "").trim();
       if (!pid) continue;
-      if (isPluginEnabled(pid)) enabled.add(pid);
+      const permissionReady = Boolean(app.state.permissions?.ready);
+      if (isTenantEmbedActive() && !isTenantPluginAllowed(pid)) continue;
+      if (isPluginEnabled(pid) && (!permissionReady || canAccessPlugin(pid, "view"))) enabled.add(pid);
     }
     headers["X-Gui-Enabled-Plugins"] = Array.from(enabled).sort().join(",");
   }
@@ -6891,6 +7333,202 @@ function getProjectRouterDefaults(pid = app.state?.ui?.activePid) {
   };
 }
 
+function getProjectPluginDefaults() {
+  const defaults = app.state?.ui?.projectPluginDefaults;
+  return defaults && typeof defaults === "object" ? defaults : null;
+}
+
+function isTenantEmbedActive() {
+  const embedCfg = window.__CHAT_JS_EMBED_CONFIG || {};
+  return Boolean(embedCfg.embedded && (embedCfg.sass || embedCfg.biz));
+}
+
+function isSuperadminTenantEmbed() {
+  const embedCfg = window.__CHAT_JS_EMBED_CONFIG || {};
+  const sass = embedCfg.sass && typeof embedCfg.sass === "object" ? embedCfg.sass : null;
+  return Boolean(
+    embedCfg.embedded &&
+    sass &&
+    String(sass.mode || "").trim().toLowerCase() === "superadmin"
+  );
+}
+
+function isBusinessAdminTenantEmbed() {
+  const embedCfg = window.__CHAT_JS_EMBED_CONFIG || {};
+  const biz = embedCfg.biz && typeof embedCfg.biz === "object" ? embedCfg.biz : null;
+  const role = String(biz?.role || "admin").trim().toLowerCase();
+  const mode = String(biz?.mode || "").trim().toLowerCase();
+  const packageId = String(biz?.packageId || biz?.package_id || biz?.package || "").trim().toLowerCase().replace(/-/g, "_");
+  return Boolean(
+    embedCfg.embedded &&
+    biz &&
+    role === "admin" &&
+    (mode === "business" || packageId === "business_starter")
+  );
+}
+
+function isPersonalAccountEmbed() {
+  const embedCfg = window.__CHAT_JS_EMBED_CONFIG || {};
+  return Boolean(
+    embedCfg.embedded &&
+    !embedCfg.sass &&
+    !embedCfg.biz &&
+    (embedCfg.identifierKey || embedCfg.identifier_key || embedCfg.alias)
+  );
+}
+
+function normalizePluginIdList(list) {
+  const values = Array.isArray(list) ? list : String(list || "").split(",");
+  const out = new Set();
+  for (const item of values) {
+    const key = String(item || "").trim();
+    if (key) out.add(key);
+  }
+  return out;
+}
+
+function getTenantEmbedKey() {
+  if (!isTenantEmbedActive()) return "";
+  const embedCfg = window.__CHAT_JS_EMBED_CONFIG || {};
+  try {
+    return JSON.stringify({
+      alias: embedCfg.alias || "",
+      identifierKey: embedCfg.identifierKey || embedCfg.identifier_key || "",
+      sass: embedCfg.sass || null,
+      biz: embedCfg.biz || null,
+    });
+  } catch (_err) {
+    return "";
+  }
+}
+
+function setTenantPluginAllowList(list) {
+  app.state.ui = app.state.ui || {};
+  const nextList = Array.from(normalizePluginIdList(list)).sort();
+  const nextKey = getTenantEmbedKey();
+  const currentList = Array.from(normalizePluginIdList(app.state.ui.tenantPluginAllowList || [])).sort();
+  const currentKey = app.state.ui.tenantPluginAllowListKey || "";
+  const unchanged = currentKey === nextKey &&
+    currentList.length === nextList.length &&
+    currentList.every((value, index) => value === nextList[index]);
+  app.state.ui.tenantPluginAllowList = nextList;
+  app.state.ui.tenantPluginAllowListKey = nextKey;
+  if (unchanged) return;
+  pruneTenantDisallowedPlugins();
+  renderToolbar();
+  renderTranscriptBars();
+  renderComposerLeft();
+  renderPluginPanels({ force: true });
+  renderPluginTable();
+  renderGuiPluginsMenu();
+}
+
+function getTenantPluginAllowList() {
+  if (app.state?.ui?.tenantPluginAllowListKey !== getTenantEmbedKey()) return new Set();
+  return normalizePluginIdList(app.state?.ui?.tenantPluginAllowList || []);
+}
+
+function getTenantRequiredPluginIds() {
+  const embedCfg = window.__CHAT_JS_EMBED_CONFIG || {};
+  const sassEmbed = embedCfg.sass && typeof embedCfg.sass === "object" ? embedCfg.sass : null;
+  const bizEmbed = embedCfg.biz && typeof embedCfg.biz === "object" ? embedCfg.biz : null;
+  const required = new Set();
+  if (sassEmbed) {
+    required.add("sass_auth");
+    if (String(sassEmbed.mode || "").trim().toLowerCase() === "superadmin") required.add("auth_projects");
+    if (String(sassEmbed.mode || "").trim().toLowerCase() === "customer") required.add("sass_customer_chat");
+  }
+  if (bizEmbed) {
+    required.add("biz_auth");
+    if (
+      String(bizEmbed.mode || "").trim().toLowerCase() === "business" &&
+      String(bizEmbed.role || "admin").trim().toLowerCase() === "admin"
+    ) {
+      required.add("auth_projects");
+    }
+  }
+  return required;
+}
+
+function isTenantPluginAllowed(pluginId) {
+  const key = String(pluginId || "").trim();
+  if (!key || !isTenantEmbedActive()) return true;
+  // SaaS superadmin embeds and Business Starter admin embeds are owner/admin
+  // consoles. They must see and manage every plugin globally; do not apply
+  // business/customer tenant allow-list pruning here or those consoles regress
+  // to only their auth plugin.
+  if (isSuperadminTenantEmbed() || isBusinessAdminTenantEmbed()) return true;
+  if (key === "collab_chat" || key === "plugin_repo") return true;
+  if (getTenantRequiredPluginIds().has(key)) return true;
+  const allowed = getTenantPluginAllowList();
+  return allowed.size > 0 && allowed.has(key);
+}
+
+function setProjectPluginDefaults(pluginState) {
+  const state = pluginState && typeof pluginState === "object" ? pluginState : null;
+  app.state.ui = app.state.ui || {};
+  app.state.ui.projectPluginDefaults = state ? JSON.parse(JSON.stringify(state)) : null;
+}
+
+function enforceProjectPluginDefaults() {
+  if (!isTenantEmbedActive()) return;
+  const defaults = getProjectPluginDefaults();
+  const enabled = defaults?.enabled && typeof defaults.enabled === "object" ? defaults.enabled : {};
+  const keys = Object.keys(enabled);
+  if (!keys.length) return;
+  ensurePluginPrefs();
+  for (const pluginId of keys) {
+    if (enabled[pluginId] === false) {
+      app.state.pluginPrefs.enabled[pluginId] = false;
+    }
+  }
+}
+
+function applyTenantPluginSettings(settings) {
+  if (!isTenantEmbedActive()) return false;
+  const source = settings && typeof settings === "object" ? settings : {};
+  const pluginState = source.plugin_state && typeof source.plugin_state === "object" ? source.plugin_state : null;
+  if (!pluginState) return false;
+  setProjectPluginDefaults(pluginState);
+  enforceProjectPluginDefaults();
+  pruneTenantDisallowedPlugins();
+  pruneRestrictedPlugins();
+  renderToolbar();
+  renderTranscriptBars();
+  renderComposerLeft();
+  renderPluginPanels({ force: true });
+  renderPluginTable();
+  renderGuiPluginsMenu();
+  return true;
+}
+
+async function saveSaasGlobalPluginSettings() {
+  if (!isTenantEmbedActive()) return false;
+  const st = app.state?.plugins?.sass_auth;
+  const me = st?.me && typeof st.me === "object" ? st.me : null;
+  if (!me?.is_superadmin || !hasRemoteAuth()) return false;
+  const currentSettings = me.global_settings && typeof me.global_settings === "object" ? me.global_settings : {};
+  const pluginState = JSON.parse(JSON.stringify(ensurePluginPrefs()));
+  const merged = {
+    ...currentSettings,
+    plugin_state: pluginState,
+  };
+  try {
+    const data = await apiJson("/v1/sass_auth/global_settings", {
+      method: "PUT",
+      body: { settings: merged },
+    });
+    const saved = data?.settings && typeof data.settings === "object" ? data.settings : merged;
+    me.global_settings = saved;
+    if (st.me) st.me.global_settings = saved;
+    applyTenantPluginSettings(saved);
+    return true;
+  } catch (err) {
+    appendLog(`[sass_auth] global plugin settings save failed: ${err.message || err}`, "warn");
+    return false;
+  }
+}
+
 function setProjectRouterDefaults(enabled, settings, pid = app.state?.ui?.activePid) {
   ensureRouterState();
   const key = routerProjectDefaultsKey(pid);
@@ -6995,11 +7633,16 @@ async function loadProjectRouterPrefs(pid, options = {}) {
       const projectRouterDefaults = defaultPrefs.router_project_defaults && typeof defaultPrefs.router_project_defaults === "object"
         ? defaultPrefs.router_project_defaults
         : null;
+      const projectPluginDefaults = defaultPrefs.plugin_state && typeof defaultPrefs.plugin_state === "object"
+        ? defaultPrefs.plugin_state
+        : null;
       setProjectRouterDefaults(
         projectRouterDefaults ? projectRouterDefaults.enabled : null,
         projectRouterDefaults ? projectRouterDefaults.settings : null,
         projectId
       );
+      setProjectPluginDefaults(projectPluginDefaults);
+      enforceProjectPluginDefaults();
       const prefs = data?.prefs && typeof data.prefs === "object" ? data.prefs : {};
       const routerPrefs = prefs.router_state && typeof prefs.router_state === "object"
         ? projectRouterSnapshot(prefs.router_state, projectId)
@@ -7023,6 +7666,7 @@ async function loadProjectRouterPrefs(pid, options = {}) {
         if (pluginPrefs.preloads && typeof pluginPrefs.preloads === "object") {
           app.state.pluginPrefs.preloads = JSON.parse(JSON.stringify(pluginPrefs.preloads));
         }
+        enforceProjectPluginDefaults();
       }
       const uiPrefs = prefs.ui_state && typeof prefs.ui_state === "object" ? prefs.ui_state : null;
       if (uiPrefs) {
@@ -7050,6 +7694,10 @@ async function loadProjectRouterPrefs(pid, options = {}) {
 }
 
 let routerPrefsSaveTimer = null;
+
+function canManageProjectGuiDefaults() {
+  return Boolean(app.state.permissions?.is_admin);
+}
 
 function scheduleProjectRouterPrefsSave(pid = app.state?.ui?.activePid) {
   const projectId = String(pid || "").trim();
@@ -7083,10 +7731,13 @@ async function saveProjectRouterPrefs(pid = app.state?.ui?.activePid) {
       body: { scope: "user", prefs },
       timeoutMs: 8000,
     });
-    if (isAdminUser()) {
+    if (canManageProjectGuiDefaults()) {
       const currentProjectPrefs = current?.default_prefs && typeof current.default_prefs === "object"
         ? { ...current.default_prefs }
         : {};
+      if (isTenantEmbedActive()) {
+        currentProjectPrefs.plugin_state = JSON.parse(JSON.stringify(ensurePluginPrefs()));
+      }
       const projectDefaults = getProjectRouterDefaults(projectId);
       currentProjectPrefs.router_project_defaults = {
         enabled: Array.isArray(projectDefaults.enabled) ? projectDefaults.enabled.slice() : [],
@@ -7100,6 +7751,10 @@ async function saveProjectRouterPrefs(pid = app.state?.ui?.activePid) {
         body: { scope: "project", prefs: currentProjectPrefs },
         timeoutMs: 8000,
       });
+      if (isTenantEmbedActive()) {
+        setProjectPluginDefaults(currentProjectPrefs.plugin_state);
+        enforceProjectPluginDefaults();
+      }
     }
     app.routerPrefsLoaded = app.routerPrefsLoaded || {};
     app.routerPrefsLoaded[projectId] = true;
@@ -7446,13 +8101,6 @@ function isNearBottom() {
 function normalizeServerUrl(url) {
   if (!url) return "";
   const legacyHostMap = {
-    "account.saikick.org": "account.gotchat.ai",
-    "embed.saikick.org": "embed.gotchat.ai",
-    "embed2.saikick.org": "embed2.gotchat.ai",
-    "hostservices.saikick.org": "hostservices.gotchat.ai",
-    "jshostservices.saikick.org": "jshostservices.gotchat.ai",
-    "pluginserver.saikick.org": "pluginserver.gotchat.ai",
-    "llmserver.saikick.org": "llmserver.gotchat.ai",
   };
   const text = String(url || "").replace(/\/+$/, "");
   try {
@@ -8199,6 +8847,48 @@ async function saveSharedChatUiInfo() {
   }
 }
 
+function repairDisplayEncoding(text) {
+  const cp1252 = new Map([
+    [0x20ac,0x80],[0x201a,0x82],[0x0192,0x83],[0x201e,0x84],[0x2026,0x85],[0x2020,0x86],
+    [0x2021,0x87],[0x02c6,0x88],[0x2030,0x89],[0x0160,0x8a],[0x2039,0x8b],[0x0152,0x8c],
+    [0x017d,0x8e],[0x2018,0x91],[0x2019,0x92],[0x201c,0x93],[0x201d,0x94],[0x2022,0x95],
+    [0x2013,0x96],[0x2014,0x97],[0x02dc,0x98],[0x2122,0x99],[0x0161,0x9a],[0x203a,0x9b],
+    [0x0153,0x9c],[0x017e,0x9e],[0x0178,0x9f],
+  ]);
+  const suspicion = (value) => [...value].reduce((score, char) => {
+    const code = char.codePointAt(0);
+    return score + ("ÂÃâð".includes(char) ? 3 : (code >= 0x80 && code <= 0x9f ? 4 : 0));
+  }, 0) + (value.match(/�/g)?.length || 0) * 5
+    + ((value.match(/á[º»]/g)?.length || 0) * 6);
+  let repaired = String(text ?? "");
+  for (let pass = 0; pass < 8; pass += 1) {
+    const output = [];
+    let run = [];
+    const flush = () => {
+      if (!run.length) return;
+      const original = run.join(""); run = [];
+      try {
+        const bytes = Uint8Array.from([...original], (char) => cp1252.get(char.codePointAt(0)) ?? char.codePointAt(0));
+        const candidate = new TextDecoder("utf-8", { fatal:true }).decode(bytes);
+        output.push(candidate && suspicion(candidate) < suspicion(original) ? candidate : original);
+      } catch (_error) { output.push(original); }
+    };
+    for (const char of repaired) {
+      const code = char.codePointAt(0);
+      if (code <= 0xff || cp1252.has(code)) run.push(char);
+      else { flush(); output.push(char); }
+    }
+    flush();
+    const next = output.join("");
+    if (next === repaired) break;
+    repaired = next;
+  }
+  return repaired
+    .replace(/(?<=\p{L})�(?=(?:s|t|re|ve|ll|d|m)\b)/giu, "'")
+    .replace(/(\p{N})\s*�\s*(\p{N})/gu, "$1 × $2")
+    .replace(/�+/g, "");
+}
+
 function normalizeServerMessage(msg) {
   const role = msg.role || "user";
   let author = msg.author_alias || msg.author_username || "";
@@ -8208,7 +8898,7 @@ function normalizeServerMessage(msg) {
   return {
     msg_id: msg.msg_id || randomId("msg"),
     role,
-    content: msg.content || "",
+    content: repairDisplayEncoding(msg.content || ""),
     author,
     author_username: msg.author_username || "",
     ts: msg.ts || null,
@@ -8232,7 +8922,7 @@ function isOtherUserMessage(msg) {
 
 function renderMarkdown(text) {
   if (!text) return "";
-  const parts = text.split("```");
+  const parts = repairDisplayEncoding(text).split("```");
   let out = "";
   for (let i = 0; i < parts.length; i += 1) {
     const chunk = parts[i];
@@ -8483,6 +9173,9 @@ function getPluginContext() {
       hasPermission: (key, fallback) => hasPermission(key, fallback),
       canAccessPlugin: (pluginId, action) => canAccessPlugin(pluginId, action),
       setPluginEnabled: (pluginId, enabled) => setPluginEnabled(pluginId, enabled),
+      setTenantPluginAllowList: (list) => setTenantPluginAllowList(list),
+      applyTenantPluginSettings: (settings) => applyTenantPluginSettings(settings),
+      saveTenantPluginSettings: () => saveSaasGlobalPluginSettings(),
       requestPluginPriority: (pluginId, options) => requestPluginPriority(pluginId, options),
       requestPluginPreload: (pluginId, kind) => requestPluginPreload(pluginId, kind),
       refreshPermissions: (options) => refreshPermissionState(options),
@@ -8494,6 +9187,10 @@ function getPluginContext() {
       openPluginPanel: (pluginId, options) => openPluginPanel(pluginId, options),
       openPluginPanelWhenReady: (pluginId, options) => openPluginPanelWhenReady(pluginId, options),
       openPluginFullView: (pluginId, options) => openPluginFullView(pluginId, options),
+      hasPlayground: (pluginId) => (app.plugins.slots.playgrounds || []).some(
+        (entry) => String(entry.pluginId || "") === String(pluginId || ""),
+      ),
+      openPlayground: (pluginId, options = {}) => openPluginPlayground(pluginId, options),
       closePluginFullView: () => closePluginFullView(),
       closeTools: () => closeTools(),
       getSavedUiTheme: () => normalizeUiThemeSnapshot(app.state?.ui?.savedTheme),
@@ -8543,9 +9240,57 @@ function getPluginIdFromEntry(entry) {
   return path.split("/").pop().replace(/\.(mjs|js)$/i, "");
 }
 
+function isRequiredEmbedPlugin(pluginId) {
+  const key = String(pluginId || "").trim();
+  if (!key) return false;
+  const embedCfg = window.__CHAT_JS_EMBED_CONFIG || {};
+  const sassEmbed = embedCfg.sass && typeof embedCfg.sass === "object" ? embedCfg.sass : null;
+  const bizEmbed = embedCfg.biz && typeof embedCfg.biz === "object" ? embedCfg.biz : null;
+  if (sassEmbed && key === "sass_auth") return true;
+  if (sassEmbed && String(sassEmbed.mode || "").trim().toLowerCase() === "superadmin" && key === "auth_projects") {
+    return true;
+  }
+  if (sassEmbed && String(sassEmbed.mode || "").trim().toLowerCase() === "customer" && key === "sass_customer_chat") {
+    return true;
+  }
+  if (bizEmbed && key === "biz_auth") return true;
+  if (isPersonalAccountEmbed() && key === "auth_projects") return true;
+  if (key === "auth_projects" && isBusinessAdminTenantEmbed()) {
+    return true;
+  }
+  return false;
+}
+
+function requiredEmbedPluginEntries() {
+  const ids = ["biz_auth", "sass_auth", "sass_customer_chat", "auth_projects"].filter((id) => isRequiredEmbedPlugin(id));
+  return ids.map((id) => ({
+    id,
+    path: `/gui_js/plugins/${id}/plugin.js`,
+    rev: "20260912-required-embed-auth",
+  }));
+}
+
+function withRequiredEmbedEntries(list) {
+  const out = Array.isArray(list) ? list.slice() : [];
+  const seen = new Set(out.map((entry) => getPluginIdFromEntry(entry)).filter(Boolean));
+  for (const entry of requiredEmbedPluginEntries()) {
+    if (seen.has(entry.id)) continue;
+    out.unshift(entry);
+    seen.add(entry.id);
+  }
+  return out;
+}
+
 function isPluginEnabled(pluginId) {
   const key = String(pluginId || "");
   if (!key) return true;
+  if (isRequiredEmbedPlugin(key)) return true;
+  if (isTenantEmbedActive() && !isTenantPluginAllowed(key)) return false;
+  if (isTenantEmbedActive()) {
+    const projectDefaults = getProjectPluginDefaults();
+    const projectEnabled = projectDefaults?.enabled && typeof projectDefaults.enabled === "object" ? projectDefaults.enabled : {};
+    if (projectEnabled[key] === false) return false;
+  }
   const prefs = app.state.pluginPrefs || {};
   const enabled = prefs.enabled || {};
   return enabled[key] !== false;
@@ -8631,10 +9376,18 @@ function setPluginEnabled(pluginId, enabled) {
   if (!key) return;
   ensurePluginPrefs();
   app.state.pluginPrefs.enabled[key] = Boolean(enabled);
+  if (isTenantEmbedActive() && canManageProjectGuiDefaults()) {
+    const defaults = getProjectPluginDefaults() || {};
+    defaults.enabled = { ...(defaults.enabled || {}), [key]: Boolean(enabled) };
+    setProjectPluginDefaults(defaults);
+  }
   saveCriticalPrefsSnapshot(app.state);
   scheduleSave();
   if (app.state?.ui?.activePid && canUseRemoteServer() && hasRemoteAuth()) {
     scheduleProjectRouterPrefsSave(app.state.ui.activePid);
+  }
+  if (app.state?.plugins?.sass_auth?.me?.is_superadmin) {
+    setTimeout(() => void saveSaasGlobalPluginSettings(), 0);
   }
 }
 
@@ -8739,8 +9492,11 @@ function getPluginRegistry(pluginId) {
       transcriptTopbar: [],
       transcriptBottombar: [],
       composerLeft: [],
+      playgrounds: [],
+      playgroundAssets: [],
         panels: [],
         messageRenderers: [],
+        messageAttachments: [],
         blockTransformers: [],
         blockRenderers: [],
         messageFooterItems: [],
@@ -8910,9 +9666,12 @@ function unregisterPluginSlots(pluginId) {
   app.plugins.slots.transcriptTopbar = filterOut(app.plugins.slots.transcriptTopbar);
   app.plugins.slots.transcriptBottombar = filterOut(app.plugins.slots.transcriptBottombar);
   app.plugins.slots.composerLeft = filterOut(app.plugins.slots.composerLeft);
+  app.plugins.slots.playgrounds = filterOut(app.plugins.slots.playgrounds || []);
+  app.plugins.slots.playgroundAssets = filterOut(app.plugins.slots.playgroundAssets || []);
     app.plugins.slots.panels = filterOut(app.plugins.slots.panels);
     app.plugins.slots.messagePreRenderers = filterOut(app.plugins.slots.messagePreRenderers);
     app.plugins.slots.messageRenderers = filterOut(app.plugins.slots.messageRenderers);
+    app.plugins.slots.messageAttachments = filterOut(app.plugins.slots.messageAttachments || []);
     app.plugins.slots.blockTransformers = filterOut(app.plugins.slots.blockTransformers);
     app.plugins.slots.blockRenderers = filterOut(app.plugins.slots.blockRenderers);
   app.plugins.slots.messageFooterItems = filterOut(app.plugins.slots.messageFooterItems);
@@ -9043,7 +9802,7 @@ async function loadPlugins() {
       const rest = [];
       for (const entry of sorted) {
         const pid = getPluginIdFromEntry(entry);
-        if (priorityRank.has(pid)) priority.push(entry);
+        if (isRequiredEmbedPlugin(pid) || priorityRank.has(pid)) priority.push(entry);
         else rest.push(entry);
       }
       for (const entry of priority) await loadPlugin(entry);
@@ -9059,7 +9818,7 @@ async function loadPlugins() {
       appendLog(`[plugins] discovery failed: ${res.status} ${res.statusText}`, "warn");
     } else {
       const data = await res.json();
-      const list = data?.plugins || [];
+      const list = withRequiredEmbedEntries(data?.plugins || []);
       if (list.length) {
         savePluginDiscoveryCache(base, list);
         seedPluginList(list);
@@ -9078,7 +9837,7 @@ async function loadPlugins() {
     const res = await fetch(manifestUrl, { cache: "no-store" });
     if (!res.ok) throw new Error("manifest missing");
     const data = await res.json();
-    const list = data?.plugins || [];
+    const list = withRequiredEmbedEntries(data?.plugins || []);
     if (list.length) savePluginDiscoveryCache(base, list);
     for (const entry of list) {
       if (!entry?.path) continue;
@@ -9093,7 +9852,7 @@ async function loadPlugins() {
 
   if (loaded) return;
 
-  const cachedList = loadPluginDiscoveryCache(base);
+  const cachedList = withRequiredEmbedEntries(loadPluginDiscoveryCache(base));
   if (cachedList.length) {
     seedPluginList(cachedList);
     await loadSortedEntries(sortEnabledEntries(cachedList));
@@ -9108,16 +9867,32 @@ async function refreshGuiPluginsDiscovery() {
     const res = await fetch(autoUrl, { cache: "no-store", headers: buildHeaders() });
     if (!res.ok) return;
     const data = await res.json();
-    const list = data?.plugins || [];
+    const list = withRequiredEmbedEntries(data?.plugins || []);
     if (!Array.isArray(list)) return;
-    if (!list.length) return;
-    savePluginDiscoveryCache(base, list);
+      savePluginDiscoveryCache(base, list);
 
     const nextIds = new Set();
     for (const entry of list) {
       const id = getPluginIdFromEntry(entry);
       if (!id) continue;
       nextIds.add(id);
+      if (isTenantEmbedActive() && !isTenantPluginAllowed(id)) {
+        unregisterPluginSlots(id);
+        delete app.plugins.registry[id];
+        delete app.plugins.instances[id];
+        upsertPluginInfo({
+          id,
+          name: entry.name || entry.id || entry.path,
+          kind: entry.kind || "gui",
+          description: entry.description || "",
+          status: "not_in_tier",
+          error: "",
+          enabled: false,
+          entry,
+        });
+        app.plugins.entries[id] = entry;
+        continue;
+      }
       const enabled = isPluginEnabled(id);
       const prevEntry = app.plugins.entries[id] || {};
       const pluginChanged = Boolean(
@@ -9148,6 +9923,22 @@ async function refreshGuiPluginsDiscovery() {
     for (const id of Object.keys(app.plugins.meta)) {
       if (nextIds.has(id)) continue;
       const existing = app.plugins.meta[id];
+      if (isTenantEmbedActive() && !isTenantPluginAllowed(id)) {
+        unregisterPluginSlots(id);
+        delete app.plugins.registry[id];
+        delete app.plugins.instances[id];
+        existing.status = "not_in_tier";
+        existing.error = "";
+        continue;
+      }
+      if (app.state.permissions?.ready && !canAccessPlugin(id, "view")) {
+        unregisterPluginSlots(id);
+        delete app.plugins.registry[id];
+        delete app.plugins.instances[id];
+        existing.status = "restricted";
+        existing.error = "";
+        continue;
+      }
       if (existing?.status === "loaded" || isPluginEnabled(id)) {
         continue;
       }
@@ -9157,6 +9948,7 @@ async function refreshGuiPluginsDiscovery() {
       delete app.plugins.instances[id];
     }
     app.plugins.list = app.plugins.list.filter((info) => {
+      if (isTenantEmbedActive() && !isTenantPluginAllowed(info.id)) return false;
       if (nextIds.has(info.id)) return true;
       const existing = app.plugins.meta[info.id];
       return Boolean(existing?.status === "loaded" || isPluginEnabled(info.id));
@@ -9201,6 +9993,7 @@ function pluginsActuallyReady() {
     (slots.messagePreRenderers || []).length ||
     (slots.blockTransformers || []).length ||
     (slots.blockRenderers || []).length ||
+    (slots.messageAttachments || []).length ||
     (slots.messageFooterItems || []).length
   );
   return hasInstances || hasRenderHooks;
@@ -9225,6 +10018,23 @@ function schedulePluginAutoload() {
 function registerPluginInstance(pluginId, plugin, entry, meta) {
   const key = String(pluginId || "");
   if (!key) return;
+  if (isTenantEmbedActive() && !isTenantPluginAllowed(key)) {
+    unregisterPluginSlots(key);
+    delete app.plugins.registry[key];
+    delete app.plugins.instances[key];
+    upsertPluginInfo({
+      id: key,
+      name: meta?.name || plugin?.name || entry?.name || entry?.id || entry?.path || key,
+      kind: meta?.kind || plugin?.kind || plugin?.type || entry?.kind || "gui",
+      description: meta?.description || plugin?.description || entry?.description || "",
+      status: "not_in_tier",
+      error: "",
+      enabled: false,
+      entry,
+      meta: meta || {},
+    });
+    return;
+  }
   if (app.plugins.registry[key] && app.plugins.instances[key]) {
     if (entry) {
       app.plugins.entries[key] = entry;
@@ -9562,6 +10372,7 @@ function emitLanguageChange(locale, previousLocale) {
 function createPluginHost(fixedPluginId = null) {
   const fixedPid = String(fixedPluginId || "").trim() || null;
   return {
+    getContext: () => getPluginContext(),
     requestLoadPriority(options = {}) {
       const pid = fixedPid || app.plugins.currentRegistering;
       if (!pid) return false;
@@ -9575,6 +10386,7 @@ function createPluginHost(fixedPluginId = null) {
     },
     addToolbarAction(action) {
       const pid = fixedPid || app.plugins.currentRegistering;
+      if (pid && !isPluginEnabled(pid)) return;
       const entry = { pluginId: pid, action };
       app.plugins.slots.toolbar.push(entry);
       const reg = getPluginRegistry(pid);
@@ -9583,6 +10395,7 @@ function createPluginHost(fixedPluginId = null) {
     },
     addTopRightIconRow(nodeOrFactory) {
       const pid = fixedPid || app.plugins.currentRegistering;
+      if (pid && !isPluginEnabled(pid)) return;
       const entry = { pluginId: pid, entry: nodeOrFactory, node: null };
       app.plugins.slots.topRightIconRow.push(entry);
       const reg = getPluginRegistry(pid);
@@ -9591,6 +10404,7 @@ function createPluginHost(fixedPluginId = null) {
     },
     addTranscriptTopbar(nodeOrFactory, side = "right") {
       const pid = fixedPid || app.plugins.currentRegistering;
+      if (pid && !isPluginEnabled(pid)) return;
       const entry = { pluginId: pid, entry: nodeOrFactory, node: null, side };
       app.plugins.slots.transcriptTopbar.push(entry);
       const reg = getPluginRegistry(pid);
@@ -9599,6 +10413,7 @@ function createPluginHost(fixedPluginId = null) {
     },
     addTranscriptBottombar(nodeOrFactory, side = "left") {
       const pid = fixedPid || app.plugins.currentRegistering;
+      if (pid && !isPluginEnabled(pid)) return;
       const entry = { pluginId: pid, entry: nodeOrFactory, node: null, side };
       app.plugins.slots.transcriptBottombar.push(entry);
       const reg = getPluginRegistry(pid);
@@ -9607,11 +10422,59 @@ function createPluginHost(fixedPluginId = null) {
     },
     addComposerLeft(nodeOrFactory) {
       const pid = fixedPid || app.plugins.currentRegistering;
+      if (pid && !isPluginEnabled(pid)) return;
       const entry = { pluginId: pid, entry: nodeOrFactory, node: null };
       app.plugins.slots.composerLeft.push(entry);
       const reg = getPluginRegistry(pid);
       if (reg) reg.composerLeft.push(entry);
       renderComposerLeft();
+    },
+    addPlayground(spec) {
+      const pid = fixedPid || app.plugins.currentRegistering;
+      if (!pid || !spec || typeof spec !== "object") return null;
+      const entry = {
+        ...spec,
+        id: String(spec.id || pid),
+        pluginId: pid,
+        title: String(spec.title || app.plugins.meta?.[pid]?.name || pid),
+      };
+      app.plugins.slots.playgrounds = (app.plugins.slots.playgrounds || []).filter(
+        (item) => !(item.pluginId === pid && item.id === entry.id),
+      );
+      app.plugins.slots.playgrounds.push(entry);
+      const reg = getPluginRegistry(pid);
+      if (reg) {
+        reg.playgrounds = (reg.playgrounds || []).filter((item) => item.id !== entry.id);
+        reg.playgrounds.push(entry);
+      }
+      return entry;
+    },
+    addPlaygroundAsset(spec) {
+      const pid = fixedPid || app.plugins.currentRegistering;
+      if (!pid || !spec || typeof spec !== "object") return null;
+      const entry = {
+        ...spec,
+        pluginId: pid,
+        id: String(spec.id || `${pid}-playground-asset`),
+        targetPluginId: String(spec.targetPluginId || spec.target || "").trim(),
+        area: String(spec.area || "bottom-toolbar").trim().toLowerCase(),
+        priority: Number(spec.priority || 0),
+      };
+      if (!entry.targetPluginId || typeof entry.render !== "function") return null;
+      app.plugins.slots.playgroundAssets = (app.plugins.slots.playgroundAssets || []).filter(
+        (item) => !(item.pluginId === pid && item.id === entry.id),
+      );
+      app.plugins.slots.playgroundAssets.push(entry);
+      const reg = getPluginRegistry(pid);
+      if (reg) {
+        reg.playgroundAssets = (reg.playgroundAssets || []).filter((item) => item.id !== entry.id);
+        reg.playgroundAssets.push(entry);
+      }
+      return entry;
+    },
+    openPlayground(options = {}) {
+      const pid = fixedPid || app.plugins.currentRegistering;
+      return openPluginPlayground(options.pluginId || pid, options);
     },
     addPanelTab(tab) {
       const pid = fixedPid || app.plugins.currentRegistering;
@@ -9640,6 +10503,29 @@ function createPluginHost(fixedPluginId = null) {
         const reg = getPluginRegistry(pid);
         if (reg) reg.messageRenderers.push(entry);
         if (!app.plugins.suppressTranscriptRefresh) renderTranscript();
+      },
+      addMessageAttachment(spec) {
+        const pid = fixedPid || app.plugins.currentRegistering;
+        if (!spec || typeof spec.render !== "function") return null;
+        const entry = {
+          ...spec,
+          pluginId: pid,
+          roles: Array.isArray(spec.roles) && spec.roles.length ? spec.roles : ["assistant"],
+          placement: spec.placement || "bottom-left",
+        };
+        app.plugins.slots.messageAttachments = app.plugins.slots.messageAttachments || [];
+        app.plugins.slots.messageAttachments.push(entry);
+        const reg = getPluginRegistry(pid);
+        if (reg) {
+          reg.messageAttachments = reg.messageAttachments || [];
+          reg.messageAttachments.push(entry);
+        }
+        app.plugins.forceLiveTranscriptRenderOnce = true;
+        if (!app.plugins.suppressTranscriptRefresh) renderTranscript();
+        return entry;
+      },
+      addAssistantMessageAttachment(spec) {
+        return this.addMessageAttachment({ ...(spec || {}), roles: ["assistant"] });
       },
       addMessagePreRenderer(renderer) {
         const pid = fixedPid || app.plugins.currentRegistering;
@@ -9902,8 +10788,20 @@ function createPluginHost(fixedPluginId = null) {
     refreshGuiPluginsDiscovery() {
       return refreshGuiPluginsDiscovery();
     },
+    setTenantPluginAllowList(list) {
+      return setTenantPluginAllowList(list);
+    },
+    applyTenantPluginSettings(settings) {
+      return applyTenantPluginSettings(settings);
+    },
+    saveTenantPluginSettings() {
+      return saveSaasGlobalPluginSettings();
+    },
     login(username, password) {
       return loginWithCredentials(username, password);
+    },
+    applyLoginResponse(data, username) {
+      return applyLoginResponse(data, username);
     },
     logout(announce) {
       return logout(Boolean(announce));
@@ -9929,6 +10827,12 @@ function createPluginHost(fixedPluginId = null) {
     clearAccountActions() {
       const pid = fixedPid || app.plugins.currentRegistering;
       clearAccountActions(pid);
+    },
+    renderAccountMenu() {
+      return renderAccountMenu();
+    },
+    renderChatsOverride() {
+      return renderChatsOverride();
     },
     log: appendLog,
     getState: () => app.state,
@@ -10268,7 +11172,7 @@ function pluginRepoFrontendBase() {
   try {
     const url = new URL(pluginRepoApi());
     const host = String(url.hostname || "").toLowerCase();
-    if (host === "pluginserver.gotchat.ai" || host === "pluginserver.saikick.org") {
+    if (host === "pluginserver.gotchat.ai") {
       return "https://plugins.gotchat.ai";
     }
     url.pathname = "";
@@ -12928,6 +13832,7 @@ function renderComposerLeft() {
   }
   for (const item of extra) {
     if (!app.state.auth.token && pluginNeedsLogin(item.pluginId)) continue;
+    if (item.pluginId && !isPluginEnabled(item.pluginId)) continue;
     if (item.pluginId && !canAccessPlugin(item.pluginId, "view")) continue;
     const entry = item.entry || item;
     let node = item.node || null;
@@ -12952,6 +13857,7 @@ function renderTopRightIconRow() {
   let count = 0;
   for (const item of app.plugins.slots.topRightIconRow || []) {
     if (!app.state.auth.token && pluginNeedsLogin(item.pluginId)) continue;
+    if (item.pluginId && !isPluginEnabled(item.pluginId)) continue;
     if (item.pluginId && !canAccessPlugin(item.pluginId, "view")) continue;
     const entry = item.entry || item;
     let node = item.node || null;
@@ -13039,6 +13945,7 @@ function renderTranscriptBar(kind, shell, notch, wrapper, left, right, entries) 
   let count = 0;
   for (const item of entries || []) {
     if (!app.state.auth.token && pluginNeedsLogin(item.pluginId)) continue;
+    if (item.pluginId && !isPluginEnabled(item.pluginId)) continue;
     if (item.pluginId && !canAccessPlugin(item.pluginId, "view")) continue;
     const entry = item.entry || item;
     let node = item.node || null;
@@ -13291,6 +14198,7 @@ function openPluginPanel(pluginId, options = {}) {
     });
   }
 }
+
 
 
 
