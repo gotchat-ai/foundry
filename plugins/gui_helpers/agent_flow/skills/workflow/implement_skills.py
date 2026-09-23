@@ -2986,7 +2986,7 @@ def _model_guided_repair(
                 messages=_targeted_repair_prompt(skill, candidate_source, previous_source, targets),
                 max_new_tokens=2200,
                 temperature=0.0,
-                top_p=0.0,
+                top_p=1.0,
             )
             parsed = _parse_json_object(_extract_model_text(resp))
         except Exception:
@@ -3001,7 +3001,7 @@ def _model_guided_repair(
             messages=_repair_prompt(skill, candidate_source, previous_source),
             max_new_tokens=2600,
             temperature=0.0,
-            top_p=0.0,
+            top_p=1.0,
         )
         repaired = _strip_code_fences(_extract_model_text(resp))
     except Exception:
