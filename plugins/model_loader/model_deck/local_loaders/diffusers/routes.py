@@ -8,8 +8,10 @@ import builtins
 import contextlib
 import importlib
 import importlib.util
+import importlib.machinery
 import sys
 import sysconfig
+import types
 from runtime_cuda import empty_accelerator_cache, preferred_torch_device
 
 from fastapi import APIRouter, Request, HTTPException
@@ -186,33 +188,42 @@ def _block_cuda_flash_attn_imports(settings: Dict[str, Any]):
     if not _should_block_cuda_flash_attn(settings):
         yield
         return
-    original_import = builtins.__import__
-    original_find_spec = importlib.util.find_spec
-    blocked_prefixes = ("flash_attn", "flash_attn_2_cuda")
     removed_modules = {}
     for module_name in list(sys.modules.keys()):
         if module_name == "flash_attn" or module_name.startswith("flash_attn.") or module_name == "flash_attn_2_cuda":
             removed_modules[module_name] = sys.modules.pop(module_name, None)
 
-    def guarded_find_spec(name, package=None):
-        text = str(name or "")
-        if text == "flash_attn" or text.startswith("flash_attn.") or text == "flash_attn_2_cuda":
-            return None
-        return original_find_spec(name, package)
+    def _unavailable(*args, **kwargs):
+        raise RuntimeError("flash_attn is unavailable for this non-CUDA image generation runtime")
 
-    def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
-        text = str(name or "")
-        if text == "flash_attn" or text.startswith("flash_attn.") or text == "flash_attn_2_cuda":
-            raise ImportError("flash_attn is unavailable for this non-CUDA image generation runtime")
-        return original_import(name, globals, locals, fromlist, level)
+    flash_attn_stub = types.ModuleType("flash_attn")
+    flash_attn_stub.__file__ = "<llmloader2 flash_attn stub>"
+    flash_attn_stub.__spec__ = importlib.machinery.ModuleSpec("flash_attn", loader=None)
+    flash_attn_stub.flash_attn_func = _unavailable
+    flash_attn_stub.flash_attn_qkvpacked_func = _unavailable
+    flash_attn_stub.flash_attn_varlen_func = _unavailable
+    flash_attn_stub.flash_attn_varlen_qkvpacked_func = _unavailable
+    flash_attn_stub.flash_attn_with_kvcache = _unavailable
+    bert_padding_stub = types.ModuleType("flash_attn.bert_padding")
+    bert_padding_stub.__file__ = "<llmloader2 flash_attn bert_padding stub>"
+    bert_padding_stub.__spec__ = importlib.machinery.ModuleSpec("flash_attn.bert_padding", loader=None)
+    bert_padding_stub.index_first_axis = _unavailable
+    bert_padding_stub.index_put_first_axis = _unavailable
+    bert_padding_stub.pad_input = _unavailable
+    bert_padding_stub.unpad_input = _unavailable
+    bert_padding_stub.unpad_input_for_concatenated_sequences = _unavailable
+    cuda_stub = types.ModuleType("flash_attn_2_cuda")
+    cuda_stub.__file__ = "<llmloader2 flash_attn cuda stub>"
+    cuda_stub.__spec__ = importlib.machinery.ModuleSpec("flash_attn_2_cuda", loader=None)
 
-    importlib.util.find_spec = guarded_find_spec
-    builtins.__import__ = guarded_import
+    sys.modules["flash_attn"] = flash_attn_stub
+    sys.modules["flash_attn.bert_padding"] = bert_padding_stub
+    sys.modules["flash_attn_2_cuda"] = cuda_stub
     try:
         yield
     finally:
-        builtins.__import__ = original_import
-        importlib.util.find_spec = original_find_spec
+        for module_name in ("flash_attn", "flash_attn.bert_padding", "flash_attn_2_cuda"):
+            sys.modules.pop(module_name, None)
         for module_name, module in removed_modules.items():
             if module is not None and module_name not in sys.modules:
                 sys.modules[module_name] = module
@@ -568,10 +579,11 @@ def load(request: Request, settings: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 pass
             _apply_token_kwargs(AutoPipelineForText2Image.from_pretrained, extra_kwargs, hf_token)
-            pipe = AutoPipelineForText2Image.from_pretrained(
-                model_id or "Tongyi-MAI/Z-Image-Turbo",
-                **extra_kwargs,
-            )
+            with _block_cuda_flash_attn_imports(settings):
+                pipe = AutoPipelineForText2Image.from_pretrained(
+                    model_id or "Tongyi-MAI/Z-Image-Turbo",
+                    **extra_kwargs,
+                )
         except Exception as exc:
             raise HTTPException(500, f"load failed: {exc}") from exc
     elif use_sdxl_unet:
@@ -610,7 +622,8 @@ def load(request: Request, settings: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 pass
             _apply_token_kwargs(StableDiffusionXLPipeline.from_pretrained, extra_kwargs, hf_token)
-            pipe = StableDiffusionXLPipeline.from_pretrained(base_model_id, **extra_kwargs)
+            with _block_cuda_flash_attn_imports(settings):
+                pipe = StableDiffusionXLPipeline.from_pretrained(base_model_id, **extra_kwargs)
             if timestep_spacing:
                 pipe.scheduler = EulerDiscreteScheduler.from_config(
                     pipe.scheduler.config, timestep_spacing=timestep_spacing
@@ -625,7 +638,8 @@ def load(request: Request, settings: Dict[str, Any]) -> Dict[str, Any]:
                     from diffusers import ControlNetModel, StableDiffusionControlNetPipeline
                 control_kwargs: Dict[str, Any] = {"torch_dtype": torch_dtype}
                 _apply_token_kwargs(ControlNetModel.from_pretrained, control_kwargs, hf_token)
-                controlnet = ControlNetModel.from_pretrained(control_model_id, **control_kwargs)
+                with _block_cuda_flash_attn_imports(settings):
+                    controlnet = ControlNetModel.from_pretrained(control_model_id, **control_kwargs)
                 extra_kwargs = {"controlnet": controlnet, "torch_dtype": torch_dtype}
                 if low_cpu_mem_usage is not None:
                     extra_kwargs["low_cpu_mem_usage"] = low_cpu_mem_usage
@@ -636,7 +650,8 @@ def load(request: Request, settings: Dict[str, Any]) -> Dict[str, Any]:
                 except Exception:
                     pass
                 _apply_token_kwargs(StableDiffusionControlNetPipeline.from_pretrained, extra_kwargs, hf_token)
-                pipe = StableDiffusionControlNetPipeline.from_pretrained(base_model_id, **extra_kwargs)
+                with _block_cuda_flash_attn_imports(settings):
+                    pipe = StableDiffusionControlNetPipeline.from_pretrained(base_model_id, **extra_kwargs)
                 model_id = base_model_id
             elif use_flux:
                 try:
@@ -655,7 +670,8 @@ def load(request: Request, settings: Dict[str, Any]) -> Dict[str, Any]:
                 except Exception:
                     pass
                 _apply_token_kwargs(FluxPipeline.from_pretrained, extra_kwargs, hf_token)
-                pipe = FluxPipeline.from_pretrained(model_id, **extra_kwargs)
+                with _block_cuda_flash_attn_imports(settings):
+                    pipe = FluxPipeline.from_pretrained(model_id, **extra_kwargs)
             elif AutoPipelineForText2Image is not None:
                 extra_kwargs = {"torch_dtype": torch_dtype}
                 if low_cpu_mem_usage is not None:
@@ -667,7 +683,8 @@ def load(request: Request, settings: Dict[str, Any]) -> Dict[str, Any]:
                 except Exception:
                     pass
                 _apply_token_kwargs(AutoPipelineForText2Image.from_pretrained, extra_kwargs, hf_token)
-                pipe = AutoPipelineForText2Image.from_pretrained(model_id, **extra_kwargs)
+                with _block_cuda_flash_attn_imports(settings):
+                    pipe = AutoPipelineForText2Image.from_pretrained(model_id, **extra_kwargs)
             else:
                 extra_kwargs = {"torch_dtype": torch_dtype}
                 if low_cpu_mem_usage is not None:
@@ -679,7 +696,8 @@ def load(request: Request, settings: Dict[str, Any]) -> Dict[str, Any]:
                 except Exception:
                     pass
                 _apply_token_kwargs(DiffusionPipeline.from_pretrained, extra_kwargs, hf_token)
-                pipe = DiffusionPipeline.from_pretrained(model_id, **extra_kwargs)
+                with _block_cuda_flash_attn_imports(settings):
+                    pipe = DiffusionPipeline.from_pretrained(model_id, **extra_kwargs)
         except Exception as exc:
             raise HTTPException(500, f"load failed: {exc}") from exc
 
