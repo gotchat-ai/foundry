@@ -52,10 +52,18 @@ class StaticMountBootstrap:
             self.app.mount("/uploads", StaticFiles(directory=upload_dir), name="uploads")
 
     def _resolve_gui_js_dir(self) -> str:
-        try:
-            return os.path.abspath(os.path.join(os.path.dirname(self.module_file), "gui_js"))
-        except Exception:
-            return os.path.abspath("./gui_js")
+        module_dir = os.path.dirname(os.path.abspath(self.module_file))
+        candidates = [
+            os.environ.get("GUI_JS_DIR", ""),
+            os.path.join(module_dir, "gui_js"),
+            os.path.join(os.path.dirname(module_dir), "gui_js"),
+            os.path.abspath("./gui_js"),
+        ]
+        for candidate in candidates:
+            path = os.path.abspath(str(candidate or "").strip()) if candidate else ""
+            if path and os.path.isdir(path):
+                return path
+        return os.path.abspath(os.path.join(os.path.dirname(module_dir), "gui_js"))
 
     def _mount_gui_js(self, gui_js_dir: str) -> None:
         if not os.path.isdir(gui_js_dir):
