@@ -20,6 +20,55 @@ except Exception:
     EventSourceResponse = None
 
 
+def _positive_int(value: Any) -> int:
+    try:
+        number = int(value)
+    except Exception:
+        return 0
+    return number if number > 0 else 0
+
+
+def _model_context_limit(model: Any) -> int:
+    values: list[int] = []
+    try:
+        getter = getattr(model, "get_max_context_tokens", None)
+        if callable(getter):
+            values.append(_positive_int(getter()))
+    except Exception:
+        pass
+    cfg = getattr(model, "cfg", None)
+    for key in ("ctx_limit_eff", "n_ctx", "ctx_size", "context_length", "max_context_tokens"):
+        try:
+            if isinstance(cfg, dict):
+                values.append(_positive_int(cfg.get(key)))
+            else:
+                values.append(_positive_int(getattr(cfg, key, None)))
+        except Exception:
+            pass
+    try:
+        if isinstance(cfg, dict):
+            yarn_orig_ctx = _positive_int(cfg.get("yarn_orig_ctx"))
+        else:
+            yarn_orig_ctx = _positive_int(getattr(cfg, "yarn_orig_ctx", None))
+        if yarn_orig_ctx:
+            values.append(yarn_orig_ctx)
+    except Exception:
+        pass
+    values = [value for value in values if value > 0]
+    return min(values) if values else 0
+
+
+def _auto_reply_max_tokens(model: Any, settings: dict[str, Any], explicit: Any = None) -> int:
+    requested = _positive_int(explicit)
+    if requested:
+        return requested
+    ctx_limit = _model_context_limit(model)
+    if ctx_limit:
+        reserve = min(512, max(64, int(ctx_limit * 0.05)))
+        return max(1, ctx_limit - reserve)
+    return max(2048, _positive_int((settings or {}).get("max_tokens")) or 2048)
+
+
 class ChatStreamService:
     """Helpers for the detached /v1/chat/completions_stream SSE path."""
 
@@ -88,6 +137,7 @@ class ChatStreamService:
         except Exception:
             pass
 
+        forced_special_route = ""
         try:
             route_id_raw = str(getattr(body, "route_id", None) or "").strip().lower()
             route_settings = ext.get("router_plugin_settings") if isinstance(ext.get("router_plugin_settings"), dict) else {}
@@ -97,7 +147,6 @@ class ChatStreamService:
                 or agent_flow_settings.get("agent_flow_active_flow")
                 or ""
             ).strip()
-            forced_special_route = ""
             if selected_special_flow == "__llm_autoflow__":
                 forced_special_route = "llm_autoflow"
             elif selected_special_flow == "__llm_skill_autoflow__":
@@ -132,6 +181,7 @@ class ChatStreamService:
         try:
             settings["__sid"] = sid
             settings["__pid"] = pid or ""
+            settings["__server_app"] = app
             settings["__model_loader_registry"] = getattr(app.state, "model_loader_registry", None)
             reg = getattr(app.state, "agent_workflow_tools", None)
             if reg is not None and hasattr(reg, "call_tool"):
@@ -569,6 +619,14 @@ class ChatStreamService:
             if ai_jobs:
                 ai_jobs.upsert(job_id, status="running")
             try:
+                if active_model is not None and callable(getattr(active_model, "set_request_context", None)):
+                    active_model.set_request_context({
+                        "ext": ext if isinstance(ext, dict) else {},
+                        "headers": dict(ai_router.core.settings.get("__request_headers") or {}),
+                        "pid": pid or "",
+                        "sid": sid or "",
+                        "username": stream_ctx.get("collab_username") or alias or "",
+                    })
                 if bool(CANCEL.get(turn_id)):
                     try:
                         _emit_diag({"error": "canceled", "turn_id": turn_id})
@@ -588,6 +646,20 @@ class ChatStreamService:
                 #Run AI router inside the queued worker so it never interrupts an active stream.
                 try:
                     try:
+                        route_ids = [str(getattr(r, "id", "") or getattr(r, "route_id", "") or getattr(r, "name", "") or "") for r in getattr(ai_router, "routes", [])]
+                    except Exception:
+                        route_ids = []
+                    try:
+                        requested_route_for_log = str(getattr(body, "route_id", None) or "").strip()
+                    except Exception:
+                        requested_route_for_log = ""
+                    print(
+                        "[chat_stream.router] try_route start "
+                        f"pid={pid!r} sid={sid!r} requested_route={requested_route_for_log!r} "
+                        f"routes={route_ids!r} model={type(active_model).__name__ if active_model is not None else None!r}",
+                        flush=True,
+                    )
+                    try:
                         ai_router.core.settings["__cancel_cb"] = (
                             lambda: bool(CANCEL.get(turn_id))
                         )
@@ -605,10 +677,107 @@ class ChatStreamService:
                         )
                     except Exception:
                         pass
+                    try:
+                        if isinstance(ext, dict):
+                            current_attachments = stream_ctx.get("attachments") or []
+                            db_attachments = []
+                            try:
+                                current_client_msg_id = str(stream_ctx.get("client_msg_id") or "").strip()
+                                collab_db = getattr(app.state, "collab_db", None)
+                                if current_client_msg_id and collab_db is not None and hasattr(collab_db, "list_messages"):
+                                    recent_rows = collab_db.list_messages(pid=pid, sid=sid, limit=8, order_desc=True)
+                                    for row in recent_rows or []:
+                                        if str((row or {}).get("role") or "").lower() != "user":
+                                            continue
+                                        meta_raw = row.get("meta") if isinstance(row, dict) else None
+                                        meta = meta_raw if isinstance(meta_raw, dict) else {}
+                                        if not meta and isinstance(meta_raw, str) and meta_raw.strip():
+                                            try:
+                                                parsed_meta = json.loads(meta_raw)
+                                                meta = parsed_meta if isinstance(parsed_meta, dict) else {}
+                                            except Exception:
+                                                meta = {}
+                                        if not meta:
+                                            try:
+                                                parsed_meta = json.loads(str((row or {}).get("meta_json") or "{}"))
+                                                meta = parsed_meta if isinstance(parsed_meta, dict) else {}
+                                            except Exception:
+                                                meta = {}
+                                        row_msg_id = str((row or {}).get("msg_id") or "").strip()
+                                        row_client_msg_id = str(meta.get("client_msg_id") or "").strip()
+                                        if current_client_msg_id not in {row_msg_id, row_client_msg_id}:
+                                            continue
+                                        attachments = (
+                                            meta.get("attachments")
+                                            or meta.get("media_attachments")
+                                            or meta.get("files")
+                                            or []
+                                        )
+                                        if isinstance(attachments, list) and attachments:
+                                            db_attachments = attachments
+                                            break
+                            except Exception:
+                                db_attachments = []
+                            if db_attachments:
+                                current_attachments = db_attachments
+                            if current_attachments:
+                                ext["attachments"] = current_attachments
+                                ext["media_attachments"] = current_attachments
+                                try:
+                                    attachment_labels = []
+                                    for item in list(current_attachments)[:3]:
+                                        if isinstance(item, dict):
+                                            attachment_labels.append(
+                                                str(
+                                                    item.get("path")
+                                                    or item.get("url")
+                                                    or item.get("name")
+                                                    or item.get("filename")
+                                                    or ""
+                                                )
+                                            )
+                                        else:
+                                            attachment_labels.append(str(item))
+                                    print(
+                                        "[chat_stream.router] router_media "
+                                        f"pid={pid!r} sid={sid!r} count={len(current_attachments)} "
+                                        f"items={attachment_labels!r}",
+                                        flush=True,
+                                    )
+                                except Exception:
+                                    pass
+                            if getattr(body, "ext", None) is not ext:
+                                body.ext = ext
+                    except Exception:
+                        pass
                     handled, route_payload = ai_router.try_route(body)
                 except Exception as e:
-                    print("wrwerwerw: ", e)
-                    handled, route_payload = False, None
+                    print(f"[chat_stream.router] try_route error pid={pid!r} sid={sid!r} error={e!r}", flush=True)
+                    status_code = getattr(e, "status_code", None)
+                    detail = getattr(e, "detail", None)
+                    err_text = str(detail or e or "router_error")
+                    route_hint = ""
+                    try:
+                        route_hint = str(getattr(body, "route_id", "") or "").strip()
+                    except Exception:
+                        route_hint = ""
+                    handled, route_payload = True, {
+                        "route_id": route_hint or "router",
+                        "ok": False,
+                        "error": err_text,
+                        "status_code": status_code,
+                    }
+                else:
+                    route_id = ""
+                    payload_keys = []
+                    if isinstance(route_payload, dict):
+                        route_id = str(route_payload.get("route_id") or route_payload.get("id") or "")
+                        payload_keys = sorted(str(k) for k in route_payload.keys())
+                    print(
+                        "[chat_stream.router] try_route done "
+                        f"pid={pid!r} sid={sid!r} handled={handled} route_id={route_id!r} payload_keys={payload_keys!r}",
+                        flush=True,
+                    )
 
                 if handled:
                     if bool(CANCEL.get(turn_id)):
@@ -655,8 +824,6 @@ class ChatStreamService:
                     TURN_BUS.finish(turn_id, ok=True, ext={"router_result": route_payload})
                     return
 
-
-            
                 # Optional: prompt-level "thinking" summary based on attention.
                 try:
                     thinking = None
@@ -861,12 +1028,13 @@ class ChatStreamService:
                                 approx_tokens = _tok_msgs(msgs)
                             except Exception:
                                 approx_tokens = None
+                            stream_max_tokens = _auto_reply_max_tokens(active_model, _SETTINGS, getattr(body, "max_tokens", None))
                             seq_len = None
                             ctx_limit = None
                             ctx_limit_eff = None
                             try:
                                 if hasattr(active_model, "get_seq_length"):
-                                    seq_len = int(active_model.get_seq_length(msgs, max_new_tokens=int(getattr(body, "max_tokens", None) or _SETTINGS.get("max_tokens", 2048))))
+                                    seq_len = int(active_model.get_seq_length(msgs, max_new_tokens=stream_max_tokens))
                             except Exception:
                                 seq_len = None
                             try:
@@ -910,7 +1078,7 @@ class ChatStreamService:
 
                     stream_iter = active_model.stream_chat(
                         messages=msgs,
-                        max_new_tokens=int(getattr(body, "max_tokens", None) or _SETTINGS.get("max_tokens", 2048)),
+                        max_new_tokens=stream_max_tokens,
                         temperature=float(getattr(body, "temperature", 0.2) or 0.2),
                         top_p=float(getattr(body, "top_p", 0.95) or 0.95),
                         stop=getattr(body, "stop", None),
@@ -1044,12 +1212,11 @@ class ChatStreamService:
             use_assisted = backend_type_req == "hf_assist" and callable(stream_fn_assist)
 
             if use_assisted:
+                assisted_settings = env["settings_getter"]() or {}
+                assisted_max_tokens = _auto_reply_max_tokens(active_model, assisted_settings, getattr(body, "max_tokens", None))
                 stream_iter = stream_fn_assist(
                     messages=msgs,
-                    max_new_tokens=int(
-                        getattr(body, "max_tokens", None)
-                        or env["settings_getter"]().get("max_tokens", 2048)
-                    ),
+                    max_new_tokens=assisted_max_tokens,
                     temperature=float(getattr(body, "temperature", 0.2) or 0.2),
                     top_p=float(getattr(body, "top_p", 0.95) or 0.95),
                     stop=getattr(body, "stop", None),
