@@ -1006,6 +1006,14 @@ function isLLMSkillAutoFlowRouterEnabled(ctx, sid) {
   return enabled.includes("llm_skill_autoflow") && llmSettings.llm_skill_autoflow_enabled !== false;
 }
 
+function enabledAutoFlowRouterIds(ctx, sid) {
+  const ids = [];
+  if (isAutoFlowRouterEnabled(ctx, sid)) ids.push("autoflow");
+  if (isLLMAutoFlowRouterEnabled(ctx, sid)) ids.push("llm_autoflow");
+  if (isLLMSkillAutoFlowRouterEnabled(ctx, sid)) ids.push("llm_skill_autoflow");
+  return ids;
+}
+
 function inferAutoFlowCreatorFlowName(agentSettings = {}, autoSettings = null) {
   const explicitAuto = String(
     autoSettings?.autoflow_creator_flow_name
@@ -1042,7 +1050,7 @@ function looksLikeFileOrArtifactRequest(text) {
 function looksLikeLiveDataOrToolRequest(text) {
   const low = String(text || "").toLowerCase();
   if (!low) return false;
-  return /(latest|today|current|recent|weather|forecast|stock|stocks|share price|price on|market cap|average volume|yahoo finance|world bank|imf|google scholar|arxiv|news|headline|web|online|browse|search|look up|find online|research|database|sql|email)/i.test(low);
+  return /(latest|today|tonight|tomorrow|current|currently|right now|recent|live|ongoing|weather|forecast|stock|stocks|share price|price on|market cap|average volume|yahoo finance|world bank|imf|google scholar|arxiv|news|headline|web|online|browse|search|look up|find online|research|database|sql|email|sports?|mlb|baseball|basketball|football|soccer|hockey|game|games|score|scores|schedule|standings|match|matches)/i.test(low);
 }
 
 function looksLikeStructuredWorkRequest(text) {
@@ -1888,9 +1896,9 @@ function renderFlowAlertDetail(detailNode, state) {
     label.textContent = step.label || step.node_id || "";
     const statusNode = document.createElement("div");
     statusNode.className = "state";
-    let stateText = step.state || "";
-    const output = String(step.output || "").trim();
-    if (output) {
+    let stateText = normalizeFlowStatusText(step.state || "");
+    const output = normalizeFlowStatusText(step.output || "");
+    if (output && !isStatusOnlyFlowText(output)) {
       const short = output.length > 80 ? `${output.slice(0, 77)}...` : output;
       stateText = stateText ? `${stateText} • ${short}` : short;
     }
@@ -2098,9 +2106,9 @@ function updateProgressPanel(ctx, sid) {
     label.textContent = step.label || step.node_id || "";
     const status = document.createElement("div");
     status.className = "state";
-    let stateText = step.state || "";
-    const output = String(step.output || "").trim();
-    if (output) {
+    let stateText = normalizeFlowStatusText(step.state || "");
+    const output = normalizeFlowStatusText(step.output || "");
+    if (output && !isStatusOnlyFlowText(output)) {
       const short = output.length > 64 ? `${output.slice(0, 61)}...` : output;
       stateText = stateText ? `${stateText} • ${short}` : short;
     }
@@ -2366,8 +2374,33 @@ function applyNodeSystemPrompt(messages, prompt) {
   return [...sys, systemMsg, ...rest];
 }
 
+function normalizeFlowStatusText(value) {
+  let text = String(value || "").replace(/\s+/g, " ").trim();
+  if (!text) return "";
+  const statusWords = "done|ok|ready|loaded|executed|preloaded|declared|released|unloaded|failed|skipped|running|queued";
+  text = text.replace(
+    new RegExp(`\\b(${statusWords})\\b(?:\\s*(?:[•,-]?\\s*status:\\s*)?\\b\\1\\b)+`, "gi"),
+    "$1"
+  );
+  text = text.replace(
+    new RegExp(`\\b(done|ok|ready)\\b\\s*[•,-]\\s*status:\\s*\\b(${statusWords})\\b(?:\\s*(?:status:\\s*)?\\b\\2\\b)+`, "gi"),
+    "$1 • status: $2"
+  );
+  text = text.replace(
+    new RegExp(`(?:^|\\s)status:\\s*\\b(${statusWords})\\b(?:\\s*(?:status:\\s*)?\\b\\1\\b)+`, "gi"),
+    " status: $1"
+  );
+  text = text.replace(/\s+/g, " ").trim();
+  return text;
+}
+
+function isStatusOnlyFlowText(value) {
+  const text = normalizeFlowStatusText(value);
+  return /^(?:(?:done|ok|ready)\s*[•,-]\s*)?(?:status:\s*)?(?:done|ok|ready|loaded|executed|preloaded|declared|released|unloaded|failed|skipped|running|queued)$/i.test(text);
+}
+
 function formatFlowStatus(step, idx, totalSteps, data) {
-  const status = String(data?.router_status || "").trim();
+  const status = normalizeFlowStatusText(data?.router_status || "");
   if (!status) return "";
   const label = step?.label || step?.node_id || "Flow step";
   const lines = [`Flow step ${idx + 1}/${totalSteps}: ${label}`];
@@ -2912,21 +2945,37 @@ async function runFlowServer(ctx, payload, flowOverride = "", runOptions = {}) {
       };
     }
   }
-  const mediaState = ctx.state.media_upload || {};
-  const inflight = Array.isArray(mediaState.inflightBySid?.[sid]) ? mediaState.inflightBySid[sid] : [];
-  const pending = Array.isArray(mediaState.pendingBySid?.[sid]) ? mediaState.pendingBySid[sid] : [];
-  const mediaAttachments = inflight.length ? inflight : pending;
-  if (!Array.isArray(ext.attachments) || !ext.attachments.length) {
+  const mediaAttachments = await waitForAgentFlowMediaAttachments(ctx, sid, 30000);
+  const existingAttachments = Array.isArray(ext.attachments) ? ext.attachments : [];
+  const existingReadyAttachments = agentFlowReadyAttachments(existingAttachments);
+  if (existingAttachments.length && existingReadyAttachments.length !== existingAttachments.length) {
+    ctx.log?.(
+      `[agent_flow] replacing ${existingAttachments.length - existingReadyAttachments.length} unfinished media attachment(s) before flow run.`,
+      "warn"
+    );
+  }
+  if (!existingReadyAttachments.length) {
     if (mediaAttachments.length) {
+      attachMediaToExistingLocalMessage(ctx, sid, payload.client_msg_id, mediaAttachments);
+      ctx.log?.(`[agent_flow] forwarding ${mediaAttachments.length} ready media attachment(s) to flow run.`, "info");
       ext.attachments = mediaAttachments.map((att) => ({
         name: att.name || "image",
         mime: att.mime || "",
         path: att.path || att.local_path || "",
-        url: att.download_url || att.url || att.data_url || att.dataUrl || "",
+        url: att.download_url || att.url || "",
         kind: "image",
         source: att.source || "media_upload",
       }));
+    } else {
+      const mediaState = ctx.state.media_upload || {};
+      const inflight = Array.isArray(mediaState.inflightBySid?.[sid]) ? mediaState.inflightBySid[sid] : [];
+      const pending = Array.isArray(mediaState.pendingBySid?.[sid]) ? mediaState.pendingBySid[sid] : [];
+      if (inflight.length || pending.length) {
+        ctx.log?.("[agent_flow] media upload was still unavailable after waiting; starting flow without media attachments.", "warn");
+      }
     }
+  } else if (existingReadyAttachments.length !== existingAttachments.length) {
+    ext.attachments = existingReadyAttachments.map((att) => ({ ...att }));
   }
   if (!ext.base_url && ctx.state?.remote?.serverUrl) {
     ext.base_url = ctx.state.remote.serverUrl;
@@ -3221,8 +3270,8 @@ function applyFlowStatus(ctx, data) {
     ? data.steps.map((s) => ({
         node_id: s?.node_id || "",
         label: s?.label || s?.node_id || "",
-        state: s?.state || "",
-        output: s?.output || "",
+        state: normalizeFlowStatusText(s?.state || ""),
+        output: isStatusOnlyFlowText(s?.output || "") ? "" : normalizeFlowStatusText(s?.output || ""),
       }))
     : [];
   const runState = {
@@ -3233,7 +3282,7 @@ function applyFlowStatus(ctx, data) {
     running: Boolean(data.running),
     paused: normalizeFlowRunFlags(data).paused,
     pauseRequested: normalizeFlowRunFlags(data).pauseRequested,
-    status: data.status || "",
+    status: normalizeFlowStatusText(data.status || ""),
     loopCap: normalizeLoopCapMeta(data),
     steps,
     updatedAt: Date.now(),
@@ -3324,6 +3373,78 @@ async function runBuiltinAutoFlowCandidate(ctx, payload, selection) {
   }
 }
 
+function agentFlowAttachmentReady(att) {
+  if (!att || typeof att !== "object") return false;
+  if (String(att.status || "").toLowerCase() === "error") return false;
+  return Boolean(String(att.path || att.local_path || "").trim() || String(att.download_url || att.url || "").trim());
+}
+
+function agentFlowReadyAttachments(list) {
+  return (Array.isArray(list) ? list : []).filter((att) => agentFlowAttachmentReady(att));
+}
+
+function recentGlobalUploadAttachments(ctx, maxAgeMs = 10 * 60 * 1000) {
+  const nowMs = Date.now();
+  return (Array.isArray(ctx?.state?.pendingUploads) ? ctx.state.pendingUploads : [])
+    .filter((att) => {
+      if (!agentFlowAttachmentReady(att)) return false;
+      const ts = Number(att?.ts_ms || att?.ts || 0);
+      return Number.isFinite(ts) && ts > 0 && nowMs - ts <= maxAgeMs;
+    });
+}
+
+async function waitForAgentFlowMediaAttachments(ctx, sid, timeoutMs = 30000) {
+  const started = Date.now();
+  const mediaState = ctx.state.media_upload || {};
+  while (Date.now() - started < timeoutMs) {
+    const inflight = Array.isArray(mediaState.inflightBySid?.[sid]) ? mediaState.inflightBySid[sid] : [];
+    const pending = Array.isArray(mediaState.pendingBySid?.[sid]) ? mediaState.pendingBySid[sid] : [];
+    const source = inflight.length ? inflight : pending;
+    const ready = agentFlowReadyAttachments(source);
+    if (!ready.length) {
+      const globalReady = recentGlobalUploadAttachments(ctx);
+      if (globalReady.length) return globalReady;
+    }
+    const waiting = source.some((att) => String(att?.status || "").toLowerCase() === "uploading");
+    if (ready.length || !waiting) return ready;
+    await new Promise((resolve) => setTimeout(resolve, 150));
+  }
+  const latestState = ctx.state.media_upload || {};
+  const latestInflight = Array.isArray(latestState.inflightBySid?.[sid]) ? latestState.inflightBySid[sid] : [];
+  const latestPending = Array.isArray(latestState.pendingBySid?.[sid]) ? latestState.pendingBySid[sid] : [];
+  const latestReady = agentFlowReadyAttachments(latestInflight.length ? latestInflight : latestPending);
+  return latestReady.length ? latestReady : recentGlobalUploadAttachments(ctx);
+}
+
+function attachMediaToExistingLocalMessage(ctx, sid, msgId, attachments) {
+  if (!sid || !msgId || !Array.isArray(attachments) || !attachments.length) return;
+  const session = ctx.state.sessions?.[sid];
+  if (!session || !Array.isArray(session.messages)) return;
+  const msg = session.messages.find((m) => String(m?.msg_id || "") === String(msgId || ""));
+  if (!msg) return;
+  msg.meta = msg.meta && typeof msg.meta === "object" ? msg.meta : {};
+  if (!Array.isArray(msg.meta.attachments) || !msg.meta.attachments.length) {
+    msg.meta.attachments = attachments.map((a) => ({ ...a }));
+  }
+  if (!Array.isArray(msg.content)) {
+    const text = String(msg.content || "");
+    const parts = attachments
+      .map((att) => {
+        let url = String(att.download_url || att.url || "").trim();
+        if (url && url.startsWith("/")) {
+          const server = String(ctx.state.remote?.serverUrl || window.location.origin || "").replace(/\/+$/, "");
+          if (server) url = `${server}${url}`;
+        }
+        return url ? { type: "image_url", image_url: { url }, name: att.name || att.filename || "image" } : null;
+      })
+      .filter(Boolean);
+    if (text) parts.push({ type: "text", text });
+    if (parts.length) msg.content = parts;
+  }
+  ctx.saveState?.();
+  if (window.renderTranscript) window.renderTranscript();
+}
+
 
 async function sendHook(payload, ctx) {
   const sid = String(payload.sid || "");
@@ -3338,7 +3459,14 @@ async function sendHook(payload, ctx) {
   }
   const runnable = await ensureRunnableFlowSettings(ctx, sid, pid);
   if (runnable.reason === "no_flow_selected") {
-    if (!isAutoFlowRouterEnabled(ctx, sid)) {
+    const autoFlowRouterIds = enabledAutoFlowRouterIds(ctx, sid);
+    const classicAutoFlowEnabled = autoFlowRouterIds.includes("autoflow");
+    if (!classicAutoFlowEnabled) {
+      const llmRouterIds = autoFlowRouterIds.filter((id) => id !== "autoflow");
+      if (llmRouterIds.length) {
+        ctx.log?.(`[autoflow] No Flow active; ${llmRouterIds.join(", ")} router is enabled, so the backend router will handle this request.`, "info");
+        return payload;
+      }
       ctx.log?.("[autoflow] No Flow active and AutoFlow router is disabled; sending normal assistant response.", "info");
       return payload;
     }
@@ -9927,7 +10055,6 @@ const plugin = {
       const settings = getAgentFlowSettings(ctx, sid);
       if (hasNoFlowSelection(settings)) {
         const ext = payload.ext && typeof payload.ext === "object" ? payload.ext : {};
-        if (ext.agent_flow_active_flow === NO_FLOW_VALUE) return payload;
         return { ...payload, ext: { ...ext, agent_flow_active_flow: NO_FLOW_VALUE } };
       }
       if (hasSpecialFlowSelection(settings)) {
