@@ -20,7 +20,7 @@ SKILLS_ROOT = LLMLOADER_ROOT / "plugins" / "gui_helpers" / "agent_flow" / "skill
 WORKFLOW_ROOT = HERE / "workflows"
 FIXTURE_ROOT = HERE / "fixtures"
 ARTIFACT_ROOT = HERE / "artifacts"
-
+ 
 for candidate in (PROJECT_ROOT, LLMLOADER_ROOT):
     text = str(candidate)
     if text not in sys.path:
