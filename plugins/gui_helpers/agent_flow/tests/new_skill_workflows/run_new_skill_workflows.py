@@ -15,12 +15,13 @@ from typing import Any, Dict, List
 
 HERE = Path(__file__).resolve().parent
 PROJECT_ROOT = HERE.parents[5]
-SKILLS_ROOT = PROJECT_ROOT / "llmloader2" / "plugins" / "gui_helpers" / "agent_flow" / "skills"
+LLMLOADER_ROOT = PROJECT_ROOT / "llmloader2" if (PROJECT_ROOT / "llmloader2").is_dir() else HERE.parents[4]
+SKILLS_ROOT = LLMLOADER_ROOT / "plugins" / "gui_helpers" / "agent_flow" / "skills"
 WORKFLOW_ROOT = HERE / "workflows"
 FIXTURE_ROOT = HERE / "fixtures"
 ARTIFACT_ROOT = HERE / "artifacts"
 
-for candidate in (PROJECT_ROOT, PROJECT_ROOT / "llmloader2"):
+for candidate in (PROJECT_ROOT, LLMLOADER_ROOT):
     text = str(candidate)
     if text not in sys.path:
         sys.path.insert(0, text)
