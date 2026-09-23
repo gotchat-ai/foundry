@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Plugin Playground</title>
+    <link rel="icon" href="data:," />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="./playground.css?ver=20260901-playground-5" />
+  </head>
+  <body>
+    <div class="pg-app" id="playground-app">
+      <header class="pg-header">
+        <a class="pg-scope" id="scope-link" href="./chat_js.htm" aria-label="Return to chat session">
+          <span id="project-name">No project</span>
+          <span class="pg-scope-separator">/</span>
+          <span id="session-name">No session</span>
+        </a>
+        <div class="pg-title" id="plugin-title">Plugin Playground</div>
+        <div class="pg-header-actions">
+          <div class="pg-status" id="connection-status" role="status">
+            <span class="pg-status-dot" aria-hidden="true"></span>
+            <span id="connection-label">Connecting</span>
+          </div>
+          <button class="pg-icon-button" id="settings-button" type="button" title="Plugin settings" aria-label="Plugin settings" disabled>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.5"></circle><path d="M19.4 15a1.7 1.7 0 0 0 .35 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.35 1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.08a1.7 1.7 0 0 0-1-1.55 1.7 1.7 0 0 0-1.87.35l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .35-1.87 1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.08a1.7 1.7 0 0 0 1.55-1 1.7 1.7 0 0 0-.35-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.35A1.7 1.7 0 0 0 9 4.08V4a2 2 0 1 1 4 0v.08a1.7 1.7 0 0 0 1 1.55 1.7 1.7 0 0 0 1.87-.35l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.35 1.87A1.7 1.7 0 0 0 19.92 11H20a2 2 0 1 1 0 4h-.08a1.7 1.7 0 0 0-1.52 1z"></path></svg>
+          </button>
+          <div class="pg-settings-menu" id="settings-menu" role="menu" hidden></div>
+        </div>
+      </header>
+
+      <section class="pg-toolbar-shell pg-toolbar-shell-top collapsed empty" id="top-toolbar-shell">
+        <div class="pg-toolbar" id="top-toolbar"></div>
+        <button class="pg-toolbar-notch" id="top-toolbar-toggle" type="button" aria-label="Toggle top toolbar" aria-expanded="false">
+          <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M2.25 4.25 6 8l3.75-3.75"></path></svg>
+        </button>
+      </section>
+
+      <main class="pg-canvas" id="playground-canvas" aria-live="polite"></main>
+
+      <section class="pg-toolbar-shell pg-toolbar-shell-bottom collapsed empty" id="bottom-toolbar-shell">
+        <button class="pg-toolbar-notch" id="bottom-toolbar-toggle" type="button" aria-label="Toggle bottom toolbar" aria-expanded="false">
+          <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M2.25 7.75 6 4l3.75 3.75"></path></svg>
+        </button>
+        <div class="pg-toolbar" id="bottom-toolbar"></div>
+      </section>
+    </div>
+
+    <dialog class="pg-settings" id="settings-dialog">
+      <div class="pg-settings-header">
+        <h1 id="settings-title">Plugin settings</h1>
+        <button class="pg-icon-button" id="settings-close" type="button" aria-label="Close settings" title="Close settings">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"></path></svg>
+        </button>
+      </div>
+      <div class="pg-settings-body" id="settings-body"></div>
+    </dialog>
+
+    <script type="module" src="./playground.js?ver=20260907-encoding-repair-8"></script>
+  </body>
+</html>
