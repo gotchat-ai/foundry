@@ -28,6 +28,13 @@ class ChatCompletionsService:
         env = self._env_getter()
         app = env["app"]
         model = env["model_getter"]()
+        try:
+            ensure_main = getattr(app.state, "ensure_main_text_llm_loaded", None)
+            preferred = ensure_main() if callable(ensure_main) else None
+            if getattr(preferred, "is_remote_api_model", False):
+                model = preferred
+        except Exception:
+            pass
         if model is None:
             maybe_main = None
             try:
@@ -41,6 +48,8 @@ class ChatCompletionsService:
             model = env["model_getter"]()
         active_model = model
         sid = req.session_id
+        if callable(getattr(active_model, "set_request_context", None)):
+            active_model.set_request_context({"ext": getattr(req, "ext", None) or {}, "sid": sid or ""})
         active_model_id = str(getattr(active_model, "model_id", None) or getattr(active_model, "model_path", None) or "").strip()
         active_model_alias = str(getattr(active_model, "model_id_alias", None) or (os.path.basename(active_model_id) if active_model_id else "")).strip()
         # Basic validation
