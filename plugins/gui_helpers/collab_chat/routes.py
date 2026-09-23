@@ -99,6 +99,55 @@ def _locked_stream(lock: threading.Lock, stream_fn):
             yield piece
 
 
+def _positive_int(value: Any) -> int:
+    try:
+        number = int(value)
+    except Exception:
+        return 0
+    return number if number > 0 else 0
+
+
+def _model_context_limit(model: Any) -> int:
+    values: List[int] = []
+    try:
+        getter = getattr(model, "get_max_context_tokens", None)
+        if callable(getter):
+            values.append(_positive_int(getter()))
+    except Exception:
+        pass
+    cfg = getattr(model, "cfg", None)
+    for key in ("ctx_limit_eff", "n_ctx", "ctx_size", "context_length", "max_context_tokens"):
+        try:
+            if isinstance(cfg, dict):
+                values.append(_positive_int(cfg.get(key)))
+            else:
+                values.append(_positive_int(getattr(cfg, key, None)))
+        except Exception:
+            pass
+    try:
+        if isinstance(cfg, dict):
+            yarn_orig_ctx = _positive_int(cfg.get("yarn_orig_ctx"))
+        else:
+            yarn_orig_ctx = _positive_int(getattr(cfg, "yarn_orig_ctx", None))
+        if yarn_orig_ctx:
+            values.append(yarn_orig_ctx)
+    except Exception:
+        pass
+    values = [value for value in values if value > 0]
+    return min(values) if values else 0
+
+
+def _auto_reply_max_tokens(model: Any, settings: Dict[str, Any], explicit: Any = None) -> int:
+    requested = _positive_int(explicit)
+    if requested:
+        return requested
+    ctx_limit = _model_context_limit(model)
+    if ctx_limit:
+        reserve = min(512, max(64, int(ctx_limit * 0.05)))
+        return max(1, ctx_limit - reserve)
+    return max(2048, _positive_int((settings or {}).get("max_tokens")) or 2048)
+
+
 def _rand_token() -> str:
     return secrets.token_urlsafe(32)
 
@@ -391,7 +440,7 @@ def _looks_like_general_chat(prompt: str) -> bool:
             return True
     if re.search(r"(?:/uploads/|/app/|\.csv\b|\.json\b|\.txt\b|\.pdf\b|\.docx\b|\.pptx\b|\.xlsx\b|\.zip\b|\.html\b|\.htm\b|\.css\b)", low):
         return False
-    if re.search(r"\b(weather|forecast|temperature|news|headline|stock|stocks|ticker|market cap|yahoo finance|world bank|imf|google scholar|arxiv|search the web|go online|browse)\b", low):
+    if re.search(r"\b(weather|forecast|temperature|news|headline|stock|stocks|ticker|market cap|yahoo finance|world bank|imf|google scholar|arxiv|search the web|go online|browse|today|tonight|tomorrow|current|currently|right now|live|ongoing|sports?|mlb|baseball|basketball|football|soccer|hockey|game|games|score|scores|schedule|standings|match|matches)\b", low):
         return False
     if re.search(r"\b(create|draft|write|review|analyze|analyse|compare|summarize|summarise|plan|design|build|run|prepare|make|outline|research|use|turn|convert|generate|inspect|open|read|edit|fix|patch)\b", low):
         return False
@@ -407,7 +456,7 @@ def _looks_like_direct_text_generation(prompt: str) -> bool:
     low = text.lower()
     if _has_explicit_file_or_repo_scope(text):
         return False
-    if re.search(r"\b(weather|forecast|temperature|news|headline|stock|stocks|ticker|market cap|yahoo finance|world bank|imf|google scholar|arxiv|search the web|go online|browse)\b", low):
+    if re.search(r"\b(weather|forecast|temperature|news|headline|stock|stocks|ticker|market cap|yahoo finance|world bank|imf|google scholar|arxiv|search the web|go online|browse|today|tonight|tomorrow|current|currently|right now|live|ongoing|sports?|mlb|baseball|basketball|football|soccer|hockey|game|games|score|scores|schedule|standings|match|matches)\b", low):
         return False
     if re.search(r"\b(zip|archive|bundle|compress|download|export as file|output file)\b", low):
         return False
@@ -512,7 +561,7 @@ def _looks_like_current_context_explanatory_chat(prompt: str) -> bool:
     low = text.lower()
     if re.search(r"(?:/uploads/|/app/|/data/|[a-z]:[\/].+\.(?:csv|json|txt|md|pdf|docx|pptx|xlsx|zip|html|htm|css)\b)", text, flags=re.IGNORECASE):
         return False
-    if re.search(r"\b(weather|forecast|temperature|yahoo finance|world bank|imf|google scholar|arxiv|repo|repository|codebase|workflow|agent flow|agent_workflow)\b", low):
+    if re.search(r"\b(weather|forecast|temperature|yahoo finance|world bank|imf|google scholar|arxiv|repo|repository|codebase|workflow|agent flow|agent_workflow|sports?|mlb|baseball|basketball|football|soccer|hockey|game|games|score|scores|schedule|standings|match|matches)\b", low):
         return False
     has_current = any(tok in low for tok in ("latest", "today", "right now", "recent", "new", "trend", "trends", "headlines", "news", "current affairs", "current events")) or bool(re.search(r"\bcurrent\s+(?:inflation|gdp|unemployment|interest(?:\s+rates?)?|policy|regulation|trend|trends|research|technology|tech|market|economy|ceo|president|prime minister|chair|founder)\b", low))
     has_prompt_shape = bool(re.search(r"\b(what is|what are|how is|how are|why is|why are|explain|summarize|summarise|analyze|analyse|compare|tell me about|who is|who are|who's|what's)\b", low))
@@ -877,6 +926,84 @@ def _looks_like_generic_current_info_answer(prompt: str, answer_text: str) -> bo
     if named_examples >= 3 and len(compact) >= 260:
         return False
     return generic_hits >= 2 or len(compact) < 260
+
+
+def _looks_like_live_capability_prompt(prompt: str) -> bool:
+    low = str(prompt or "").strip().lower()
+    if not low:
+        return False
+    return bool(re.search(
+        r"\b(latest|today|tonight|tomorrow|current|currently|right now|recent|live|ongoing|weather|forecast|temperature|news|headline|stock|stocks|ticker|market cap|yahoo finance|world bank|imf|google scholar|arxiv|search the web|go online|browse|online|sports?|mlb|baseball|basketball|football|soccer|hockey|game|games|score|scores|schedule|standings|match|matches)\b",
+        low,
+    ))
+
+
+def _looks_like_live_capability_refusal(prompt: str, answer_text: str) -> bool:
+    if not _looks_like_live_capability_prompt(prompt):
+        return False
+    prompt_norm = re.sub(r"\s+", " ", str(prompt or "").strip().lower()).strip(" ?!.")
+    answer_norm = re.sub(r"\s+", " ", str(answer_text or "").strip().lower()).strip(" ?!.")
+    if prompt_norm and answer_norm and prompt_norm == answer_norm:
+        return True
+    low = str(answer_text or "").strip().lower()
+    if not low:
+        return True
+    refusal_markers = (
+        "can't access live",
+        "cannot access live",
+        "can't fetch live",
+        "cannot fetch live",
+        "can't see live",
+        "cannot see live",
+        "can't retrieve live",
+        "cannot retrieve live",
+        "can't determine",
+        "cannot determine",
+        "don't have access to live",
+        "do not have access to live",
+        "from here",
+        "without checking a live source",
+        "without checking live",
+        "paste what you see",
+        "share a screenshot",
+        "go to **mlb.com",
+        "go to mlb.com",
+        "go to **espn",
+        "visit mlb.com",
+        "visit espn",
+        "check the mlb",
+        "check espn",
+    )
+    return any(marker in low for marker in refusal_markers)
+
+
+def _first_nested_text(value: Any, keys: Iterable[str] = ("assistant_response", "final_result", "result_text", "text", "content", "response")) -> str:
+    wanted = {str(k or "") for k in keys}
+    seen: set[int] = set()
+
+    def walk(item: Any) -> str:
+        ident = id(item)
+        if ident in seen:
+            return ""
+        if isinstance(item, (dict, list, tuple)):
+            seen.add(ident)
+        if isinstance(item, dict):
+            for key in wanted:
+                text = item.get(key)
+                if isinstance(text, str) and text.strip():
+                    return text.strip()
+            for child in item.values():
+                found = walk(child)
+                if found:
+                    return found
+        elif isinstance(item, (list, tuple)):
+            for child in item:
+                found = walk(child)
+                if found:
+                    return found
+        return ""
+
+    return walk(value)
 
 
 def _structured_authoring_fallback_answer(prompt: str) -> str:
@@ -1445,27 +1572,50 @@ def _repair_common_mojibake(text: str) -> str:
                 score += 4
         score += value.count("\u00e2\u0080") * 3
         score += value.count("\u00c3\u00a2\u00c2\u0080") * 4
+        score += len(re.findall(r"á[º»]", value)) * 6
         return score
 
-    repaired = raw
-    best_score = _suspicion_score(raw)
-    for _ in range(3):
-        improved = False
-        for src_enc, dst_enc in (("latin-1", "utf-8"), ("cp1252", "utf-8")):
+    def _repair_run(run: str) -> str:
+        best = run
+        best_score = _suspicion_score(run)
+        for encoding in ("latin-1", "cp1252"):
             try:
-                candidate = repaired.encode(src_enc, errors="ignore").decode(dst_enc, errors="ignore").strip()
-            except Exception:
-                candidate = ""
-            if not candidate or candidate == repaired:
+                candidate = run.encode(encoding).decode("utf-8")
+            except (UnicodeEncodeError, UnicodeDecodeError):
                 continue
             score = _suspicion_score(candidate)
             if score < best_score:
-                repaired = candidate
-                best_score = score
-                improved = True
-                break
-        if not improved:
+                best, best_score = candidate, score
+        return best
+
+    def _repair_segments(value: str) -> str:
+        output: List[str] = []
+        run: List[str] = []
+        for char in value:
+            encodable = ord(char) <= 0xFF
+            if not encodable:
+                try:
+                    char.encode("cp1252")
+                    encodable = True
+                except UnicodeEncodeError:
+                    pass
+            if encodable:
+                run.append(char)
+            else:
+                if run:
+                    output.append(_repair_run("".join(run)))
+                    run.clear()
+                output.append(char)
+        if run:
+            output.append(_repair_run("".join(run)))
+        return "".join(output)
+
+    repaired = raw
+    for _ in range(8):
+        candidate = _repair_segments(repaired)
+        if candidate == repaired:
             break
+        repaired = candidate
 
     replacements = {
         "\u00e2\u0080\u0099": "'",
@@ -1494,7 +1644,9 @@ def _repair_common_mojibake(text: str) -> str:
     }
     for bad, good in replacements.items():
         repaired = repaired.replace(bad, good)
-    return unicodedata.normalize("NFKC", repaired).strip()
+    repaired = re.sub(r"(?<=\w)�(?=(?:s|t|re|ve|ll|d|m)\b)", "'", repaired, flags=re.I)
+    repaired = re.sub(r"(?<=\d)\s*�\s*(?=\d)", " × ", repaired)
+    return unicodedata.normalize("NFKC", repaired.replace("�", "")).strip()
 
 
 def _strip_reasoning_artifacts(text: str) -> str:
@@ -1616,7 +1768,28 @@ def _service_startup_warmup_state(app: Any) -> Dict[str, Any]:
     }
 
 
-def _service_text_model_available(app: Any) -> bool:
+def _service_active_remote_text_model(app: Any) -> Any:
+    try:
+        services = getattr(getattr(app, "state", None), "plugin_services", None)
+        if not isinstance(services, dict):
+            return None
+        for plugin_id in sorted(services):
+            service = services.get(plugin_id)
+            if not isinstance(service, dict) or service.get("kind") != "remote_text_model":
+                continue
+            getter = service.get("get_active_model")
+            model = getter() if callable(getter) else None
+            if model is not None:
+                return model
+    except Exception:
+        return None
+    return None
+
+
+def _service_resolve_text_model(app: Any) -> Any:
+    remote = _service_active_remote_text_model(app)
+    if remote is not None:
+        return remote
     try:
         state = getattr(app, "state", None)
         getter = getattr(state, "model", None)
@@ -1624,16 +1797,22 @@ def _service_text_model_available(app: Any) -> bool:
     except Exception:
         state = getattr(app, "state", None)
         model = None
-    if model is None:
+    if model is not None:
+        return model
+    try:
+        get_loaded = getattr(state, "get_main_text_llm_if_loaded", None)
+    except Exception:
+        get_loaded = None
+    if callable(get_loaded):
         try:
-            get_loaded = getattr(state, "get_main_text_llm_if_loaded", None)
+            return get_loaded()
         except Exception:
-            get_loaded = None
-        if callable(get_loaded):
-            try:
-                model = get_loaded()
-            except Exception:
-                model = None
+            return None
+    return None
+
+
+def _service_text_model_available(app: Any) -> bool:
+    model = _service_resolve_text_model(app)
     if model is None:
         return False
     try:
@@ -3805,9 +3984,13 @@ class ServiceChatRequest(BaseModel):
     selected_flow: Optional[str] = None
     alias: Optional[str] = None
     client_msg_id: Optional[str] = None
+    route_id: Optional[str] = None
+    router_enabled_plugins: Optional[List[str]] = None
+    ext: Optional[Dict[str, Any]] = None
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
     top_p: Optional[float] = None
+    system: Optional[str] = None
     stream: Optional[bool] = None
     wait_timeout_s: Optional[float] = 90.0
     stream_capture_timeout_s: Optional[float] = 90.0
@@ -4988,6 +5171,35 @@ def install(app) -> None:
         settings_map = router_cfg.get("settings") if isinstance(router_cfg.get("settings"), dict) else {}
         if settings_map:
             payload["ext"]["router_plugin_settings"] = settings_map
+        body_ext = svc.ext if isinstance(getattr(svc, "ext", None), dict) else {}
+        if body_ext:
+            payload["ext"].update(body_ext)
+        requested_plugins: List[str] = []
+        for item in (getattr(svc, "router_enabled_plugins", None) or []):
+            plugin_id = str(item or "").strip()
+            if plugin_id and plugin_id not in requested_plugins:
+                requested_plugins.append(plugin_id)
+        ext_plugins = payload["ext"].get("router_enabled_plugins")
+        if isinstance(ext_plugins, list):
+            for item in ext_plugins:
+                plugin_id = str(item or "").strip()
+                if plugin_id and plugin_id not in requested_plugins:
+                    requested_plugins.append(plugin_id)
+        if isinstance(payload["ext"].get("generic_mpc"), dict) and "generic_mpc" not in requested_plugins:
+            requested_plugins.append("generic_mpc")
+        if not direct_model_only and requested_plugins:
+            enabled_plugins = list(payload.get("router_enabled_plugins") or [])
+            for plugin_id in requested_plugins:
+                if plugin_id not in enabled_plugins:
+                    enabled_plugins.append(plugin_id)
+            payload["router_enabled_plugins"] = enabled_plugins
+            payload["ext"]["router_enabled_plugins"] = enabled_plugins
+        body_route_id = str(getattr(svc, "route_id", "") or payload["ext"].get("route_id") or "").strip()
+        if not direct_model_only and body_route_id:
+            payload["route_id"] = body_route_id
+            if body_route_id not in {"auto", "chat", "none", "__none__"} and body_route_id not in payload["router_enabled_plugins"]:
+                payload["router_enabled_plugins"].append(body_route_id)
+                payload["ext"]["router_enabled_plugins"] = list(payload["router_enabled_plugins"])
         if svc.temperature is not None:
             payload["temperature"] = svc.temperature
         if svc.max_tokens is not None:
@@ -5073,7 +5285,11 @@ def install(app) -> None:
         if isinstance(latest, dict):
             latest_msg_id = str(latest.get("msg_id") or "").strip()
             latest_ts = int(latest.get("ts") or 0)
+            done_meta_for_latest = (stream or {}).get("done") if isinstance((stream or {}).get("done"), dict) else {}
+            done_msg_id = str(done_meta_for_latest.get("msg_id") or "").strip()
             if (previous_msg_id and latest_msg_id == previous_msg_id) or (previous_ts and latest_ts <= previous_ts):
+                latest = None
+            elif done_msg_id and latest_msg_id and latest_msg_id != done_msg_id:
                 latest = None
         if not isinstance(latest, dict):
             stream_text = str((stream or {}).get("text") or "").strip()
@@ -5959,6 +6175,31 @@ def install(app) -> None:
         if action_history:
             last_action = action_history[-1] if isinstance(action_history[-1], dict) else {}
             last_action_text = _strip_reasoning_artifacts(_repair_common_mojibake(str(last_action.get("result_text") or ""))).strip()
+        if not action_history and _looks_like_live_capability_refusal(prompt, assistant_text):
+            try:
+                fallback_result = await _run_autoflow_service_turn(pid, sid, prompt, svc, router_cfg, request)
+                if isinstance(fallback_result, dict):
+                    fallback_text = _first_nested_text(fallback_result)
+                    fallback_inner = fallback_result.get("result")
+                    if fallback_text and not str(fallback_result.get("assistant_response") or "").strip():
+                        fallback_assistant = _service_assistant_message(
+                            db,
+                            pid,
+                            sid,
+                            fallback_text,
+                            client_msg_id=str(svc.client_msg_id or ""),
+                            meta={"llm_autoflow": True, "flow": True, "llm_autoflow_fallback": "autoflow_after_live_refusal"},
+                        )
+                        fallback_result["assistant_response"] = fallback_text
+                        fallback_result["assistant_message"] = fallback_assistant
+                        if isinstance(fallback_inner, dict):
+                            fallback_inner["assistant_message"] = fallback_assistant
+                    fallback_result["llm_autoflow_fallback"] = "autoflow_after_live_refusal"
+                    if isinstance(fallback_inner, dict):
+                        fallback_inner["llm_autoflow_fallback"] = "autoflow_after_live_refusal"
+                    return fallback_result
+            except Exception:
+                pass
         should_rewrite = bool(
             last_action_text
             and (
@@ -6238,6 +6479,7 @@ def install(app) -> None:
         prompt = str(body.message or body.prompt or body.content or "").strip()
         if not prompt:
             raise HTTPException(status_code=400, detail="service_chat_message_required")
+        print(f"[collab_chat.route] service_chat start pid={pid!r} sid={sid!r}", flush=True)
         prefs = db.get_gui_prefs_effective(pid, u.username)
         router_cfg = _extract_router_config_from_prefs(prefs, pid, sid)
         alias = str((prefs.get("alias") if isinstance(prefs, dict) else None) or u.username).strip() or u.username
@@ -6346,9 +6588,18 @@ def install(app) -> None:
         route_with_llm_autoflow = bool(
             (not route_with_llm_skill_autoflow)
             and llm_autoflow_enabled
-            and (llm_autoflow_selected or no_flow_selected)
+            and llm_autoflow_selected
         )
         route_with_autoflow = bool((not route_with_llm_skill_autoflow) and (not route_with_llm_autoflow) and no_flow_selected and autoflow_enabled and not direct_flow_any and not direct_model_chat and not (direct_structured_authoring and not direct_current_context_authoring))
+        print(
+            "[collab_chat.route] service_chat router state "
+            f"pid={pid!r} sid={sid!r} raw_active={raw_active!r} active_flow={active_flow!r} "
+            f"no_flow={no_flow_selected} enabled={list(router_cfg.get('enabled') or [])!r} "
+            f"header_enabled={sorted(header_enabled)!r} direct_flow={direct_flow_any!r} "
+            f"route_llm_skill={route_with_llm_skill_autoflow} route_llm_autoflow={route_with_llm_autoflow} "
+            f"route_autoflow={route_with_autoflow}",
+            flush=True,
+        )
         warmup_state = _service_startup_warmup_state(app)
         if warmup_state.get("active") and direct_general_chat and not text_model_available:
             remaining_s = int(round(float(warmup_state.get("remaining_seconds") or 0.0)))
@@ -8500,9 +8751,20 @@ def install(app) -> None:
         sid: str,
         system_prompt: str,
         limit: int = 80,
+        max_history_chars: int = 18000,
     ) -> List[Dict[str, str]]:
-        """Build ChatCompletion-style messages from the persisted DB log."""
-        msgs = db.list_messages(pid=pid, sid=sid, after_msg_id=None, since_ts=None, limit=limit)
+        """Build a recent, bounded ChatCompletion history from the DB log."""
+        # Fetch the newest rows, then let list_messages restore chronological
+        # order. Ascending LIMIT would permanently select the session's oldest
+        # messages and omit the user's current request in long sessions.
+        msgs = db.list_messages(
+            pid=pid,
+            sid=sid,
+            after_msg_id=None,
+            since_ts=None,
+            limit=limit,
+            order_desc=True,
+        )
 
         # detect multi-author user chat and prefix usernames for clarity
         authors = []
@@ -8513,36 +8775,56 @@ def install(app) -> None:
                     authors.append(au.lower())
         multi_author = len(set(authors)) > 1
 
-        out: List[Dict[str, str]] = []
         sys_txt = (system_prompt or "").strip()
-        if sys_txt:
-            out.append({"role": "system", "content": sys_txt})
+        history: List[Dict[str, str]] = []
 
         for m in msgs:
             role = (m.get("role") or "user").strip() or "user"
             if role not in ("user", "assistant", "system"):
                 role = "user"
             if role == "system":
-                # avoid duplicating system prompts from clients (we manage it above)
                 continue
 
             meta = m.get("meta") if isinstance(m.get("meta"), dict) else {}
-            content = str(m.get("content") or "")
-            if not content.strip():
-                # Ignore empty placeholder rows so the model history does not end in
-                # synthetic assistant messages created only for live streaming.
-                continue
-            if role == "assistant" and meta.get("is_draft"):
+            content = str(m.get("content") or "").strip()
+            if not content or (role == "assistant" and meta.get("is_draft")):
                 continue
             if role == "user" and multi_author:
                 alias = (m.get("author_alias") or m.get("author_username") or "").strip()
                 if alias:
                     content = f"{alias}: {content}"
+            history.append({"role": role, "content": content})
+
+        # Long-running voice sessions can contain many multi-thousand-character
+        # answers. Keep the newest complete turns so the current spoken request
+        # remains prominent and the model's context window is not overrun.
+        budget = max(4000, int(max_history_chars or 18000) - len(sys_txt))
+        selected_rev: List[Dict[str, str]] = []
+        used = 0
+        for item in reversed(history):
+            content = item["content"]
+            cost = len(content) + 16
+            if selected_rev and used + cost > budget:
+                break
+            if not selected_rev and cost > budget:
+                keep = max(1000, budget - 64)
+                half = max(400, keep // 2)
+                content = content[:half].rstrip() + "\n[earlier text omitted]\n" + content[-half:].lstrip()
+                cost = len(content) + 16
+            selected_rev.append({"role": item["role"], "content": content})
+            used += cost
+
+        selected = list(reversed(selected_rev))
+        out: List[Dict[str, str]] = []
+        if sys_txt:
+            out.append({"role": "system", "content": sys_txt})
+
+        for item in selected:
+            role = item["role"]
+            content = item["content"]
             if out and out[-1].get("role") == role:
                 prior = str(out[-1].get("content") or "").strip()
-                current = str(content or "").strip()
-                if current:
-                    out[-1]["content"] = (prior + "\n\n" + current).strip() if prior else current
+                out[-1]["content"] = (prior + "\n\n" + content).strip() if prior else content
                 continue
             out.append({"role": role, "content": content})
 
@@ -8562,19 +8844,17 @@ def install(app) -> None:
     @r.post("/v1/projects/{pid}/sessions/{sid}/model_turn_stream")
     async def model_turn_stream(body: ModelTurnRequest, pid: str, sid: str, request: Request):
     # async def model_turn_stream1(pid: str, sid: str, body: ModelTurnRequest):
-        print(235235234234)
+        print(f"[collab_chat.route] model_turn_stream start pid={pid!r} sid={sid!r}", flush=True)
         require_gui_plugin_enabled(request, gui_plugin_id=GUI_PLUGIN_ID)
         actor = _require_user_or_guest(app, request, pid, sid, alias_value=body.alias)
         u = actor["user"]
 
         # if EventSourceResponse is None:
         #     raise HTTPException(status_code=500, detail="SSE not available")
-        print(34324324324)
         prompt = (body.prompt or "").strip()
         if not prompt:
             raise HTTPException(status_code=400, detail="Empty prompt")
 
-        print(23423523523)
         hub: _SessionHub = app.state.collab_hub
         turn_id = secrets.token_hex(10)
 
@@ -8656,7 +8936,20 @@ def install(app) -> None:
         llm_skill_autoflow_enabled = (("llm_skill_autoflow" in set(router_cfg.get("enabled") or [])) or ("llm_skill_autoflow" in header_enabled)) and llm_skill_autoflow_cfg.get("llm_skill_autoflow_enabled", True) is not False
         llm_autoflow_requested = requested_route_id == "llm_autoflow" or ("llm_autoflow" in requested_plugins)
         llm_skill_autoflow_requested = requested_route_id == "llm_skill_autoflow" or ("llm_skill_autoflow" in requested_plugins)
+        print(
+            "[collab_chat.route] model_turn_stream router state "
+            f"pid={pid!r} sid={sid!r} raw_active={raw_active!r} active_flow={active_flow!r} "
+            f"no_flow={no_flow_selected} enabled={list(router_cfg.get('enabled') or [])!r} "
+            f"header_enabled={sorted(header_enabled)!r} requested_route={requested_route_id!r} "
+            f"requested_plugins={sorted(requested_plugins)!r}",
+            flush=True,
+        )
         if (llm_skill_autoflow_selected or llm_skill_autoflow_requested) and llm_skill_autoflow_enabled:
+            print(
+                "[collab_chat.route] model_turn_stream pre-router branch=llm_skill_autoflow "
+                f"selected={llm_skill_autoflow_selected} requested={llm_skill_autoflow_requested}",
+                flush=True,
+            )
             svc = ServiceChatRequest(
                 message=prompt,
                 alias=body.alias,
@@ -8918,7 +9211,12 @@ def install(app) -> None:
                     pass
 
             return StreamingResponse(_gen_llm_skill_autoflow(), media_type="text/event-stream")
-        if (llm_autoflow_selected or llm_autoflow_requested or (no_flow_selected and llm_autoflow_enabled and "llm_autoflow" in header_enabled)) and llm_autoflow_enabled:
+        if (llm_autoflow_selected or llm_autoflow_requested) and llm_autoflow_enabled:
+            print(
+                "[collab_chat.route] model_turn_stream pre-router branch=llm_autoflow "
+                f"selected={llm_autoflow_selected} requested={llm_autoflow_requested}",
+                flush=True,
+            )
             svc = ServiceChatRequest(
                 message=prompt,
                 alias=body.alias,
@@ -9206,17 +9504,14 @@ def install(app) -> None:
         system_prompt = (getattr(body, "system", None) or sys_default)
         model_msgs = _build_model_messages(pid=pid, sid=sid, system_prompt=system_prompt, limit=90)
 
-        # Pull the active model from app.state (same instance used by /v1/chat/...),
-        # but fall back to the currently loaded main text LLM from Model Deck.
-        model_fn = getattr(app.state, "model", None)
-        model_obj = model_fn() if callable(model_fn) else model_fn
-        if model_obj is None:
-            get_loaded = getattr(app.state, "get_main_text_llm_if_loaded", None)
-            if callable(get_loaded):
-                try:
-                    model_obj = get_loaded()
-                except Exception:
-                    model_obj = None
+        # Resolve the same effective Text LLM used by /v1/chat/completions_stream.
+        # This prefers active remote API providers (OpenAI API) before local models.
+        model_obj = _service_resolve_text_model(app)
+        print(
+            "[collab_chat.route] model_turn_stream normal branch=direct_model_stream "
+            f"pid={pid!r} sid={sid!r} model_type={type(model_obj).__name__ if model_obj is not None else None!r}",
+            flush=True,
+        )
         if model_obj is None or not hasattr(model_obj, "stream_chat"):
             ensure_main = getattr(app.state, "ensure_main_text_llm_loaded", None)
             if callable(ensure_main):
@@ -9235,7 +9530,7 @@ def install(app) -> None:
         #     try:
         #         stream_iter = model_obj.stream_chat(
         #             messages=model_msgs,
-        #             max_new_tokens=int(req.max_tokens or settings.get("max_tokens", 512)),
+        #             max_new_tokens=int(req.max_tokens or settings.get("max_tokens", 2048)),
         #             temperature=float(req.temperature if req.temperature is not None else settings.get("temperature", 0.2)),
         #             top_p=float(req.top_p if req.top_p is not None else settings.get("top_p", 0.95)),
         #             stop=req.stop,
@@ -9259,9 +9554,25 @@ def install(app) -> None:
                 model_key = f"inst:{id(model_obj)}"
                 lock = lock_fn(model_key) if callable(lock_fn) else None
                 def _stream():
+                    stream_max_tokens = _auto_reply_max_tokens(model_obj, settings, body.max_tokens)
+                    if callable(getattr(model_obj, "set_request_context", None)):
+                        try:
+                            model_obj.set_request_context({
+                                "ext": {
+                                    "project_id": pid,
+                                    "session_id": sid,
+                                    "sid": sid,
+                                },
+                                "headers": dict(request.headers),
+                                "pid": pid,
+                                "sid": sid,
+                                "username": u.username,
+                            })
+                        except Exception:
+                            pass
                     return model_obj.stream_chat(
                         messages=model_msgs,
-                        max_new_tokens=int(body.max_tokens or settings.get("max_tokens", 512)),
+                        max_new_tokens=stream_max_tokens,
                         temperature=float(body.temperature if body.temperature is not None else settings.get("temperature", 0.2)),
                         top_p=float(body.top_p if body.top_p is not None else settings.get("top_p", 0.95)),
                         stop=body.stop,
