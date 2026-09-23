@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 import urllib.request
+import urllib.error
 from urllib.request import urlopen
 from runtime_cuda import cuda_available_safe, xpu_available_safe
 
@@ -37,7 +38,7 @@ from fastapi import APIRouter, Request, HTTPException
 from pydantic import BaseModel, Field
 
 from plugins.gui_helpers._framework.utils import require_gui_plugin_enabled
-from plugins.gui_helpers._framework.services import register_plugin_service
+from plugins.gui_helpers._framework.services import get_plugin_service, register_plugin_service
 from plugins.model_loader.model_deck import compat_registry
 from plugins.gui_helpers.agent_flow.model_workflow_process import ModelWorkflowProcessManager
 
@@ -50,7 +51,36 @@ def _require_model_deck_permission(app: Any, request: Request, permission_key: s
         from plugins.gui_helpers.permissions_manager.core import require_permission
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"permissions unavailable: {exc}") from exc
-    return require_permission(app, request, permission_key, detail=detail)
+    try:
+        return require_permission(app, request, permission_key, detail=detail)
+    except HTTPException as permission_error:
+        collab = get_plugin_service(app, "collab_chat")
+        require_user = collab.get("require_user") if isinstance(collab, dict) else None
+        if not callable(require_user):
+            raise permission_error
+        user = require_user(request)
+        username = str(getattr(user, "username", "") or "")
+        collab_role = str(getattr(user, "role", "") or "").lower()
+        sass_db = getattr(app.state, "sass_auth_db", None)
+        biz_db = getattr(app.state, "biz_auth_db", None)
+        sass_context = sass_db.user_context(username) if sass_db is not None and hasattr(sass_db, "user_context") else None
+        biz_context = biz_db.user_context(username) if biz_db is not None and hasattr(biz_db, "user_context") else None
+        sass_role = str((sass_context or {}).get("role") or "").lower()
+        biz_role = str((biz_context or {}).get("role") or "").lower()
+        sass_superadmin = bool(sass_context) and (collab_role == "admin" or sass_role in {"superadmin", "super_admin"})
+        sass_business_admin = bool(sass_context) and sass_role in {"admin", "business_admin", "owner"}
+        business_owner = bool(biz_context) and biz_role in {"superadmin", "super_admin", "admin", "business_admin", "owner"}
+        allowed = sass_superadmin or business_owner
+        if permission_key == "model_deck.view":
+            allowed = allowed or sass_business_admin
+        if not allowed:
+            raise permission_error
+        return {
+            "username": username,
+            "role": sass_role or biz_role or collab_role,
+            "is_admin": bool(sass_superadmin or business_owner),
+            "tenant_admin": True,
+        }
 
 
 def _process_meta_map(app: Any) -> Dict[str, Any]:
@@ -232,8 +262,17 @@ def _post_llama_manager_json(
         if x_auth_token:
             headers["X-Auth-Token"] = x_auth_token
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-    with urlopen(req, timeout=_llama_manager_timeout(timeout_seconds)) as resp:
-        body = resp.read() or b"{}"
+    try:
+        with urlopen(req, timeout=_llama_manager_timeout(timeout_seconds)) as resp:
+            body = resp.read() or b"{}"
+    except urllib.error.URLError as exc:
+        reason = str(getattr(exc, "reason", exc) or exc)
+        if "10061" in reason or "connection refused" in reason.lower() or "actively refused" in reason.lower():
+            raise RuntimeError(
+                f"llama manager service is not reachable at {_llama_manager_base()}; "
+                "start llama_server/start_host_service on port 8767 and try again"
+            ) from exc
+        raise
     return json.loads(body.decode("utf-8", errors="ignore"))
 
 
@@ -1027,6 +1066,13 @@ class WorkflowReadinessRequest(BaseModel):
     settings: Dict[str, Any] = Field(default_factory=dict)
 
 
+class ModelWorkflowListRequest(BaseModel):
+    type_id: str
+    model_id: Optional[str] = None
+    pid: Optional[str] = "default"
+    settings: Dict[str, Any] = Field(default_factory=dict)
+
+
 _LTX_MODEL_WORKFLOW_TEMPLATE_FLOW = "Models / Unsloth LTX 2.3 GGUF"
 
 
@@ -1103,6 +1149,7 @@ _WORKFLOW_SETTING_KEYS = {
     "model_workflow_attached_flows",
     "model_workflow_flow_name",
     "model_workflow_id",
+    "model_workflow_template_flow_name",
     "model_workflow_bindings",
     "workflow_loader_mode",
     "workflow_node_lifecycle_policy",
@@ -1308,7 +1355,19 @@ def _model_workflow_safe_name(model_id: str) -> str:
 def _model_workflow_name_for_model(type_id: str, model_id: str, template_flow_name: str = "") -> str:
     safe = _model_workflow_safe_name(model_id)
     template = str(template_flow_name or _LTX_MODEL_WORKFLOW_TEMPLATE_FLOW).strip()
-    suffix = "LTX 2.3 GGUF" if "ltx" in template.lower() else "Workflow"
+    template_lower = template.lower()
+    if "ltx" in template_lower:
+        suffix = "LTX 2.3 GGUF"
+    elif "wan2.2" in template_lower or "wan 2.2" in template_lower or "wan22" in template_lower:
+        suffix = "Wan2.2 I2V GGUF" if "i2v" in template_lower else "Wan2.2 T2V GGUF"
+    elif "wan2.1" in template_lower or "wan 2.1" in template_lower or "wan21" in template_lower:
+        suffix = "Wan2.1 I2V Workflow" if "i2v" in template_lower else "Wan2.1 T2V Workflow"
+    elif "minimax" in template_lower or "ref2va" in template_lower:
+        suffix = "MiniMax H3 REF2VA GGUF"
+    elif "hunyuan" in template_lower or "hunyu" in template_lower:
+        suffix = "HunyuanVideo I2V GGUF" if "i2v" in template_lower else "HunyuanVideo T2V GGUF"
+    else:
+        suffix = "Workflow"
     return f"Models / {safe} / {suffix}"
 
 
@@ -1380,6 +1439,13 @@ def _collect_asset_sources(*sources: Dict[str, Any]) -> Dict[str, Any]:
 def _model_workflow_asset_and_setting_values(model: Dict[str, Any], type_id: str = "") -> tuple[Dict[str, Any], Dict[str, Any]]:
     settings = dict((model or {}).get("settings") or {})
     model_id = str((model or {}).get("model_id") or "").strip()
+    model_tokens = _model_workflow_family_tokens(
+        model_id,
+        settings.get("model_family"),
+        settings.get("workflow_variant"),
+        settings.get("model_deck_compat_manifest_id"),
+        settings.get("tested_profile_id"),
+    )
     runtime_assets = _parse_json_dict(settings.get("video_runtime_assets_json") or settings.get("image_runtime_assets_json"))
     runtime_params = _parse_json_dict(settings.get("video_runtime_params_json") or settings.get("image_runtime_params_json"))
     asset_key_names = {
@@ -1403,6 +1469,8 @@ def _model_workflow_asset_and_setting_values(model: Dict[str, Any], type_id: str
             if value in (None, "", [], {}):
                 continue
             key_text = str(key)
+            if not _model_workflow_setting_key_matches_family(key_text, model_tokens):
+                continue
             if key_text in asset_key_names or key_text.endswith("_path"):
                 asset_values[key_text] = value
     asset_sources = _collect_asset_sources(runtime_assets, settings)
@@ -1415,6 +1483,10 @@ def _model_workflow_asset_and_setting_values(model: Dict[str, Any], type_id: str
             if value in (None, "", [], {}):
                 continue
             key_text = str(key)
+            if key_text in {"model_workflow_id", "agent_flow_default_workflow_id", "model_workflow_attached_flows"}:
+                continue
+            if not _model_workflow_setting_key_matches_family(key_text, model_tokens):
+                continue
             if key_text in {"video_runtime_template_json", "video_runtime_assets_json", "video_runtime_params_json", "image_runtime_template_json", "image_runtime_assets_json", "image_runtime_params_json"}:
                 continue
             settings_values[key_text] = value
@@ -1503,6 +1575,151 @@ def _hydrate_model_workflow_flow(flow: Dict[str, Any], model: Dict[str, Any], ty
     }
     hydrated["metadata"] = meta
     return hydrated
+
+
+def _load_generated_model_workflow_templates(app: Any, wanted_template: str = "") -> Dict[str, Dict[str, Any]]:
+    base = getattr(getattr(app, "state", None), "data_dir", None) or getattr(getattr(app, "state", None), "workdir", None)
+    root = Path(str(base or Path(__file__).resolve().parents[3] / "data")).resolve() / "generated" / "workflow_blueprints"
+    if not root.is_dir():
+        return {}
+    wanted = str(wanted_template or "").strip().lower()
+    out: Dict[str, Dict[str, Any]] = {}
+    try:
+        entries = list(root.iterdir())
+    except Exception:
+        return {}
+    for entry in entries:
+        if not entry.is_dir():
+            continue
+        manifest_path = entry / "agent_flow_manifest.json"
+        if not manifest_path.is_file():
+            continue
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        workflow_file = str(manifest.get("workflow_file") or "").strip()
+        if not workflow_file:
+            continue
+        workflow_path = entry / workflow_file
+        if not workflow_path.is_file():
+            continue
+        try:
+            doc = json.loads(workflow_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        flows = doc.get("flows") if isinstance(doc, dict) else None
+        if not isinstance(flows, dict):
+            continue
+        for name, flow in flows.items():
+            if not isinstance(flow, dict):
+                continue
+            runtime = flow.get("runtime") if isinstance(flow.get("runtime"), dict) else {}
+            engine = str(runtime.get("engine") or "").strip()
+            flow_id = str(flow.get("workflow_id") or "").strip()
+            name_text = str(name or "").strip()
+            manifest_names = {
+                str(manifest.get("root_flow") or "").strip(),
+                *[str(x or "").strip() for x in (manifest.get("flow_names") or [])],
+                name_text,
+                str(flow.get("flow_name") or "").strip(),
+            }
+            name_lows = {x.lower() for x in manifest_names if x}
+            is_model_workflow = engine == "model_deck.workflow_model_loader" or flow_id.startswith("models.")
+            if not is_model_workflow:
+                continue
+            if wanted and wanted not in name_lows and not any(wanted in x or x in wanted for x in name_lows):
+                if not ("ltx" in wanted and any("ltx" in x for x in name_lows)):
+                    continue
+            if name_text:
+                out.setdefault(name_text, flow)
+            for alias in manifest_names:
+                alias = str(alias or "").strip()
+                if alias:
+                    out.setdefault(alias, flow)
+            if flow_id == "models.unsloth_ltx23_gguf":
+                out.setdefault(_LTX_MODEL_WORKFLOW_TEMPLATE_FLOW, flow)
+    return out
+
+
+def _is_model_workflow_flow(flow: Dict[str, Any], flow_name: str = "") -> bool:
+    if not isinstance(flow, dict):
+        return False
+    runtime = flow.get("runtime") if isinstance(flow.get("runtime"), dict) else {}
+    engine = str(runtime.get("engine") or "").strip()
+    workflow_id = str(flow.get("workflow_id") or flow.get("id") or "").strip()
+    text = " ".join([
+        str(flow_name or ""),
+        str(flow.get("flow_name") or ""),
+        str(flow.get("name") or ""),
+        str(flow.get("category") or ""),
+        workflow_id,
+        engine,
+    ]).lower()
+    if engine == "model_deck.workflow_model_loader" or workflow_id.startswith("models."):
+        return True
+    if "models /" in text and "workflow" in text:
+        return True
+    if str(flow_name or "").strip().lower().startswith("models /"):
+        return bool(_model_workflow_family_tokens(flow_name, flow.get("name"), flow.get("model_workflow_variant"), flow.get("settings")))
+    return False
+
+
+def _legacy_project_workflow_flows(app: Any, pid: str) -> Dict[str, Dict[str, Any]]:
+    safe_pid = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(pid or "default").strip() or "default")
+    candidates: List[Path] = []
+    app_state = getattr(app, "state", None)
+    for attr in ("DATA_DIR", "data_dir", "llmloader_data_dir"):
+        value = getattr(app_state, attr, None)
+        if value:
+            candidates.append(Path(str(value)) / "projects" / "agent_flow" / f"{safe_pid}.json")
+    candidates.append(Path(os.getcwd()) / "data" / "projects" / "agent_flow" / f"{safe_pid}.json")
+    candidates.append(Path(__file__).resolve().parents[3] / "data" / "projects" / "agent_flow" / f"{safe_pid}.json")
+
+    out: Dict[str, Dict[str, Any]] = {}
+    seen_paths: set[str] = set()
+    for path in candidates:
+        try:
+            resolved_key = str(path.resolve())
+        except Exception:
+            resolved_key = str(path)
+        if resolved_key in seen_paths:
+            continue
+        seen_paths.add(resolved_key)
+        if not path.exists():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        flows = data.get("flows") if isinstance(data, dict) else {}
+        if not isinstance(flows, dict):
+            continue
+        for name, flow in flows.items():
+            if not isinstance(flow, dict):
+                continue
+            row_name = str(flow.get("flow_name") or name or "").strip()
+            if row_name:
+                out.setdefault(row_name, dict(flow))
+    return out
+
+
+def _global_model_workflow_template_flows(app: Any, store: Any, ctx: Dict[str, Any], wanted_template: str = "") -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    for source_flows in (
+        store.load_default_flows(ctx),
+        store.load_project_flows(ctx, "default"),
+        _legacy_project_workflow_flows(app, "default"),
+    ):
+        if not isinstance(source_flows, dict):
+            continue
+        for name, flow in source_flows.items():
+            if _is_model_workflow_flow(flow, str(name)):
+                out.setdefault(str(name), flow)
+    for name, flow in _load_generated_model_workflow_templates(app, wanted_template).items():
+        if _is_model_workflow_flow(flow, str(name)):
+            out.setdefault(str(name), flow)
+    return out
 
 
 def _model_deck_models_dir_for_settings(app: Any, settings: Optional[Dict[str, Any]] = None) -> Path:
@@ -1734,7 +1951,11 @@ def _legacy_project_workflow_record(app: Any, pid: str, workflow_name: str = "",
                 continue
             row_name = str(flow.get("flow_name") or name or "").strip()
             wid = str(flow.get("workflow_id") or flow.get("id") or "").strip()
-            if (workflow_id and wid == workflow_id) or (workflow_name and row_name == workflow_name):
+            if workflow_name and row_name != workflow_name:
+                continue
+            if not workflow_name and workflow_id and wid != workflow_id:
+                continue
+            if workflow_name or workflow_id:
                 flow_copy = dict(flow)
                 if row_name and not flow_copy.get("flow_name"):
                     flow_copy["flow_name"] = row_name
@@ -1754,14 +1975,28 @@ def _selected_workflow_record(app: Any, pid: str, workflow_name: str = "", workf
     records = _workflow_store.project_flow_records(ctx, str(pid or "default").strip() or "default")
     by_id, by_name = _workflow_rows_by_id_and_name(records)
     row: Dict[str, Any] = {}
-    if workflow_id and workflow_id in by_id:
-        row = by_id[workflow_id]
-    elif workflow_name and workflow_name in by_name:
+    if workflow_name and workflow_name in by_name:
+        # Trust the human-visible selected workflow name over a saved id. Some
+        # older model settings kept a stale model_workflow_id after the user
+        # changed the dropdown, which made readiness/open actions resolve a
+        # completely different model workflow.
         row = by_name[workflow_name]
+    elif workflow_id and workflow_id in by_id:
+        row = by_id[workflow_id]
     if not row:
         fallback = _legacy_project_workflow_record(app, pid, workflow_name, workflow_id)
         if fallback[0]:
             return fallback
+        global_templates = _global_model_workflow_template_flows(app, _workflow_store, ctx, workflow_name)
+        flow = global_templates.get(workflow_name) if workflow_name else None
+        if not isinstance(flow, dict) and workflow_id:
+            for candidate_name, candidate_flow in global_templates.items():
+                if isinstance(candidate_flow, dict) and str(candidate_flow.get("workflow_id") or candidate_flow.get("id") or "").strip() == workflow_id:
+                    flow = candidate_flow
+                    workflow_name = str(candidate_name)
+                    break
+        if isinstance(flow, dict):
+            return dict(flow), str(workflow_name or flow.get("flow_name") or "").strip(), str(flow.get("workflow_id") or flow.get("id") or workflow_id or "").strip()
         return {}, "", ""
     return dict(row.get("flow_json") or {}), str(row.get("flow_name") or workflow_name or "").strip(), str(row.get("workflow_id") or row.get("id") or workflow_id or "").strip()
 
@@ -1890,6 +2125,215 @@ def _build_model_workflow_readiness(app: Any, req: WorkflowReadinessRequest) -> 
     }
 
 
+def _model_workflow_family_tokens(*values: Any) -> set[str]:
+    text = " ".join(str(value or "") for value in values).replace("\\", "/").lower()
+    tokens: set[str] = set()
+    if "wan2.2" in text or "wan22" in text or "wan_2.2" in text:
+        tokens.add("wan22")
+        if "i2v" in text or "image-to-video" in text or "image_to_video" in text:
+            tokens.add("wan22_i2v")
+        if "t2v" in text or "text-to-video" in text or "text_to_video" in text:
+            tokens.add("wan22_t2v")
+    if "wan2.1" in text or "wan21" in text or "wan_2.1" in text:
+        tokens.add("wan21")
+        if "i2v" in text or "image-to-video" in text or "image_to_video" in text:
+            tokens.add("wan21_i2v")
+        if "t2v" in text or "text-to-video" in text or "text_to_video" in text:
+            tokens.add("wan21_t2v")
+    if "ltx-2.3" in text or "ltx 2.3" in text or "ltx23" in text or "unsloth_ltx" in text:
+        tokens.add("ltx23")
+    if "minimax" in text or "h3_ref2va" in text or "ref2va" in text:
+        tokens.add("minimax_h3")
+    if "hunyuan" in text or "hunyu" in text:
+        tokens.add("hunyuan")
+        if "i2v" in text or "image-to-video" in text or "image_to_video" in text:
+            tokens.add("hunyuan_i2v")
+        if "t2v" in text or "text-to-video" in text or "text_to_video" in text:
+            tokens.add("hunyuan_t2v")
+    if "flux" in text:
+        tokens.add("flux")
+    if "z-image" in text or "zimage" in text:
+        tokens.add("zimage")
+    if "sdxl" in text or "stable-diffusion-xl" in text:
+        tokens.add("sdxl")
+    return tokens
+
+
+def _model_workflow_family_matches(model_tokens: set[str], flow_tokens: set[str]) -> bool:
+    if not model_tokens or not flow_tokens:
+        return True
+    exact_tokens = {token for token in model_tokens if "_" in token}
+    flow_exact = {token for token in flow_tokens if "_" in token}
+    if exact_tokens or flow_exact:
+        return bool((exact_tokens or model_tokens) & (flow_exact or flow_tokens))
+    return bool(model_tokens & flow_tokens)
+
+
+def _model_workflow_setting_key_matches_family(key: str, model_tokens: set[str]) -> bool:
+    lower = str(key or "").strip().lower()
+    if not lower:
+        return False
+    if not model_tokens:
+        return True
+    family_prefixes = {
+        "ltx23": ("ltx_", "gemma_", "distilled_lora_", "native_stage1_", "native_stage2_"),
+        "wan22": ("wan_", "wan22_", "i2v_", "t2v_", "high_noise_", "low_noise_", "use_wan", "use_wan_vae"),
+        "wan21": ("wan_", "wan21_", "i2v_", "t2v_", "high_noise_", "low_noise_", "use_wan", "use_wan_vae"),
+        "hunyuan": ("hunyuan_",),
+        "minimax_h3": ("minimax_", "ref2va_", "fl2va_"),
+    }
+    key_tokens = {family for family, prefixes in family_prefixes.items() if lower.startswith(prefixes)}
+    if not key_tokens:
+        return True
+    if key_tokens & model_tokens:
+        return True
+    if "wan22" in key_tokens and any(token.startswith("wan22") for token in model_tokens):
+        return True
+    if "wan21" in key_tokens and any(token.startswith("wan21") for token in model_tokens):
+        return True
+    if "hunyuan" in key_tokens and any(token.startswith("hunyuan") for token in model_tokens):
+        return True
+    if "minimax_h3" in key_tokens and "minimax_h3" in model_tokens:
+        return True
+    return False
+
+
+def _workflow_matches_model_type(flow: Dict[str, Any], name: str, type_id: str, model_settings: Optional[Dict[str, Any]] = None, model_id: str = "") -> bool:
+    if not isinstance(flow, dict):
+        return False
+    type_text = str(type_id or "").strip()
+    if type_text not in {"image_gen", "video_gen"}:
+        return False
+    meta = flow.get("metadata") if isinstance(flow.get("metadata"), dict) else {}
+    deck_meta = meta.get("model_deck") if isinstance(meta.get("model_deck"), dict) else {}
+    deck_type = str(deck_meta.get("type_id") or "").strip()
+    if deck_type:
+        if deck_type != type_text:
+            return False
+    text = " ".join([
+        str(name or ""),
+        str(flow.get("flow_name") or ""),
+        str(flow.get("category") or ""),
+        str(flow.get("workflow_id") or ""),
+        str(deck_meta.get("model_id") or ""),
+        str(deck_meta.get("template_flow_name") or ""),
+    ]).lower()
+    if type_text == "image_gen":
+        broad_match = "image" in text or "flux" in text or "sdxl" in text or "z-image" in text
+    else:
+        broad_match = "video" in text or "ltx" in text or "wan" in text or "hunyuan" in text or "minimax" in text
+    if not broad_match:
+        return False
+    settings = model_settings if isinstance(model_settings, dict) else {}
+    model_tokens = _model_workflow_family_tokens(
+        model_id,
+        settings.get("model_id"),
+        settings.get("model_family"),
+        settings.get("workflow_variant"),
+        settings.get("model_deck_compat_manifest_id"),
+        settings.get("tested_profile_id"),
+        settings.get("model_workflow_template_flow_name"),
+        settings.get("hf_source_repo_id"),
+        settings.get("hf_source_filename"),
+    )
+    flow_tokens = _model_workflow_family_tokens(
+        name,
+        flow.get("flow_name"),
+        flow.get("category"),
+        flow.get("workflow_id"),
+        flow.get("id"),
+        deck_meta.get("model_id"),
+        deck_meta.get("template_flow_name"),
+    )
+    return _model_workflow_family_matches(model_tokens, flow_tokens)
+
+
+def _list_model_workflow_choices(app: Any, req: ModelWorkflowListRequest) -> Dict[str, Any]:
+    try:
+        from plugins.gui_helpers.agent_flow.skills.workflow import _workflow_store
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Agent Flow workflow store unavailable: {exc}") from exc
+    type_id = str(req.type_id or "").strip()
+    model_id = str(req.model_id or "").strip()
+    pid = str(req.pid or "default").strip() or "default"
+    incoming_settings = dict(req.settings or {})
+    deck = _ensure_defaults(_load_deck(app))
+    model: Dict[str, Any] = {}
+    try:
+        t = _get_type(deck, type_id)
+        found = _find_model_by_deck_or_runtime_id(t, model_id) if model_id else None
+        if isinstance(found, dict):
+            model = found
+    except Exception:
+        model = {}
+    model_settings = {**dict(model.get("settings") or {}), **incoming_settings}
+    ctx = {"app": app, "pid": pid}
+    source_flows: Dict[str, Dict[str, Any]] = {}
+    for flows in (
+        _workflow_store.load_project_flows(ctx, pid),
+        _global_model_workflow_template_flows(app, _workflow_store, ctx, str(model_settings.get("model_workflow_template_flow_name") or "")),
+    ):
+        if not isinstance(flows, dict):
+            continue
+        for name, flow in flows.items():
+            if isinstance(flow, dict):
+                source_flows.setdefault(str(name), flow)
+
+    rows_by_name: Dict[str, Dict[str, Any]] = {}
+
+    def add_row(name: str, workflow_id: str = "", *, source: str = "workflow", attached: bool = False, selected: bool = False) -> None:
+        name = str(name or "").strip()
+        if not name:
+            return
+        flow = source_flows.get(name)
+        if flow is not None and not _workflow_matches_model_type(flow, name, type_id, model_settings, model_id):
+            return
+        if not workflow_id and isinstance(flow, dict):
+            workflow_id = str(flow.get("workflow_id") or flow.get("id") or "").strip()
+        existing = rows_by_name.get(name) or {}
+        rows_by_name[name] = {
+            "name": name,
+            "workflow_id": str(workflow_id or existing.get("workflow_id") or "").strip(),
+            "source": str(existing.get("source") or source),
+            "attached": bool(existing.get("attached") or attached),
+            "selected": bool(existing.get("selected") or selected),
+            "global_template": bool(existing.get("global_template") or source in {"global", "template"}),
+        }
+
+    selected_name = str(model_settings.get("model_workflow_flow_name") or "").strip()
+    selected_id = str(model_settings.get("model_workflow_id") or model_settings.get("agent_flow_default_workflow_id") or "").strip()
+    if selected_name and selected_name in source_flows:
+        selected_flow = source_flows.get(selected_name)
+        selected_flow_id = str((selected_flow or {}).get("workflow_id") or (selected_flow or {}).get("id") or selected_id or "").strip()
+        add_row(selected_name, selected_flow_id, source="selected", attached=True, selected=True)
+    attached_rows = model_settings.get("model_workflow_attached_flows")
+    if isinstance(attached_rows, list):
+        for row in attached_rows:
+            if not isinstance(row, dict):
+                continue
+            attached_name = str(row.get("name") or "").strip()
+            attached_id = str(row.get("workflow_id") or "").strip()
+            if attached_name and attached_name in source_flows:
+                attached_flow = source_flows.get(attached_name)
+                attached_flow_id = str((attached_flow or {}).get("workflow_id") or (attached_flow or {}).get("id") or attached_id or "").strip()
+                add_row(attached_name, attached_flow_id, source="attached", attached=True)
+                continue
+            if attached_id:
+                for candidate_name, candidate_flow in source_flows.items():
+                    if isinstance(candidate_flow, dict) and str(candidate_flow.get("workflow_id") or candidate_flow.get("id") or "").strip() == attached_id:
+                        add_row(str(candidate_name), attached_id, source="attached", attached=True)
+                        break
+
+    for name, flow in source_flows.items():
+        if not _workflow_matches_model_type(flow, str(name), type_id, model_settings, model_id):
+            continue
+        source = "global" if _is_model_workflow_flow(flow, str(name)) else "workflow"
+        add_row(str(name), str(flow.get("workflow_id") or flow.get("id") or "").strip(), source=source, attached=False)
+
+    rows = sorted(rows_by_name.values(), key=lambda row: (not bool(row.get("selected")), not bool(row.get("attached")), str(row.get("name") or "").lower()))
+    return {"ok": True, "type_id": type_id, "model_id": model_id, "pid": pid, "rows": rows}
+
+
 def _ensure_model_workflow_for_deck_model(app: Any, type_id: str, model_id: str, pid: str = "default", template_flow_name: str = "", incoming_settings: Optional[Dict[str, Any]] = None, force_new: bool = False) -> Dict[str, Any]:
     try:
         from plugins.gui_helpers.agent_flow.skills.workflow import _workflow_store
@@ -1907,32 +2351,142 @@ def _ensure_model_workflow_for_deck_model(app: Any, type_id: str, model_id: str,
     ctx = {"app": app, "pid": str(pid or "default").strip() or "default"}
     project_flows = _workflow_store.load_project_flows(ctx, str(pid or "default").strip() or "default")
     default_flows = _workflow_store.load_default_flows(ctx)
+    global_template_flows = _global_model_workflow_template_flows(app, _workflow_store, ctx, "")
     flows = dict(project_flows or {})
+    reusable_flows = {**global_template_flows, **default_flows, **flows}
     saved_flow_name = str(settings.get("model_workflow_flow_name") or "").strip()
-    if saved_flow_name and not force_new and isinstance(flows.get(saved_flow_name), dict):
-        if isinstance(incoming_settings, dict) and incoming_settings:
+    if saved_flow_name and not force_new and isinstance(reusable_flows.get(saved_flow_name), dict):
+        saved_flow = reusable_flows.get(saved_flow_name)
+        if not _workflow_matches_model_type(saved_flow, saved_flow_name, str(type_id), settings, str(model_id)):
+            saved_flow_name = ""
+        else:
+            if saved_flow_name not in flows:
+                flows[saved_flow_name] = _hydrate_model_workflow_flow(saved_flow, model, str(type_id), saved_flow_name, str(settings.get("model_workflow_template_flow_name") or template_flow_name or saved_flow_name))
+                project_records = _workflow_store.project_flow_records(ctx, str(pid or "default").strip() or "default")
+                prior_ids_by_name = _workflow_store.flow_ids_by_name(project_records)
+                project_records = _workflow_store.replace_project_flows(ctx, str(pid or "default").strip() or "default", flows, prior_ids_by_name if isinstance(prior_ids_by_name, dict) else None)
+                settings["model_workflow_flow_name"] = saved_flow_name
+                settings["model_workflow_owned"] = False
+                model["settings"] = settings
+                _save_deck(app, deck)
+            else:
+                project_records = _workflow_store.project_flow_records(ctx, str(pid or "default").strip() or "default")
+            if isinstance(incoming_settings, dict) and incoming_settings:
+                _save_deck(app, deck)
+            ids = _workflow_store.flow_ids_by_name(project_records)
+            saved_workflow_id = str(ids.get(saved_flow_name) or "")
+            if not saved_workflow_id and isinstance(saved_flow, dict):
+                saved_workflow_id = str(saved_flow.get("workflow_id") or saved_flow.get("id") or "").strip()
+            settings["model_workflow_flow_name"] = saved_flow_name
+            settings["model_workflow_template_flow_name"] = str(settings.get("model_workflow_template_flow_name") or template_flow_name or saved_flow_name)
+            if saved_workflow_id:
+                settings["model_workflow_id"] = saved_workflow_id
+                settings["agent_flow_default_workflow_id"] = saved_workflow_id
+                settings["model_workflow_attached_flows"] = [{"name": saved_flow_name, "workflow_id": saved_workflow_id}]
+            else:
+                settings.pop("model_workflow_id", None)
+                settings.pop("agent_flow_default_workflow_id", None)
+                settings["model_workflow_attached_flows"] = [{"name": saved_flow_name}]
+            model["settings"] = settings
             _save_deck(app, deck)
-        records = _workflow_store.project_flow_records(ctx, str(pid or "default").strip() or "default")
-        ids = _workflow_store.flow_ids_by_name(records)
-        return {
-            "ok": True,
-            "created": False,
-            "flow_name": saved_flow_name,
-            "workflow_id": str(ids.get(saved_flow_name) or ""),
-            "template_flow_name": str(settings.get("model_workflow_template_flow_name") or template_flow_name or _LTX_MODEL_WORKFLOW_TEMPLATE_FLOW),
-            "deck": deck,
-        }
+            return {
+                "ok": True,
+                "created": False,
+                "flow_name": saved_flow_name,
+                "workflow_id": saved_workflow_id,
+                "template_flow_name": str(settings.get("model_workflow_template_flow_name") or template_flow_name or ""),
+                "deck": deck,
+            }
 
-    chosen_template = str(template_flow_name or settings.get("model_workflow_template_flow_name") or _LTX_MODEL_WORKFLOW_TEMPLATE_FLOW).strip()
+    manifest = compat_registry.match_manifest(
+        str(type_id or "").strip(),
+        settings,
+        str(settings.get("model_deck_compat_manifest_id") or settings.get("tested_profile_id") or ""),
+    )
+    manifest_workflow = ""
+    if isinstance(manifest, dict):
+        workflow_json = manifest.get("workflow_json") if isinstance(manifest.get("workflow_json"), dict) else {}
+        runtime_profile = manifest.get("runtime_profile") if isinstance(manifest.get("runtime_profile"), dict) else {}
+        params_json = manifest.get("params_json") if isinstance(manifest.get("params_json"), dict) else {}
+        manifest_workflow = str(
+            workflow_json.get("active_flow")
+            or workflow_json.get("default_flow")
+            or workflow_json.get("flow_name")
+            or workflow_json.get("name")
+            or runtime_profile.get("model_workflow_template_flow_name")
+            or params_json.get("model_workflow_template_flow_name")
+            or ""
+        ).strip()
+    model_tokens = _model_workflow_family_tokens(
+        model_id,
+        settings.get("model_id"),
+        settings.get("model_family"),
+        settings.get("workflow_variant"),
+        settings.get("model_deck_compat_manifest_id"),
+        settings.get("tested_profile_id"),
+        manifest_workflow,
+    )
+
+    def compatible_template_name(value: Any) -> str:
+        name = str(value or "").strip()
+        if not name:
+            return ""
+        template_tokens = _model_workflow_family_tokens(name)
+        return name if _model_workflow_family_matches(model_tokens, template_tokens) else ""
+
+    chosen_template = str(
+        compatible_template_name(template_flow_name)
+        or compatible_template_name(settings.get("model_workflow_template_flow_name"))
+        or compatible_template_name(manifest_workflow)
+        or ""
+    ).strip()
+    if not chosen_template:
+        raise HTTPException(status_code=404, detail="workflow template not found for selected model/profile")
     template_flow = flows.get(chosen_template) if isinstance(flows.get(chosen_template), dict) else None
+    if template_flow is not None and not _workflow_matches_model_type(template_flow, chosen_template, str(type_id), settings, str(model_id)):
+        template_flow = None
     if template_flow is None:
         template_flow = default_flows.get(chosen_template) if isinstance(default_flows.get(chosen_template), dict) else None
+        if template_flow is not None and not _workflow_matches_model_type(template_flow, chosen_template, str(type_id), settings, str(model_id)):
+            template_flow = None
     if template_flow is None:
-        for candidate_name, candidate_flow in {**default_flows, **flows}.items():
-            if isinstance(candidate_flow, dict) and str(candidate_name or "").lower().startswith("models /") and "ltx" in str(candidate_name or "").lower():
+        template_flow = global_template_flows.get(chosen_template) if isinstance(global_template_flows.get(chosen_template), dict) else None
+        if template_flow is not None and not _workflow_matches_model_type(template_flow, chosen_template, str(type_id), settings, str(model_id)):
+            template_flow = None
+    if template_flow is None and isinstance(manifest, dict):
+        workflow_json = manifest.get("workflow_json") if isinstance(manifest.get("workflow_json"), dict) else {}
+        workflow_name = str(
+            workflow_json.get("active_flow")
+            or workflow_json.get("default_flow")
+            or workflow_json.get("flow_name")
+            or workflow_json.get("name")
+            or ""
+        ).strip()
+        if workflow_name and workflow_name == chosen_template:
+            template_flow = workflow_json
+    if template_flow is None:
+        for candidate_name, candidate_flow in {**global_template_flows, **default_flows, **flows}.items():
+            if (
+                isinstance(candidate_flow, dict)
+                and str(candidate_name or "").lower().startswith("models /")
+                and _workflow_matches_model_type(candidate_flow, str(candidate_name), str(type_id), settings, str(model_id))
+            ):
                 chosen_template = str(candidate_name)
                 template_flow = candidate_flow
                 break
+    if template_flow is None:
+        generated_templates = _load_generated_model_workflow_templates(app, chosen_template)
+        template_flow = generated_templates.get(chosen_template) if isinstance(generated_templates.get(chosen_template), dict) else None
+        if template_flow is None:
+            for candidate_name, candidate_flow in generated_templates.items():
+                if (
+                    isinstance(candidate_flow, dict)
+                    and str(candidate_name or "").lower().startswith("models /")
+                    and _workflow_matches_model_type(candidate_flow, str(candidate_name), str(type_id), settings, str(model_id))
+                ):
+                    chosen_template = str(candidate_name)
+                    template_flow = candidate_flow
+                    break
     if template_flow is None:
         raise HTTPException(status_code=404, detail=f"workflow template not found: {chosen_template}")
 
@@ -1945,18 +2499,23 @@ def _ensure_model_workflow_for_deck_model(app: Any, type_id: str, model_id: str,
     flows[flow_name] = _hydrate_model_workflow_flow(template_flow, model, str(type_id), flow_name, chosen_template)
     records = _workflow_store.replace_project_flows(ctx, str(pid or "default").strip() or "default", flows)
     ids = _workflow_store.flow_ids_by_name(records)
+    created_workflow_id = str(ids.get(flow_name) or "")
 
     settings["model_workflow_flow_name"] = flow_name
     settings["model_workflow_template_flow_name"] = chosen_template
     settings["model_workflow_owned"] = True
     settings["model_workflow_created_ts"] = int(time.time())
+    if created_workflow_id:
+        settings["model_workflow_id"] = created_workflow_id
+        settings["agent_flow_default_workflow_id"] = created_workflow_id
+        settings["model_workflow_attached_flows"] = [{"name": flow_name, "workflow_id": created_workflow_id}]
     model["settings"] = settings
     _save_deck(app, deck)
     return {
         "ok": True,
         "created": True,
         "flow_name": flow_name,
-        "workflow_id": str(ids.get(flow_name) or ""),
+        "workflow_id": created_workflow_id,
         "template_flow_name": chosen_template,
         "deck": deck,
     }
@@ -3739,6 +4298,33 @@ def install(app) -> None:
     except Exception:
         pass
 
+    @r.get("/v1/model_deck/remote_providers")
+    def remote_providers(request: Request) -> Dict[str, Any]:
+        require_gui_plugin_enabled(request, gui_plugin_id=GUI_PLUGIN_ID)
+        _require_model_deck_permission(app, request, "model_deck.view", "Model Deck is not available for this user")
+        providers: List[Dict[str, Any]] = []
+        services = getattr(app.state, "plugin_services", None)
+        for plugin_id, service in sorted((services or {}).items()):
+            if not isinstance(service, dict) or service.get("kind") != "remote_text_model":
+                continue
+            descriptor = service.get("descriptor")
+            try:
+                row = descriptor() if callable(descriptor) else {}
+            except Exception:
+                row = {}
+            if not isinstance(row, dict):
+                row = {}
+            providers.append({
+                "id": str(row.get("id") or plugin_id),
+                "name": str(row.get("name") or service.get("provider_name") or plugin_id),
+                "kind": "remote_text_model",
+                "active": bool(row.get("active")),
+                "configured": bool(row.get("configured")),
+                "model": str(row.get("model") or ""),
+                "activate_path": str(row.get("activate_path") or f"/v1/{plugin_id}/activate"),
+            })
+        return {"ok": True, "providers": providers}
+
     @r.get("/v1/model_deck/type_templates")
     def type_templates(request: Request):
         require_gui_plugin_enabled(request, gui_plugin_id="model_deck")
@@ -3993,6 +4579,12 @@ def install(app) -> None:
                 "source_urls": {},
             }
         return _build_model_workflow_readiness(app, req)
+
+    @r.post("/v1/model_deck/model/workflow/list")
+    def model_workflow_list(request: Request, req: ModelWorkflowListRequest):
+        require_gui_plugin_enabled(request, gui_plugin_id=GUI_PLUGIN_ID)
+        _require_model_deck_permission(app, request, "model_deck.view", "Model Deck is not available for this user")
+        return _list_model_workflow_choices(app, req)
 
     @r.post("/v1/model_deck/model/set_default")
     def set_default(request: Request, req: SetDefaultRequest):
