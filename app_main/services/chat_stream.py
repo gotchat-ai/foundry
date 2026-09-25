@@ -969,6 +969,7 @@ class ChatStreamService:
 
                 lock_ctx = nullcontext() if allow_parallel_streams else _with_model_lock(model_key)
                 with lock_ctx:
+                    stream_max_tokens = _auto_reply_max_tokens(active_model, _SETTINGS, getattr(body, "max_tokens", None))
                     # Debug context visibility (helps diagnose missing system/RAG context).
                     if bool(_SETTINGS.get("debug_ctx", False)):
                         try:
@@ -1028,7 +1029,6 @@ class ChatStreamService:
                                 approx_tokens = _tok_msgs(msgs)
                             except Exception:
                                 approx_tokens = None
-                            stream_max_tokens = _auto_reply_max_tokens(active_model, _SETTINGS, getattr(body, "max_tokens", None))
                             seq_len = None
                             ctx_limit = None
                             ctx_limit_eff = None
