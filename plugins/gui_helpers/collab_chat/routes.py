@@ -5185,8 +5185,10 @@ def install(app) -> None:
                 plugin_id = str(item or "").strip()
                 if plugin_id and plugin_id not in requested_plugins:
                     requested_plugins.append(plugin_id)
-        if isinstance(payload["ext"].get("generic_mpc"), dict) and "generic_mpc" not in requested_plugins:
-            requested_plugins.append("generic_mpc")
+        if isinstance(payload["ext"].get("mpc"), dict) and "mpc" not in requested_plugins:
+            requested_plugins.append("mpc")
+        if isinstance(payload["ext"].get("generic_mpc"), dict) and "mpc" not in requested_plugins:
+            requested_plugins.append("mpc")
         if not direct_model_only and requested_plugins:
             enabled_plugins = list(payload.get("router_enabled_plugins") or [])
             for plugin_id in requested_plugins:
