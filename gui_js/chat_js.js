@@ -8101,6 +8101,13 @@ function isNearBottom() {
 function normalizeServerUrl(url) {
   if (!url) return "";
   const legacyHostMap = {
+    "account.saikick.org": "account.gotchat.ai",
+    "embed.saikick.org": "embed.gotchat.ai",
+    "embed2.saikick.org": "embed2.gotchat.ai",
+    "hostservices.saikick.org": "hostservices.gotchat.ai",
+    "jshostservices.saikick.org": "jshostservices.gotchat.ai",
+    "pluginserver.saikick.org": "pluginserver.gotchat.ai",
+    "llmserver.saikick.org": "llmserver.gotchat.ai",
   };
   const text = String(url || "").replace(/\/+$/, "");
   try {
@@ -11172,7 +11179,7 @@ function pluginRepoFrontendBase() {
   try {
     const url = new URL(pluginRepoApi());
     const host = String(url.hostname || "").toLowerCase();
-    if (host === "pluginserver.gotchat.ai") {
+    if (host === "pluginserver.gotchat.ai" || host === "pluginserver.saikick.org") {
       return "https://plugins.gotchat.ai";
     }
     url.pathname = "";
@@ -14198,7 +14205,6 @@ function openPluginPanel(pluginId, options = {}) {
     });
   }
 }
-
 
 
 
