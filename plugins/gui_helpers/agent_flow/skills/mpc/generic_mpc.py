@@ -1,14 +1,25 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any, Dict, List
 
-from plugins.ai_routes.generic_mpc import (
-    DEFAULT_MPCS,
-    _call_server_mpc,
-    _call_webmpc,
-    _enabled_mpcs,
-    _select_mpc,
-)
+try:
+    from .generic_mpc_runtime import (
+        DEFAULT_MPCS,
+        _call_server_mpc,
+        _call_webmpc,
+        _enabled_mpcs,
+        _select_mpc,
+    )
+except Exception:  # pragma: no cover - fallback for direct file loading
+    from generic_mpc_runtime import (  # type: ignore
+        DEFAULT_MPCS,
+        _call_server_mpc,
+        _call_webmpc,
+        _enabled_mpcs,
+        _select_mpc,
+    )
 
 
 NAME = "mpc.generic_mpc"
@@ -19,15 +30,54 @@ def _dict(value: Any) -> Dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
 
 
+def _central_config_path(ctx: Dict[str, Any]) -> Path | None:
+    app = ctx.get("app") if isinstance(ctx, dict) else None
+    try:
+        base = getattr(getattr(app, "state", None), "data_dir", None) or getattr(getattr(app, "state", None), "workdir", None)
+    except Exception:
+        base = None
+    if not base:
+        return None
+    return Path(str(base)).expanduser().resolve() / "gui_helpers" / "mpc" / "config.json"
+
+
+def _legacy_central_config_path(ctx: Dict[str, Any]) -> Path | None:
+    app = ctx.get("app") if isinstance(ctx, dict) else None
+    try:
+        base = getattr(getattr(app, "state", None), "data_dir", None) or getattr(getattr(app, "state", None), "workdir", None)
+    except Exception:
+        base = None
+    if not base:
+        return None
+    return Path(str(base)).expanduser().resolve() / "gui_helpers" / "generic_mpc" / "config.json"
+
+
+def _central_config_from_ctx(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    path = _central_config_path(ctx)
+    if (not path or not path.is_file()):
+        path = _legacy_central_config_path(ctx)
+    if not path or not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8") or "{}")
+    except Exception:
+        return {}
+    return dict(data) if isinstance(data, dict) and isinstance(data.get("mpcs"), list) else {}
+
+
 def _config_from(ctx: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
     candidates = [
+        _dict(params.get("mpc")),
         _dict(params.get("generic_mpc")),
         _dict(params.get("config")),
+        _dict(ctx.get("mpc")),
         _dict(ctx.get("generic_mpc")),
     ]
     for source in (params, ctx):
         route_settings = _dict(source.get("router_plugin_settings"))
+        candidates.append(_dict(route_settings.get("mpc")))
         candidates.append(_dict(route_settings.get("generic_mpc")))
+    candidates.append(_central_config_from_ctx(ctx))
     for candidate in candidates:
         if isinstance(candidate.get("mpcs"), list):
             return candidate
@@ -125,13 +175,13 @@ def run(ctx: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
 TOOL_SPEC = {
     "id": NAME,
     "category": "mpc",
-    "label": "MPC: Generic MPC",
-    "description": "List or call Generic MPC templates intentionally from Agent Flow or LLM Skill AutoFlow without enabling Generic MPC as an automatic AI router.",
+    "label": "MPC",
+    "description": "List or call MPC templates intentionally from Agent Flow or LLM Skill AutoFlow without enabling MPC as an automatic AI router.",
     "permissions": PERMISSIONS,
     "metadata": {
         "version": "1.0",
         "dev_status": "tested",
-        "purpose": "Expose Generic MPC catalog entries as explicit workflow-callable tools.",
+        "purpose": "Expose MPC catalog entries as explicit workflow-callable tools.",
     },
     "params_schema": {
         "type": "object",
@@ -151,7 +201,12 @@ TOOL_SPEC = {
             },
             "generic_mpc": {
                 "type": "object",
-                "description": "Optional Generic MPC config object containing an mpcs list.",
+                "description": "Optional legacy MPC config object containing an mpcs list.",
+                "additionalProperties": True,
+            },
+            "mpc": {
+                "type": "object",
+                "description": "Optional MPC config object containing an mpcs list.",
                 "additionalProperties": True,
             },
             "timeout_s": {"type": "number"},
