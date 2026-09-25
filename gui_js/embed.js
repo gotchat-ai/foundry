@@ -9,7 +9,7 @@
 //     data-server="https://YOUR_API_DOMAIN"
 //     data-rev="timestamp"
 //     data-dev="true"
-//     data-token="<token>"
+//     data-token="OPTIONAL_AUTH_TOKEN"
 //     data-pid="default"
 //     data-sid="main"
 //     data-alias="SIGNED_IN_EMAIL_OR_LOGIN_ID"
@@ -1712,8 +1712,6 @@
 
   start();
 })();
-
-
 
 
 
