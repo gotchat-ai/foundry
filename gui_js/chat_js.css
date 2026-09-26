@@ -641,6 +641,87 @@ body {
   text-align: left;
 }
 
+.message-body-with-attachments {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, auto);
+  width: 100%;
+  min-width: 0;
+  min-height: 96px;
+  overflow: visible;
+}
+
+.message-body-with-attachments > .bubble {
+  grid-column: 1;
+  grid-row: 1;
+}
+
+.message.attachment-bottom-left .message-body-with-attachments,
+.message.attachment-top-left .message-body-with-attachments {
+  padding-left: 106px;
+  box-sizing: border-box;
+}
+
+.message-attachment-rail {
+  --message-attachment-size: 96px;
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: var(--message-attachment-size);
+  pointer-events: none;
+  z-index: 2;
+}
+
+.message-attachment-rail.bottom-left,
+.message-attachment-rail.top-left {
+  left: 0;
+}
+
+.message-attachment-rail.bottom-right,
+.message-attachment-rail.top-right {
+  left: min(calc(75% + 10px), calc(100% - var(--message-attachment-size)));
+}
+
+.message-attachment-sticky {
+  position: sticky;
+  top: var(--message-attachment-sticky-top, 12px);
+  width: var(--message-attachment-size);
+  height: var(--message-attachment-size);
+  pointer-events: auto;
+}
+
+.message-attachment-rail.bottom-left .message-attachment-sticky,
+.message-attachment-rail.bottom-right .message-attachment-sticky {
+  bottom: auto;
+}
+
+@media (max-width: 760px) {
+  .message.has-message-attachments .message-body-with-attachments {
+    box-sizing: border-box;
+    min-height: 68px;
+    overflow: visible;
+  }
+  .message.attachment-bottom-left .message-body-with-attachments,
+  .message.attachment-top-left .message-body-with-attachments {
+    padding-left: 78px;
+  }
+  .message.has-message-attachments .message-body-with-attachments > .bubble {
+    max-width: 100%;
+  }
+  .message-attachment-rail {
+    --message-attachment-size: 68px;
+  }
+  .message-attachment-rail.bottom-left,
+  .message-attachment-rail.top-left {
+    left: 0;
+  }
+  .message-attachment-rail.bottom-right,
+  .message-attachment-rail.top-right {
+    left: auto;
+    right: 0;
+  }
+}
+
 .block.block-image {
   display: flex;
   flex-direction: column;
