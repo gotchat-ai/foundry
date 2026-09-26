@@ -2906,7 +2906,7 @@ def install(app) -> None:
         if isinstance(out, str):
             return "" if _is_status_only_text(out) else out
         if isinstance(out, dict):
-            for key in ("answer", "text", "final_text", "content", "result", "description"):
+            for key in ("answer", "text", "report_text", "final_text", "content", "result", "description"):
                 v = out.get(key)
                 if isinstance(v, str) and not _is_status_only_text(v):
                     return v
@@ -2916,7 +2916,7 @@ def install(app) -> None:
                     if not isinstance(row, dict):
                         continue
                     data = row.get("data") if isinstance(row.get("data"), dict) else {}
-                    for key in ("finalized_text", "final_answer", "markdown", "table_markdown", "content", "response", "answer", "summary", "text", "result", "message"):
+                    for key in ("finalized_text", "final_answer", "markdown", "table_markdown", "report_text", "content", "response", "answer", "summary", "text", "result", "message"):
                         v = data.get(key)
                         if v is None:
                             v = row.get(key)
@@ -8370,6 +8370,12 @@ def install(app) -> None:
                         state["steps"][idx]["output"] = output_summary
 
                     if isinstance(out, dict):
+                        try:
+                            tr_state = out.get("tool_results")
+                            if isinstance(tr_state, list):
+                                state["steps"][idx]["tool_results"] = _json_safe(list(tr_state[:20]))
+                        except Exception:
+                            pass
                         out["flow_node_label"] = f"Flow step {idx + 1}/{len(steps)}: {label}".strip()
                         # Capture changed files from tool results for downstream review stages.
                         try:
@@ -8445,7 +8451,7 @@ def install(app) -> None:
                                                 skills_invoked.append(skill0)
                                             data0 = tr0.get("data") if isinstance(tr0.get("data"), dict) else {}
                                             if not fallback_response:
-                                                for k0 in ("review_summary", "summary", "response", "did", "message", "text", "content", "result"):
+                                                for k0 in ("review_summary", "report_text", "summary", "response", "did", "message", "text", "content", "result"):
                                                     v0 = str(data0.get(k0) or tr0.get(k0) or "").strip()
                                                     if v0:
                                                         fallback_response = v0
@@ -9399,6 +9405,43 @@ def install(app) -> None:
                             final_result_mode = "text"
                             final_result_text = fallback_text_plain
                             final_result_out = {"plain_text_fallback": True}
+                    exact_tracked_report_text = ""
+                    try:
+                        terminal_output = ""
+                        terminal_steps = state.get("steps") if isinstance(state.get("steps"), list) else []
+                        for terminal_step in reversed(terminal_steps):
+                            if not isinstance(terminal_step, dict):
+                                continue
+                            terminal_output = str(
+                                terminal_step.get("output")
+                                or terminal_step.get("text")
+                                or terminal_step.get("result")
+                                or ""
+                            ).strip()
+                            terminal_low = terminal_output.lower()
+                            if (
+                                terminal_output
+                                and "tracked build completion report" in terminal_low
+                                and "## completed todo list" in terminal_low
+                                and "## worker handoffs" in terminal_low
+                            ):
+                                exact_tracked_report_text = terminal_output
+                                break
+                        terminal_low = terminal_output.lower()
+                        if (
+                            exact_tracked_report_text
+                            or (
+                                terminal_output
+                                and "tracked build completion report" in terminal_low
+                                and "## completed todo list" in terminal_low
+                                and "## worker handoffs" in terminal_low
+                            )
+                        ):
+                            final_result_mode = "text"
+                            final_result_text = exact_tracked_report_text or terminal_output
+                            final_result_out = {"plain_text_fallback": True, "preserve_exact_text": True}
+                    except Exception:
+                        pass
                     if final_result_mode:
                         _publish_step_stream(f"[agent_flow] final result mode: {final_result_mode}")
                         ts_res = _now_ts()
@@ -9445,6 +9488,10 @@ def install(app) -> None:
                             if emit_content:
                                 content_res = emit_content
                                 generic_result_content_used = True
+                        if exact_tracked_report_text:
+                            content_res = exact_tracked_report_text
+                            meta_res["flow_result_mode"] = "text"
+                            final_result_mode = "text"
                         if not str(content_res or "").strip():
                             content_res = _humanize_result_fallback(
                                 str(last_output_text or "").strip(),
@@ -9452,6 +9499,12 @@ def install(app) -> None:
                             )
                         content_low_pre = str(content_res or "").strip().lower()
                         if (
+                            not (
+                                "tracked build completion report" in content_low_pre
+                                and "## completed todo list" in content_low_pre
+                                and "## worker handoffs" in content_low_pre
+                            )
+                            and
                             content_low_pre
                             and (
                                 content_low_pre.startswith("summary:")
@@ -9700,6 +9753,10 @@ def install(app) -> None:
                             content_res = f"{zip_text}\n\n{content_res}".strip() if str(content_res or "").strip() else zip_text
                         if not content_res:
                             content_res = "Result ready."
+                        if exact_tracked_report_text:
+                            content_res = exact_tracked_report_text
+                            final_result_mode = "text"
+                            meta_res["flow_result_mode"] = "text"
                         try:
                             content_text_final = str(content_res or "")
                             content_low_final = content_text_final.lower()
@@ -9717,11 +9774,29 @@ def install(app) -> None:
                         meta_res = _json_safe(meta_res) if isinstance(meta_res, dict) else {}
                         exact_result_text = ""
                         try:
+                            content_text_for_exact = str(content_res or "").strip()
+                            content_low_for_exact = content_text_for_exact.lower()
+                            if (
+                                content_text_for_exact
+                                and "tracked build completion report" in content_low_for_exact
+                                and "## completed todo list" in content_low_for_exact
+                                and "## worker handoffs" in content_low_for_exact
+                            ):
+                                exact_result_text = content_text_for_exact
                             data_meta = meta_res.get("data") if isinstance(meta_res.get("data"), dict) else {}
                             data_text = str(data_meta.get("text") or "").strip()
                             low_data_text = data_text.lower()
                             if (
-                                data_text
+                                not exact_result_text
+                                and data_text
+                                and "tracked build completion report" in low_data_text
+                                and "## completed todo list" in low_data_text
+                                and "## worker handoffs" in low_data_text
+                            ):
+                                exact_result_text = data_text
+                            if (
+                                not exact_result_text
+                                and data_text
                                 and ("target folder:" in low_data_text or "**target folder:**" in low_data_text)
                                 and ("verified files:" in low_data_text or "**verified files:**" in low_data_text)
                                 and ("changed files:" in low_data_text or "**changed files:**" in low_data_text)
@@ -9740,6 +9815,8 @@ def install(app) -> None:
                         content_res = final_text_clean
                         state["final_result"] = final_text_clean
                         state["final_result_mode"] = str(final_result_mode or meta_res.get("flow_result_mode") or "text").strip().lower() or "text"
+                        if isinstance(final_result_out, dict) and final_result_out:
+                            state["final_result_out"] = _json_safe(final_result_out)
                         ts_res = max(int(ts_res), int(flow_stream_ts["v"] or 0) + 1)
                         msg_payload = {
                             "msg_id": msg_id_res,
@@ -9812,6 +9889,8 @@ def install(app) -> None:
                         fallback_text = fallback_text_clean
                         state["final_result"] = fallback_text_clean
                         state["final_result_mode"] = str(final_result_mode or "text").strip().lower() or "text"
+                        if isinstance(final_result_out, dict) and final_result_out:
+                            state["final_result_out"] = _json_safe(final_result_out)
                         try:
                             db.add_message(
                                 msg_id=f"{run_id}_result_fallback",
