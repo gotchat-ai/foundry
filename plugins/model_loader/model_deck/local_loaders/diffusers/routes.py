@@ -9,6 +9,7 @@ import contextlib
 import importlib
 import importlib.util
 import importlib.machinery
+import os
 import sys
 import sysconfig
 import types
@@ -19,7 +20,7 @@ from plugins.gui_helpers._framework.utils import require_gui_plugin_enabled
 from plugins.ai_routes.model_deck_utils import get_server_app
 from plugins.model_loader.model_deck import compat_registry
 from plugins.model_loader.gguf.plugin import _resolve_gguf_path
-from plugins.model_loader.model_deck.local_loaders.diffusers_manifest import build_pipeline_from_runtime_profile, build_transformer_and_pipeline, resolve_manifest, resolve_runtime_profile 
+from plugins.model_loader.model_deck.local_loaders.diffusers_manifest import build_pipeline_from_runtime_profile, build_transformer_and_pipeline, resolve_manifest, resolve_runtime_profile
 try:
     from plugins.gui_helpers._framework.event_bus import publish_gui_event
 except Exception:
@@ -212,17 +213,26 @@ def _block_cuda_flash_attn_imports(settings: Dict[str, Any]):
     bert_padding_stub.pad_input = _unavailable
     bert_padding_stub.unpad_input = _unavailable
     bert_padding_stub.unpad_input_for_concatenated_sequences = _unavailable
+    modules_stub = types.ModuleType("flash_attn.modules")
+    modules_stub.__file__ = "<llmloader2 flash_attn modules stub>"
+    modules_stub.__spec__ = importlib.machinery.ModuleSpec("flash_attn.modules", loader=None)
+    mha_stub = types.ModuleType("flash_attn.modules.mha")
+    mha_stub.__file__ = "<llmloader2 flash_attn mha stub>"
+    mha_stub.__spec__ = importlib.machinery.ModuleSpec("flash_attn.modules.mha", loader=None)
+    mha_stub.FlashCrossAttention = None
     cuda_stub = types.ModuleType("flash_attn_2_cuda")
     cuda_stub.__file__ = "<llmloader2 flash_attn cuda stub>"
     cuda_stub.__spec__ = importlib.machinery.ModuleSpec("flash_attn_2_cuda", loader=None)
 
     sys.modules["flash_attn"] = flash_attn_stub
     sys.modules["flash_attn.bert_padding"] = bert_padding_stub
+    sys.modules["flash_attn.modules"] = modules_stub
+    sys.modules["flash_attn.modules.mha"] = mha_stub
     sys.modules["flash_attn_2_cuda"] = cuda_stub
     try:
         yield
     finally:
-        for module_name in ("flash_attn", "flash_attn.bert_padding", "flash_attn_2_cuda"):
+        for module_name in ("flash_attn", "flash_attn.bert_padding", "flash_attn.modules", "flash_attn.modules.mha", "flash_attn_2_cuda"):
             sys.modules.pop(module_name, None)
         for module_name, module in removed_modules.items():
             if module is not None and module_name not in sys.modules:
@@ -335,7 +345,9 @@ def _resolve_hf_token(request: Optional[Request], settings: Dict[str, Any]) -> s
             token = str(settings_obj.get("hf_token") or "").strip()
     except Exception:
         token = ""
-    return token or ""
+    if token:
+        return token
+    return str(os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN") or "").strip()
 
 
 def _apply_token_kwargs(fn: Any, kwargs: Dict[str, Any], token: str) -> Dict[str, Any]:
@@ -494,6 +506,16 @@ def load(request: Request, settings: Dict[str, Any]) -> Dict[str, Any]:
     device = _resolve_device(settings)
     torch_dtype = _resolve_dtype(settings, device)
     hf_token = _resolve_hf_token(request, settings)
+    try:
+        print(
+            "[diffusers.load] resolved_runtime "
+            f"model_id={str(model_id or settings.get('repo_id') or '')!r} "
+            f"device={str(device or '')!r} dtype={str(settings.get('dtype') or '')!r} "
+            f"hf_token_present={bool(hf_token)}",
+            flush=True,
+        )
+    except Exception:
+        pass
     gguf_path = _resolve_gguf_path_setting(request, settings, str(settings.get("gguf_path") or "").strip())
     use_unet = _resolve_bool(settings.get("use_unet"))
     sdxl_unet_path = _resolve_unet_path_setting(
@@ -531,7 +553,8 @@ def load(request: Request, settings: Dict[str, Any]) -> Dict[str, Any]:
             manifest_id = str((manifest_probe or {}).get("id") or (manifest_probe or {}).get("loader_id") or "")
         except Exception:
             manifest_id = ""
-        manifest_pipe = _resolve_manifest_pipeline(request, settings, torch_dtype, hf_token)
+        with _block_cuda_flash_attn_imports(settings):
+            manifest_pipe = _resolve_manifest_pipeline(request, settings, torch_dtype, hf_token)
     except HTTPException:
         raise
     except Exception as exc:
