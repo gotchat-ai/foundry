@@ -10,8 +10,10 @@ import time
 import sys
 import traceback
 from contextlib import nullcontext
+from pathlib import Path
 from typing import Any, Callable
 
+import httpx
 from app_main.core.jobs import _GenJob
 from fastapi.responses import StreamingResponse
 try:
@@ -67,6 +69,41 @@ def _auto_reply_max_tokens(model: Any, settings: dict[str, Any], explicit: Any =
         reserve = min(512, max(64, int(ctx_limit * 0.05)))
         return max(1, ctx_limit - reserve)
     return max(2048, _positive_int((settings or {}).get("max_tokens")) or 2048)
+
+
+async def _chat_stream_internal_json_request(
+    app: Any,
+    *,
+    method: str,
+    path: str,
+    headers: dict[str, str],
+    body: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://chat-stream.internal", timeout=None) as client:
+        resp = await client.request(method.upper(), path, headers=headers, json=body)
+    if resp.status_code >= 400:
+        return {"ok": False, "status_code": resp.status_code, "error": resp.text[:800] or "internal_request_failed"}
+    try:
+        parsed = resp.json()
+    except Exception as exc:
+        return {"ok": False, "status_code": 500, "error": f"internal_json_decode_failed: {exc}"}
+    return parsed if isinstance(parsed, dict) else {"ok": True, "data": parsed}
+
+
+def _chat_stream_load_project_agent_flows(pid: Any) -> dict[str, Any]:
+    project_id = str(pid or "").strip()
+    if not project_id:
+        return {}
+    try:
+        root = Path(__file__).resolve().parents[2]
+        path = root / "data" / "projects" / "agent_flow" / f"{project_id}.json"
+        with path.open("r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+        flows = raw.get("flows") if isinstance(raw, dict) else {}
+        return dict(flows or {}) if isinstance(flows, dict) else {}
+    except Exception:
+        return {}
 
 
 class ChatStreamService:
@@ -260,6 +297,8 @@ class ChatStreamService:
         # persisted transcripts. Keep plugin context as system messages.
         try:
             base_url = str(getattr(request, "base_url", "") or "").rstrip("/")
+            if isinstance(ext, dict) and base_url and not str(ext.get("base_url") or ext.get("server_url") or "").strip():
+                ext["base_url"] = base_url
             msgs = _inject_attachments_into_messages(msgs, ext, base_url=base_url)
         except Exception:
             pass
@@ -295,7 +334,8 @@ class ChatStreamService:
             "last_user_content": last_user_content,
             "raw_messages": msgs,
             "messages": msgs,
-            "client_msg_id" : getattr(body, "client_msg_id", None) 
+            "client_msg_id" : getattr(body, "client_msg_id", None),
+            "request_base_url": str(ext.get("base_url") or "") if isinstance(ext, dict) else "",
         }
         try:
             if isinstance(ext, dict):
@@ -750,7 +790,151 @@ class ChatStreamService:
                                 body.ext = ext
                     except Exception:
                         pass
-                    handled, route_payload = ai_router.try_route(body)
+                    handled = False
+                    route_payload = None
+                    try:
+                        route_settings = ext.get("router_plugin_settings") if isinstance(ext, dict) and isinstance(ext.get("router_plugin_settings"), dict) else {}
+                        agent_flow_settings = route_settings.get("agent_flow") if isinstance(route_settings.get("agent_flow"), dict) else {}
+                        selected_flow = str(
+                            (ext.get("agent_flow_active_flow") if isinstance(ext, dict) else "")
+                            or agent_flow_settings.get("agent_flow_active_flow")
+                            or ""
+                        ).strip()
+                        selected_flow_is_real = bool(selected_flow and selected_flow not in {"__none__", "__llm_autoflow__", "__llm_skill_autoflow__"})
+                        enabled_now = getattr(body, "router_enabled_plugins", None)
+                        enabled_set = {str(item or "").strip() for item in enabled_now} if isinstance(enabled_now, list) else set()
+                        if isinstance(ext, dict):
+                            ext_enabled_now = ext.get("router_enabled_plugins") if isinstance(ext.get("router_enabled_plugins"), list) else []
+                            enabled_set.update(str(item or "").strip() for item in ext_enabled_now)
+                        if selected_flow_is_real and ("agent_flow" in enabled_set or str(getattr(body, "route_id", "") or "").strip().lower() == "agent_flow"):
+                            headers = {
+                                "X-Project-Id": str(pid or "").strip(),
+                                "X-Session-Id": str(sid or "").strip(),
+                                "X-Gui-Enabled-Plugins": "agent_flow",
+                            }
+                            try:
+                                req_headers = dict(ai_router.core.settings.get("__request_headers") or {})
+                            except Exception:
+                                req_headers = {}
+                            auth = str(req_headers.get("authorization") or req_headers.get("Authorization") or "").strip()
+                            if auth:
+                                headers["Authorization"] = auth
+                            xauth = str(req_headers.get("x-auth-token") or req_headers.get("X-Auth-Token") or "").strip()
+                            if xauth and not auth:
+                                headers["X-Auth-Token"] = xauth
+                            alias_header = str(req_headers.get("x-user-alias") or req_headers.get("X-User-Alias") or "").strip()
+                            if alias_header:
+                                headers["X-User-Alias"] = alias_header
+                            guest_id = str(req_headers.get("x-guest-id") or req_headers.get("X-Guest-Id") or "").strip()
+                            if guest_id and not auth and not xauth:
+                                headers["X-Guest-Id"] = guest_id
+                            run_ext = dict(ext or {})
+                            run_ext["project_id"] = str(pid or "")
+                            run_ext["session_id"] = str(sid or "")
+                            run_ext["session-id"] = str(sid or "")
+                            run_ext["sid"] = str(sid or "")
+                            run_ext["agent_flow_active_flow"] = selected_flow
+                            run_ext["agent_flow_default_flow"] = str(run_ext.get("agent_flow_default_flow") or selected_flow)
+                            if not isinstance(run_ext.get("agent_flow_flows"), dict) or selected_flow not in run_ext.get("agent_flow_flows", {}):
+                                project_flows = _chat_stream_load_project_agent_flows(pid)
+                                if project_flows:
+                                    existing_flows = run_ext.get("agent_flow_flows") if isinstance(run_ext.get("agent_flow_flows"), dict) else {}
+                                    merged_flows = dict(project_flows)
+                                    merged_flows.update(existing_flows)
+                                    run_ext["agent_flow_flows"] = merged_flows
+                            print(
+                                "[chat_stream.router] agent_flow_bridge start "
+                                f"pid={pid!r} sid={sid!r} flow={selected_flow!r} "
+                                f"attachments={len(run_ext.get('attachments') or run_ext.get('media_attachments') or [])} "
+                                f"flows={len(run_ext.get('agent_flow_flows') or {})}",
+                                flush=True,
+                            )
+
+                            async def _run_agent_flow_bridge() -> dict[str, Any]:
+                                run_payload = await _chat_stream_internal_json_request(
+                                    app,
+                                    method="POST",
+                                    path=f"/v1/projects/{pid}/sessions/{sid}/agent_flow/run",
+                                    headers=headers,
+                                    body={
+                                        "text": last_user_content,
+                                        "client_msg_id": str(stream_ctx.get("client_msg_id") or ""),
+                                        "ext": run_ext,
+                                    },
+                                )
+                                if run_payload.get("ok") is False:
+                                    return {
+                                        "route_id": "agent_flow",
+                                        "ok": False,
+                                        "error": str(run_payload.get("error") or "agent_flow_run_failed"),
+                                        "status_code": run_payload.get("status_code"),
+                                    }
+                                run_id = str(run_payload.get("run_id") or "").strip()
+                                state: dict[str, Any] = {}
+                                if run_id:
+                                    started = time.time()
+                                    while True:
+                                        state = await _chat_stream_internal_json_request(
+                                            app,
+                                            method="GET",
+                                            path=f"/v1/projects/{pid}/sessions/{sid}/agent_flow/status?run_id={run_id}",
+                                            headers=headers,
+                                        )
+                                        if not bool((state.get("state") if isinstance(state.get("state"), dict) else state).get("running")):
+                                            break
+                                        if time.time() - started > 420.0:
+                                            return {
+                                                "route_id": "agent_flow",
+                                                "ok": False,
+                                                "error": "agent_flow_chat_stream_timeout",
+                                                "run_id": run_id,
+                                            }
+                                        await asyncio.sleep(1.0)
+                                state_obj = state.get("state") if isinstance(state.get("state"), dict) else state
+                                if not isinstance(state_obj, dict):
+                                    state_obj = {}
+                                final_text = str(
+                                    state_obj.get("final_result")
+                                    or state_obj.get("result_text")
+                                    or state_obj.get("text")
+                                    or ""
+                                ).strip()
+                                if not final_text and isinstance(state_obj.get("result"), dict):
+                                    final_text = str(
+                                        state_obj["result"].get("report_text")
+                                        or state_obj["result"].get("text")
+                                        or state_obj["result"].get("message")
+                                        or ""
+                                    ).strip()
+                                return {
+                                    "route_id": "agent_flow",
+                                    "ok": True,
+                                    "mode": "agent_flow",
+                                    "flow_name": selected_flow,
+                                    "run_id": run_id,
+                                    "state": state_obj,
+                                    "text": final_text or f"Agent Flow finished: {selected_flow}",
+                                }
+
+                            route_payload = asyncio.run(_run_agent_flow_bridge())
+                            handled = True
+                            print(
+                                "[chat_stream.router] agent_flow_bridge done "
+                                f"pid={pid!r} sid={sid!r} flow={selected_flow!r} "
+                                f"ok={bool(isinstance(route_payload, dict) and route_payload.get('ok') is not False)} "
+                                f"keys={sorted(route_payload.keys()) if isinstance(route_payload, dict) else []!r}",
+                                flush=True,
+                            )
+                    except Exception as bridge_exc:
+                        print(f"[chat_stream.router] agent_flow_bridge error pid={pid!r} sid={sid!r} error={bridge_exc!r}", flush=True)
+                        handled = True
+                        route_payload = {
+                            "route_id": "agent_flow",
+                            "ok": False,
+                            "error": str(bridge_exc or "agent_flow_bridge_error"),
+                        }
+                    if not handled:
+                        handled, route_payload = ai_router.try_route(body)
                 except Exception as e:
                     print(f"[chat_stream.router] try_route error pid={pid!r} sid={sid!r} error={e!r}", flush=True)
                     status_code = getattr(e, "status_code", None)
