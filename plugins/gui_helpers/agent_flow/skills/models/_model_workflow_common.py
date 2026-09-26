@@ -82,6 +82,39 @@ def _run_override_values(raw: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _norm_identity_value(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _model_deck_defaults_match_current_workflow(current: Dict[str, Any], deck_settings: Dict[str, Any]) -> bool:
+    """Return whether video deck defaults are safe to overlay onto this run.
+
+    The Model Deck video default is a fallback/hydration source for generic
+    model workflows. It must not overwrite a run that already selected a
+    different model workflow; otherwise a Wan flow can inherit MiniMax assets
+    and fail at decode with mismatched latent/VAE channels.
+    """
+    if not isinstance(current, dict) or not isinstance(deck_settings, dict) or not deck_settings:
+        return False
+    identity_pairs = (
+        ("model_deck_compat_manifest_id",),
+        ("tested_profile_id", "model_deck_compat_manifest_id"),
+        ("model_workflow_flow_name",),
+        ("model_workflow_template_flow_name", "model_workflow_flow_name"),
+        ("model_family",),
+        ("workflow_variant",),
+        ("model_id",),
+    )
+    for pair in identity_pairs:
+        current_key = pair[0]
+        deck_key = pair[-1]
+        current_value = _norm_identity_value(current.get(current_key))
+        deck_value = _norm_identity_value(deck_settings.get(deck_key))
+        if current_value and deck_value and current_value != deck_value:
+            return False
+    return True
+
+
 def now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -869,12 +902,32 @@ def resolve_asset_values(params: Dict[str, Any]) -> Dict[str, Any]:
         "",
     )
     explicit_request_prompt = str(settings.get("__request_prompt") or "").strip()
-    deck_settings, deck_model_id = _current_model_deck_video_default_settings()
+    media_type = str(
+        settings.get("model_type")
+        or settings.get("workflow_media_type")
+        or settings.get("diffusers_media_type")
+        or ""
+    ).strip().lower()
+    is_image_workflow = media_type in {"image", "image_gen"} or str(settings.get("model_family") or "").strip().lower().endswith("_diffusers_repo")
+    deck_settings, deck_model_id = ({}, "") if is_image_workflow else _current_model_deck_video_default_settings()
     deck_default_flag = settings.get("model_workflow_use_model_deck_default_assets")
     if deck_default_flag is None:
         deck_default_flag = settings.get("use_model_deck_default_assets")
     use_deck_defaults = str("true" if deck_default_flag is None else deck_default_flag).strip().lower() not in {"0", "false", "no", "off"}
-    if deck_settings and use_deck_defaults:
+    deck_defaults_match = _model_deck_defaults_match_current_workflow(settings, deck_settings)
+    if deck_settings and use_deck_defaults and not deck_defaults_match:
+        try:
+            print(
+                "[model_workflow.assets] skipped_model_deck_default_overlay "
+                f"current_flow={str(settings.get('model_workflow_flow_name') or '')!r} "
+                f"deck_flow={str(deck_settings.get('model_workflow_flow_name') or '')!r} "
+                f"current_compat={str(settings.get('model_deck_compat_manifest_id') or settings.get('tested_profile_id') or '')!r} "
+                f"deck_compat={str(deck_settings.get('model_deck_compat_manifest_id') or deck_settings.get('tested_profile_id') or '')!r}",
+                flush=True,
+            )
+        except Exception:
+            pass
+    if deck_settings and use_deck_defaults and deck_defaults_match:
         settings = {**settings, **deck_settings}
         strip_stale_workflow_identity(settings)
         if deck_model_id:
@@ -1271,7 +1324,21 @@ def settings_artifact(run: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, 
     if deck_default_flag is None:
         deck_default_flag = out.get("use_model_deck_default_assets")
     use_deck_defaults = str("true" if deck_default_flag is None else deck_default_flag).strip().lower() not in {"0", "false", "no", "off"}
-    if deck_settings and use_deck_defaults:
+    deck_defaults_match = _model_deck_defaults_match_current_workflow(out, deck_settings)
+    if deck_settings and use_deck_defaults and not deck_defaults_match:
+        try:
+            print(
+                "[model_workflow.settings] skipped_model_deck_default_overlay "
+                f"run_id={str((run or {}).get('run_id') or '')!r} "
+                f"current_flow={str(out.get('model_workflow_flow_name') or '')!r} "
+                f"deck_flow={str(deck_settings.get('model_workflow_flow_name') or '')!r} "
+                f"current_compat={str(out.get('model_deck_compat_manifest_id') or out.get('tested_profile_id') or '')!r} "
+                f"deck_compat={str(deck_settings.get('model_deck_compat_manifest_id') or deck_settings.get('tested_profile_id') or '')!r}",
+                flush=True,
+            )
+        except Exception:
+            pass
+    if deck_settings and use_deck_defaults and deck_defaults_match:
         out = {**out, **deck_settings}
         strip_stale_workflow_identity(out)
         if deck_model_id:
