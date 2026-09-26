@@ -115,11 +115,13 @@ function renderPanelHtml(ctx) {
   ensureStyles();
   const st = stateFor(ctx);
   const savedGoogle = st.settings?.skills?.["external_data.google_scholar"]?.settings || {};
+  const savedSpawner = st.settings?.skills?.["workflow.spawn_ai_job"]?.settings || {};
   const draftValue = (key, fallback = "") => Object.prototype.hasOwnProperty.call(st.drafts, key) ? st.drafts[key] : fallback;
   const gsDraft = draftValue("googleScholarSerpApiKey", savedGoogle.serpapi_key || "");
   const gsProvider = draftValue("googleScholarProvider", savedGoogle.provider || "auto");
   const gsSearxngBase = draftValue("googleScholarSearxngBase", savedGoogle.searxng_base_url || "");
   const gsSearxngEngines = draftValue("googleScholarSearxngEngines", savedGoogle.searxng_engines || "google scholar");
+  const spawnerRemoteCap = draftValue("spawnAiJobRemoteCap", savedSpawner.remote_max_concurrent_jobs || "3");
   const customSkill = st.drafts.customSkillId || "";
   const customKey = st.drafts.customKey || "";
   const customValue = st.drafts.customValue || "";
@@ -136,6 +138,16 @@ function renderPanelHtml(ctx) {
         </div>
         <div class="skills-settings-actions">
           <button class="primary" data-ss-save-google>Save Google Scholar Settings</button>
+        </div>
+      </div>
+      <div class="skills-settings-card">
+        <div class="skills-settings-title">Concurrent AI Job Spawner</div>
+        <div class="skills-settings-sub"><span class="skills-settings-code">workflow.spawn_ai_job</span> can start chat/router jobs or Agent Flow workflows in the background. Local llama-server jobs use the active model parallel slots; remote/unknown models use this cap.</div>
+        <div class="skills-settings-grid">
+          <div class="skills-settings-field"><label>Remote max concurrent jobs</label><input class="skills-settings-input" data-ss-draft="spawnAiJobRemoteCap" type="number" min="1" max="64" step="1" value="${escapeHtml(spawnerRemoteCap)}" /></div>
+        </div>
+        <div class="skills-settings-actions">
+          <button class="primary" data-ss-save-spawner>Save Concurrent Job Settings</button>
         </div>
       </div>
       <div class="skills-settings-card">
@@ -178,6 +190,20 @@ function bindPanel(ctx, root) {
         body: JSON.stringify({ settings }),
       });
       st.message = "Saved Google Scholar settings.";
+      await loadSettings(ctx);
+    } catch (err) {
+      st.message = `Save failed: ${err.message || err}`;
+      ctx.refresh?.();
+    }
+  });
+  root.querySelector("[data-ss-save-spawner]")?.addEventListener("click", async () => {
+    const cap = Math.max(1, Math.min(64, Number(st.drafts.spawnAiJobRemoteCap || 3) || 3));
+    try {
+      await apiJson(ctx, `/v1/skills_settings/${encodeURIComponent("workflow.spawn_ai_job")}`, {
+        method: "PUT",
+        body: JSON.stringify({ settings: { remote_max_concurrent_jobs: cap } }),
+      });
+      st.message = "Saved concurrent AI job settings.";
       await loadSettings(ctx);
     } catch (err) {
       st.message = `Save failed: ${err.message || err}`;
