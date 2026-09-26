@@ -764,6 +764,20 @@ def _save_settings_value(app: Any, key: str, value: Any) -> None:
             settings_obj[key] = value
     except Exception:
         pass
+    # Persist to settings.json for restart.
+    try:
+        path = _settings_path()
+        data: Dict[str, Any] = {}
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if isinstance(raw, dict):
+                data = raw
+        data[key] = value
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
 
 def _read_settings_map(app: Any) -> Dict[str, Any]:
     try:
@@ -792,21 +806,6 @@ def _resolve_hf_cache_dir(app: Any) -> Optional[str]:
     cache_dir = settings.get("hf_cache_dir") or settings.get("models_dir")
     cache_dir = str(cache_dir or "").strip()
     return cache_dir or None
-
-    # Persist to settings.json for restart.
-    try:
-        path = _settings_path()
-        data: Dict[str, Any] = {}
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-            if isinstance(raw, dict):
-                data = raw
-        data[key] = value
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-    except Exception:
-        pass
 
 def _load_deck(app: Any) -> Dict[str, Any]:
     path = _deck_path(app)
@@ -4741,6 +4740,37 @@ def install(app) -> None:
             matches = _find_loaded_slots_by_filename(settings)
             return matches[0] if matches else None
 
+        def _remote_text_status(loader_id: str, settings: Dict[str, Any]) -> Dict[str, Any]:
+            if not (str(loader_id or "").startswith("remote_model.") or str((settings or {}).get("model_location") or "").strip().lower() == "remote"):
+                return {}
+            provider_id = str((settings or {}).get("remote_provider_id") or str(loader_id or "").replace("remote_model.", "", 1)).strip()
+            if not provider_id:
+                return {}
+            services = getattr(app.state, "plugin_services", None)
+            service = (services or {}).get(provider_id) if isinstance(services, dict) else None
+            if not isinstance(service, dict) or service.get("kind") != "remote_text_model":
+                return {
+                    "provider_id": provider_id,
+                    "active": False,
+                    "configured": False,
+                    "model": str((settings or {}).get("remote_model_id") or (settings or {}).get("model") or ""),
+                }
+            descriptor = service.get("descriptor")
+            try:
+                row = descriptor() if callable(descriptor) else {}
+            except Exception:
+                row = {}
+            if not isinstance(row, dict):
+                row = {}
+            model_name = str(row.get("model") or (settings or {}).get("remote_model_id") or (settings or {}).get("model") or "")
+            return {
+                "provider_id": provider_id,
+                "active": bool(row.get("active")),
+                "configured": bool(row.get("configured")),
+                "model": model_name,
+                "provider_name": str(row.get("name") or service.get("provider_name") or provider_id),
+            }
+
         defaults: List[Dict[str, Any]] = []
         for tid, t in (deck.get("types") or {}).items():
             if not isinstance(t, dict):
@@ -4825,6 +4855,12 @@ def install(app) -> None:
                     loaded_model_id = str(st.get("model_id") or "")
                 except Exception:
                     loaded = False
+            remote_status = _remote_text_status(loader_id, settings)
+            if remote_status:
+                backend_mode = "remote"
+                supports = False
+                loaded = bool(remote_status.get("active") and remote_status.get("configured"))
+                configured_model_path = str(remote_status.get("model") or configured_model_path or "").strip()
             defaults.append({
                 "kind": "default",
                 "type_id": str(tid),
@@ -4838,6 +4874,8 @@ def install(app) -> None:
                 "supports_load": supports,
                 "pid": None if (backend_mode or "embedded") == "llama_server" else ((entry_pid or server_pid) if loaded else None),
                 "backend_mode": backend_mode or "embedded",
+                "remote": bool(remote_status),
+                "remote_provider_id": str(remote_status.get("provider_id") or "") if remote_status else "",
                 "managed_server_id": managed_id or None,
                 "managed_server": managed_status,
                 "expected_gguf_filename": expected_gguf_filename or None,
@@ -4887,6 +4925,12 @@ def install(app) -> None:
                                     loaded_model_id = str((st.get("settings") or {}).get("model_id") or st.get("path") or "")
                             except Exception:
                                 pass
+                    remote_status = _remote_text_status(loader_id, settings)
+                    if remote_status:
+                        backend_mode = "remote"
+                        supports = False
+                        loaded = bool(remote_status.get("active") and remote_status.get("configured"))
+                        configured_model_path = str(remote_status.get("model") or configured_model_path or "").strip()
                     main = {
                         "kind": "main",
                         "type_id": "text_llm",
@@ -4900,6 +4944,8 @@ def install(app) -> None:
                         "supports_load": supports,
                         "pid": None if (backend_mode or "embedded") == "llama_server" else (server_pid if loaded else None),
                         "backend_mode": backend_mode or "embedded",
+                        "remote": bool(remote_status),
+                        "remote_provider_id": str(remote_status.get("provider_id") or "") if remote_status else "",
                         "managed_server_id": managed_id or None,
                         "managed_server": managed_status,
                         "expected_gguf_filename": expected_gguf_filename or None,
