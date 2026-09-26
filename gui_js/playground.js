@@ -31,6 +31,7 @@ state.pluginPrefs = state.pluginPrefs || { enabled: {} };
 state.ui = state.ui || {};
 state.projects = state.projects || {};
 state.sessions = state.sessions || {};
+state.sessionAccess = state.sessionAccess || {};
 if (query.get("pid")) state.ui.activePid = query.get("pid");
 if (query.get("sid")) state.ui.activeSid = query.get("sid");
 
@@ -198,6 +199,7 @@ function serverBase() {
 function requestHeaders(extra = {}) {
   const headers = { ...extra };
   if (state.auth?.token) headers.Authorization = `Bearer ${state.auth.token}`;
+  if (!state.auth?.token && state.auth?.guestId) headers["X-Guest-Id"] = state.auth.guestId;
   if (state.auth?.alias) headers["X-User-Alias"] = state.auth.alias;
   return headers;
 }
@@ -215,6 +217,73 @@ async function apiJson(path, options = {}) {
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(payload?.detail || payload?.error || `HTTP ${response.status}`);
   return payload;
+}
+
+function ensureGuestId() {
+  if (state.auth?.token) return "";
+  const existing = String(state.auth?.guestId || "").trim();
+  if (existing) return existing;
+  const bytes = new Uint8Array(16);
+  if (window.crypto?.getRandomValues) window.crypto.getRandomValues(bytes);
+  else for (let i = 0; i < bytes.length; i += 1) bytes[i] = Math.floor(Math.random() * 256);
+  const id = Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
+  state.auth = { ...(state.auth || {}), guestId: id };
+  try { localStorage.setItem(STORAGE_AUTH_KEY, JSON.stringify({ auth: state.auth })); } catch (_err) {}
+  return id;
+}
+
+function activeSessionAccess() {
+  const sid = String(state.ui.activeSid || "");
+  return sid ? (state.sessionAccess?.[sid] || null) : null;
+}
+
+function hasGuestSessionAccess() {
+  const access = activeSessionAccess();
+  return Boolean(!state.auth?.token && access?.can_access && access?.allow_guest);
+}
+
+async function refreshSessionAccess() {
+  const pid = String(state.ui.activePid || "");
+  const sid = String(state.ui.activeSid || "");
+  if (!pid || !sid) return null;
+  if (!state.auth?.token) ensureGuestId();
+  try {
+    const data = await apiJson(`/v1/projects/${encodeURIComponent(pid)}/sessions/${encodeURIComponent(sid)}/access`, {
+      headers: { "X-Project-ID": pid, "X-Session-ID": sid },
+    });
+    state.sessionAccess = { ...(state.sessionAccess || {}), [sid]: data?.ok ? data : null };
+    return state.sessionAccess[sid];
+  } catch (_err) {
+    state.sessionAccess = { ...(state.sessionAccess || {}), [sid]: null };
+    return null;
+  }
+}
+
+function canUseActiveSession() {
+  if (state.auth?.token) return true;
+  return hasGuestSessionAccess();
+}
+
+async function loadProjectGuiPrefs() {
+  const pid = String(state.ui.activePid || "");
+  const sid = String(state.ui.activeSid || "");
+  if (!pid) return false;
+  if (!state.auth?.token && !hasGuestSessionAccess()) return false;
+  const suffix = sid ? `?sid=${encodeURIComponent(sid)}` : "";
+  try {
+    const data = await apiJson(`/v1/projects/${encodeURIComponent(pid)}/gui_prefs${suffix}`, {
+      headers: { "X-Project-ID": pid, "X-Session-ID": sid },
+    });
+    if (data?.unauthenticated) return false;
+    const prefs = data?.prefs && typeof data.prefs === "object" ? data.prefs : {};
+    const pluginPrefs = prefs.plugin_state && typeof prefs.plugin_state === "object" ? prefs.plugin_state : null;
+    if (pluginPrefs) {
+      state.pluginPrefs = mergeDeep(state.pluginPrefs || {}, pluginPrefs);
+    }
+    return true;
+  } catch (_err) {
+    return false;
+  }
 }
 
 function setPlaygroundComposerText(text) {
@@ -289,7 +358,10 @@ async function sendPlaygroundMessage(text, options = {}) {
   const sid = String(state.ui.activeSid || "");
   const message = String(text ?? app.composerText).trim();
   if (!pid || !sid) throw new Error("Select a project and session first.");
-  if (!state.auth?.token) throw new Error("Authentication is required.");
+  if (!state.auth?.token) {
+    const access = activeSessionAccess() || await refreshSessionAccess();
+    if (!access?.can_access || !access?.allow_guest) throw new Error("This playground is private. Sign in to access it.");
+  }
   if (!message) return false;
   const clientMsgId = `playground-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
   setPlaygroundComposerText("");
@@ -305,6 +377,7 @@ async function sendPlaygroundMessage(text, options = {}) {
       message,
       stream: true,
       client_msg_id: clientMsgId,
+      alias: String(state.auth?.alias || "").trim() || "Guest",
       system: String(options.system || "").trim() || undefined,
     }),
   });
@@ -532,7 +605,11 @@ function updateScope(scope = {}) {
 async function loadSessionMessages() {
   const pid = String(state.ui.activePid || "");
   const sid = String(state.ui.activeSid || "");
-  if (!pid || !sid || !state.auth?.token) return [];
+  if (!pid || !sid) return [];
+  if (!canUseActiveSession()) {
+    const access = await refreshSessionAccess();
+    if (!access?.can_access) return [];
+  }
   try {
     const data = await apiJson(`/v1/projects/${encodeURIComponent(pid)}/sessions/${encodeURIComponent(sid)}/messages?limit=200&tail=1`, {
       headers: { "X-Project-ID": pid, "X-Session-ID": sid },
@@ -610,7 +687,12 @@ function targetPanel() {
   return app.panels.find((entry) => entry.pluginId === targetPluginId)?.tab || null;
 }
 
+function canOpenPluginSettings() {
+  return Boolean(String(state.auth?.token || "").trim());
+}
+
 function settingsProviders() {
+  if (!canOpenPluginSettings()) return [];
   const pluginIds = new Set([targetPluginId]);
   app.playgroundAssets.forEach((asset) => {
     if (asset.targetPluginId === targetPluginId && asset.settings !== false) pluginIds.add(asset.pluginId);
@@ -627,6 +709,7 @@ function closeSettingsMenu() {
 }
 
 function openSettings(provider = null) {
+  if (!canOpenPluginSettings()) return;
   const selected = provider || settingsProviders()[0] || null;
   const panel = selected?.panel || selected || targetPanel();
   if (!panel) return;
@@ -642,6 +725,7 @@ function openSettings(provider = null) {
 }
 
 function handleSettingsButton() {
+  if (!canOpenPluginSettings()) return;
   const providers = settingsProviders();
   if (providers.length <= 1) {
     openSettings(providers[0] || null);
@@ -751,6 +835,18 @@ window.addEventListener("beforeunload", () => {
 async function boot() {
   updateScope();
   try {
+    const access = await refreshSessionAccess();
+    const scopedToSession = Boolean(String(state.ui.activePid || "") && String(state.ui.activeSid || ""));
+    if (scopedToSession && !state.auth?.token && !access?.can_access) {
+      setConnected("Access denied", true);
+      const note = document.createElement("div");
+      note.className = "pg-error";
+      note.textContent = "This playground belongs to a private chat session. Sign in with a permitted account to access it.";
+      dom.canvas.replaceChildren(note);
+      dom.settingsButton.disabled = true;
+      return;
+    }
+    await loadProjectGuiPrefs();
     await loadPlugins();
     renderPlayground();
     await loadSessionMessages();
