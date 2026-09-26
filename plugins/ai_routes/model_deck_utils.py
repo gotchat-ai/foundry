@@ -196,6 +196,28 @@ def _workflow_flow_name(model_settings: Dict[str, Any]) -> str:
     return ""
 
 
+def _settings_identity_compatible(base: Dict[str, Any], overlay: Dict[str, Any]) -> bool:
+    if not isinstance(base, dict) or not isinstance(overlay, dict) or not overlay:
+        return True
+    identity_pairs = (
+        ("model_deck_compat_manifest_id",),
+        ("tested_profile_id", "model_deck_compat_manifest_id"),
+        ("model_workflow_flow_name",),
+        ("model_workflow_template_flow_name", "model_workflow_flow_name"),
+        ("model_family",),
+        ("workflow_variant",),
+        ("model_id",),
+    )
+    for pair in identity_pairs:
+        base_key = pair[0]
+        overlay_key = pair[-1]
+        base_value = str((base or {}).get(base_key) or "").strip().lower()
+        overlay_value = str((overlay or {}).get(overlay_key) or "").strip().lower()
+        if base_value and overlay_value and base_value != overlay_value:
+            return False
+    return True
+
+
 def _prefer_image_to_video_flow(flow_name: str, model_settings: Dict[str, Any], source_image: str) -> str:
     if not str(source_image or "").strip():
         return flow_name
@@ -236,16 +258,50 @@ def _load_model_workflow_blueprint_flows(settings: Dict[str, Any], model_setting
     wanted_names = {
         str(flow_name or "").strip(),
         str((model_settings or {}).get("model_workflow_flow_name") or "").strip(),
-        "Models / Unsloth LTX 2.3 GGUF",
     }
     wanted_names = {x for x in wanted_names if x}
     wanted_ids = {
         str((model_settings or {}).get("workflow_id") or "").strip(),
+        str((model_settings or {}).get("model_workflow_id") or "").strip(),
+        str((model_settings or {}).get("agent_flow_default_workflow_id") or "").strip(),
         str((model_settings or {}).get("workflow_model_loader_id") or "").strip(),
-        "models.unsloth_ltx23_gguf",
-        "unsloth_ltx23_gguf",
     }
     wanted_ids = {x for x in wanted_ids if x}
+    workflow_fields = " ".join(
+        str((model_settings or {}).get(key) or "")
+        for key in (
+            "workflow_id",
+            "workflow_model_loader_id",
+            "model_workflow_id",
+            "agent_flow_default_workflow_id",
+            "model_workflow_flow_name",
+            "model_workflow_template_flow_name",
+            "model_family",
+            "model_deck_compat_manifest_id",
+        )
+    ).lower()
+    if "ltx" in workflow_fields or "unsloth_ltx" in workflow_fields:
+        wanted_names.add("Models / Unsloth LTX 2.3 GGUF")
+        wanted_ids.update({"models.unsloth_ltx23_gguf", "unsloth_ltx23_gguf"})
+    default_flow_path = os.path.join(str(base), "projects", "agent_flow", "default.json")
+    if os.path.isfile(default_flow_path):
+        try:
+            with open(default_flow_path, "r", encoding="utf-8") as fh:
+                default_doc = json.load(fh)
+        except Exception:
+            default_doc = {}
+        default_flows = default_doc.get("flows") if isinstance(default_doc, dict) else None
+        if isinstance(default_flows, dict):
+            for wanted_name in wanted_names:
+                flow_def = default_flows.get(wanted_name)
+                if isinstance(flow_def, dict):
+                    return {wanted_name: dict(flow_def)}
+            for candidate_name, flow_def in default_flows.items():
+                if not isinstance(flow_def, dict):
+                    continue
+                wf_id = str(flow_def.get("workflow_id") or flow_def.get("id") or "").strip()
+                if wf_id and wf_id in wanted_ids:
+                    return {str(candidate_name): dict(flow_def)}
     matches: List[Tuple[float, Dict[str, Any]]] = []
     try:
         entries = list(os.scandir(root))
@@ -288,10 +344,6 @@ def _load_model_workflow_blueprint_flows(settings: Dict[str, Any], model_setting
             wf_id = str(flow_def.get("workflow_id") or flow_def.get("id") or "").strip()
             if wf_id in wanted_ids:
                 score += 5.0
-            runtime = flow_def.get("runtime") if isinstance(flow_def.get("runtime"), dict) else {}
-            engine = str(runtime.get("engine") or "").strip()
-            if engine == "model_deck.workflow_model_loader":
-                score += 2.0
         lower_name = entry.name.lower()
         if "ltx" in lower_name and "unsloth" in " ".join(wanted_ids).lower():
             score += 1.0
@@ -348,7 +400,10 @@ def _run_agent_flow_model_workflow(
         workflow_settings["__request_prompt"] = prompt
         workflow_settings["use_default_when_blank"] = False
         workflow_settings["wan_optional_use_default_when_blank"] = False
-    workflow_settings.setdefault("model_workflow_use_model_deck_default_assets", True)
+    if "model_workflow_use_model_deck_default_assets" not in workflow_settings:
+        workflow_settings["model_workflow_use_model_deck_default_assets"] = model_type != "image_gen"
+    if "use_model_deck_default_assets" not in workflow_settings:
+        workflow_settings["use_model_deck_default_assets"] = model_type != "image_gen"
     workflow_assets: Dict[str, Any] = {}
     media_keys = {
         "input_image_paths",
@@ -421,7 +476,12 @@ def _run_agent_flow_model_workflow(
         }
     ext = {
         "agent_flow_active_flow": flow_name,
-        "agent_flow_active_workflow_id": str(model_settings.get("workflow_id") or "").strip(),
+        "agent_flow_active_workflow_id": str(
+            model_settings.get("workflow_id")
+            or model_settings.get("model_workflow_id")
+            or model_settings.get("agent_flow_default_workflow_id")
+            or ""
+        ).strip(),
         "agent_flow_force_runtime_flow": False,
         "agent_flow_internal_run": True,
         "model_workflow_direct_request": True,
@@ -774,7 +834,19 @@ def resolve_model_deck_default(
     if not isinstance(t, dict):
         return None, f"model_deck_type_missing:{model_type}"
 
-    mid = str(t.get("default_model_id") or "").strip()
+    override_keys = (
+        f"{model_type}_model_id",
+        f"{model_type}_deck_model_id",
+        "model_deck_model_id",
+    )
+    mid = ""
+    for key in override_keys:
+        value = str((settings or {}).get(key) or "").strip()
+        if value:
+            mid = value
+            break
+    if not mid:
+        mid = str(t.get("default_model_id") or "").strip()
     if not mid:
         return None, "model_deck_default_missing"
     m = find_model(t, mid)
@@ -806,7 +878,7 @@ def resolve_main_text_llm_fallback(settings: Dict[str, Any]) -> Tuple[Optional[D
     loader_id = str(provider_result.get("loader_id") or "").strip()
     if not model_id:
         return None, "main_text_llm_model_missing"
-    if loader_id not in ("model_loader.model_deck.text_llm", "model_loader.gguf"):
+    if loader_id not in ("model_loader.model_deck.text_llm", "model_loader.gguf") and not loader_id.startswith("remote_model."):
         return None, f"main_text_llm_loader_unsupported:{loader_id}"
     return {
         "model_id": model_id,
@@ -1150,17 +1222,40 @@ class ModelDeckRunner:
 
     def _bind_model_from_deck(self, info: Dict[str, Any], loader_id: str) -> Dict[str, Any]:
         reg = self.settings.get("__model_loader_registry", None)
-        if reg is None:
-            return {"error": "model_loader_registry_missing"}
-
         app = get_server_app(self.settings, reg)
         use_main_fallback = bool(info.get("use_main_text_llm_fallback"))
         sid = "_default" if use_main_fallback else str(self.settings.get("__sid") or "_default")
         slot = "text_llm_main" if use_main_fallback else self.slot
 
+        use_settings = dict(info.get("settings") or {})
+        if loader_id.startswith("remote_model.") or str(use_settings.get("model_location") or "").strip().lower() == "remote":
+            if app is None:
+                return {"error": "server_app_missing_for_remote_model"}
+            provider_id = str(use_settings.get("remote_provider_id") or loader_id.replace("remote_model.", "", 1)).strip()
+            services = getattr(getattr(app, "state", None), "plugin_services", None)
+            service = (services or {}).get(provider_id) if isinstance(services, dict) else None
+            if not isinstance(service, dict) or service.get("kind") != "remote_text_model":
+                return {"error": f"remote_text_model_provider_missing:{provider_id or loader_id}"}
+            getter = service.get("get_active_model")
+            model = getter() if callable(getter) else None
+            if model is None:
+                return {"error": f"remote_text_model_inactive:{provider_id or loader_id}"}
+            return {
+                "model": model,
+                "loader": None,
+                "sid": sid,
+                "slot": slot,
+                "persist": True,
+                "settings": use_settings,
+                "backend_mode": "remote",
+                "managed_llama_server": False,
+            }
+
+        if reg is None:
+            return {"error": "model_loader_registry_missing"}
+
         loader = reg.get(loader_id) if hasattr(reg, "get") else None
         gguf_loader = reg.get("model_loader.gguf") if hasattr(reg, "get") else None
-        use_settings = dict(info.get("settings") or {})
         backend_mode = str((use_settings.get("backend_mode") or "")).strip().lower()
         managed_llama_server = False
 
@@ -1417,6 +1512,20 @@ class ImageGenRunner:
         loader_id = str(info.get("loader_id") or "")
         model_settings = dict(info.get("settings") or {})
         model_settings.update(self.settings.get("image_gen_model_settings") or {})
+        try:
+            print(
+                "[image_gen] merged_model_settings "
+                f"loader_id={loader_id!r} "
+                f"model_id={str(model_settings.get('model_id') or model_settings.get('model') or '')!r} "
+                f"repo_id={str(model_settings.get('repo_id') or '')!r} "
+                f"device={str(model_settings.get('device') or '')!r} "
+                f"dtype={str(model_settings.get('dtype') or '')!r} "
+                f"cpu_offload={model_settings.get('enable_model_cpu_offload')!r} "
+                f"seq_offload={model_settings.get('enable_sequential_cpu_offload')!r}",
+                flush=True,
+            )
+        except Exception:
+            pass
         if _is_workflow_model_loader_settings(info, model_settings):
             return _run_agent_flow_model_workflow(
                 settings=self.settings,
@@ -1843,7 +1952,42 @@ class VideoGenRunner:
             return {"ok": False, "error": f"unsupported_loader:{loader_id}"}
 
         model_settings = dict(info.get("settings") or {})
-        model_settings.update(self.settings.get("video_gen_model_settings") or {})
+        model_overrides = self.settings.get("video_gen_model_settings") or {}
+        if isinstance(model_overrides, dict) and model_overrides:
+            if _settings_identity_compatible(model_settings, model_overrides):
+                model_settings.update(model_overrides)
+            else:
+                media_override_keys = {
+                    "input_image_paths",
+                    "image_paths",
+                    "source_image_path",
+                    "first_image_path",
+                    "input_image_path",
+                    "init_image_path",
+                    "reference_image_path",
+                    "last_image_path",
+                    "target_image_path",
+                    "end_image_path",
+                    "workflow_media_inputs",
+                    "prompt",
+                    "positive_prompt",
+                    "__request_prompt",
+                }
+                for key in media_override_keys:
+                    value = model_overrides.get(key)
+                    if value not in (None, "", [], {}):
+                        model_settings[key] = value
+                try:
+                    print(
+                        "[video_gen.workflow] skipped_incompatible_model_settings_overlay "
+                        f"selected_flow={str(model_settings.get('model_workflow_flow_name') or '')!r} "
+                        f"overlay_flow={str(model_overrides.get('model_workflow_flow_name') or '')!r} "
+                        f"selected_compat={str(model_settings.get('model_deck_compat_manifest_id') or '')!r} "
+                        f"overlay_compat={str(model_overrides.get('model_deck_compat_manifest_id') or '')!r}",
+                        flush=True,
+                    )
+                except Exception:
+                    pass
         if _is_workflow_model_loader_settings(info, model_settings):
             runtime_params = {
                 "num_frames": num_frames,
