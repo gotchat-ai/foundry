@@ -1773,6 +1773,25 @@ def _service_active_remote_text_model(app: Any) -> Any:
         services = getattr(getattr(app, "state", None), "plugin_services", None)
         if not isinstance(services, dict):
             return None
+        provider = getattr(getattr(app, "state", None), "main_text_llm_provider", None)
+        provider_id = ""
+        if callable(provider):
+            try:
+                row = provider() or {}
+            except Exception:
+                row = {}
+            if isinstance(row, dict):
+                loader_id = str(row.get("loader_id") or "").strip()
+                settings = row.get("settings") if isinstance(row.get("settings"), dict) else {}
+                if loader_id.startswith("remote_model.") or str(settings.get("model_location") or "").strip().lower() == "remote":
+                    provider_id = str(settings.get("remote_provider_id") or loader_id.replace("remote_model.", "", 1)).strip()
+        if provider_id:
+            service = services.get(provider_id)
+            if isinstance(service, dict) and service.get("kind") == "remote_text_model":
+                getter = service.get("get_active_model")
+                model = getter() if callable(getter) else None
+                if model is not None:
+                    return model
         for plugin_id in sorted(services):
             service = services.get(plugin_id)
             if not isinstance(service, dict) or service.get("kind") != "remote_text_model":
@@ -1840,24 +1859,21 @@ def _service_text_model_available(app: Any) -> bool:
 
 
 def _service_ensure_text_model(app: Any) -> bool:
+    model = _service_resolve_text_model(app)
+    if model is not None:
+        return _service_text_model_available(app)
     try:
         state = getattr(app, "state", None)
-        getter = getattr(state, "model", None)
     except Exception:
         return False
-    try:
-        model = getter() if callable(getter) else getter
-    except Exception:
-        model = None
-    if model is not None:
-        return True
     try:
         ensure_main = getattr(state, "ensure_main_text_llm_loaded", None)
     except Exception:
         ensure_main = None
     if callable(ensure_main):
         try:
-            return ensure_main() is not None
+            model = ensure_main()
+            return bool(model is not None and (hasattr(model, "stream_chat") or hasattr(model, "chat") or getattr(model, "model_id", None)))
         except Exception:
             return False
     return False
@@ -3511,6 +3527,26 @@ class _DB:
                 finally:
                     con.close()
 
+    def update_message_meta(self, *, msg_id: str, meta_patch: Dict[str, Any]) -> None:
+            patch = dict(meta_patch or {})
+            if not patch:
+                return
+            with self._lock:
+                con = self._connect()
+                try:
+                    row = con.execute("SELECT meta_json FROM messages WHERE msg_id=?", (msg_id,)).fetchone()
+                    meta: Dict[str, Any] = {}
+                    if row is not None:
+                        try:
+                            meta = json.loads(str(row[0] or "{}"))
+                        except Exception:
+                            meta = {}
+                    meta.update(patch)
+                    con.execute("UPDATE messages SET meta_json=? WHERE msg_id=?", (json.dumps(meta), msg_id))
+                    con.commit()
+                finally:
+                    con.close()
+
     def list_messages(
         self,
         *,
@@ -4196,6 +4232,9 @@ def install(app) -> None:
         alias = str(request.headers.get("X-User-Alias") or "").strip()
         if alias:
             headers["X-User-Alias"] = alias
+        guest_id = str(request.headers.get("X-Guest-Id") or "").strip()
+        if guest_id and not auth and not xauth:
+            headers["X-Guest-Id"] = guest_id
         return headers
 
     async def _wait_for_agent_flow_completion(pid: str, sid: str, run_id: str, headers: Dict[str, str], timeout_s: float) -> Dict[str, Any]:
@@ -5822,8 +5861,7 @@ def install(app) -> None:
 
             if not _service_ensure_text_model(app):
                 raise RuntimeError("chat_model_not_loaded")
-            model_fn = getattr(app.state, "model", None)
-            model_obj = model_fn() if callable(model_fn) else None
+            model_obj = _service_resolve_text_model(app)
             if model_obj is None:
                 raise RuntimeError("chat_model_not_loaded")
             settings_fn = getattr(app.state, "settings", None)
@@ -5962,8 +6000,7 @@ def install(app) -> None:
         successful = [row for row in action_history if isinstance(row, dict) and row.get("ok")]
         if not successful:
             return
-        model_fn = getattr(app.state, "model", None)
-        model_obj = model_fn() if callable(model_fn) else None
+        model_obj = _service_resolve_text_model(app)
         if model_obj is None or not hasattr(model_obj, "stream_chat"):
             return
         synthesis_prompt = (
@@ -6015,8 +6052,7 @@ def install(app) -> None:
         draft = str(draft_text or "").strip()
         if not draft:
             return
-        model_fn = getattr(app.state, "model", None)
-        model_obj = model_fn() if callable(model_fn) else None
+        model_obj = _service_resolve_text_model(app)
         if model_obj is None or not hasattr(model_obj, "stream_chat"):
             return
         system_prompt = (
@@ -6056,8 +6092,7 @@ def install(app) -> None:
         draft = str(draft_text or "").strip()
         if not draft:
             return
-        model_fn = getattr(app.state, "model", None)
-        model_obj = model_fn() if callable(model_fn) else None
+        model_obj = _service_resolve_text_model(app)
         if model_obj is None or not hasattr(model_obj, "stream_chat"):
             return
         system_prompt = (
@@ -6476,15 +6511,20 @@ def install(app) -> None:
         except Exception:
             pass
         require_gui_plugin_enabled(request, gui_plugin_id=GUI_PLUGIN_ID)
-        u = _require_user(app, request)
-        _require_session_access(app, u, pid, sid)
+        actor = _require_user_or_guest(app, request, pid, sid, alias_value=body.alias)
+        u = actor["user"]
         prompt = str(body.message or body.prompt or body.content or "").strip()
         if not prompt:
             raise HTTPException(status_code=400, detail="service_chat_message_required")
         print(f"[collab_chat.route] service_chat start pid={pid!r} sid={sid!r}", flush=True)
-        prefs = db.get_gui_prefs_effective(pid, u.username)
+        prefs = db.get_gui_prefs_effective(pid, u.username) if actor["kind"] == "user" else db.get_gui_prefs_default(pid)
         router_cfg = _extract_router_config_from_prefs(prefs, pid, sid)
-        alias = str((prefs.get("alias") if isinstance(prefs, dict) else None) or u.username).strip() or u.username
+        pref_alias = prefs.get("alias") if isinstance(prefs, dict) else None
+        alias = actor.get("alias") if actor["kind"] == "guest" else str(pref_alias or body.alias or u.username).strip() or u.username
+        meta = {"via": "service_chat"}
+        if actor["kind"] == "guest":
+            meta["is_guest"] = True
+            meta["guest_id"] = actor.get("guest_id")
         user_msg = _service_user_message(
             db,
             pid,
@@ -6493,7 +6533,7 @@ def install(app) -> None:
             author_username=u.username,
             author_alias=alias,
             client_msg_id=str(body.client_msg_id or ""),
-            meta={"via": "service_chat"},
+            meta=meta,
         )
         _service_publish_live_message(app, pid, sid, user_msg)
         wants_stream = _service_chat_wants_stream(request, body)
@@ -8360,12 +8400,23 @@ def install(app) -> None:
     #     return {"ok": True, "prefs": prefs}
 
     @r.get("/v1/projects/{pid}/gui_prefs")
-    def get_gui_prefs(pid: str, request: Request):
+    def get_gui_prefs(pid: str, request: Request, sid: Optional[str] = Query(None)):
         require_gui_plugin_enabled(request, gui_plugin_id=GUI_PLUGIN_ID)
         try:
             u = _require_user(app, request)
         except HTTPException as exc:
             if int(getattr(exc, "status_code", 0) or 0) in {401, 403}:
+                guest_sid = str(sid or "").strip()
+                if guest_sid:
+                    _require_user_or_guest(app, request, pid, guest_sid)
+                    default_prefs = db.get_gui_prefs_default(pid)
+                    return {
+                        "ok": True,
+                        "prefs": default_prefs,
+                        "default_prefs": default_prefs,
+                        "user_prefs": {},
+                        "guest": True,
+                    }
                 # GUI prefs are optional client state. Let settings panels open
                 # even before auth/bootstrap has completed; saving still
                 # requires a user in the PUT route.
@@ -9128,9 +9179,11 @@ def install(app) -> None:
                             _forward_token(piece)
                     if not saw_live_tokens:
                         full = assistant_text
-                    elif assistant_text and assistant_text != full:
-                        full = assistant_text
                     db.set_message_content(msg_id=asst_msg_id, content=full)
+                    try:
+                        db.update_message_meta(msg_id=asst_msg_id, meta_patch={"partial": False})
+                    except Exception:
+                        pass
                     try:
                         hub.publish(
                             pid,
@@ -9378,6 +9431,10 @@ def install(app) -> None:
                         full = assistant_text
                     db.set_message_content(msg_id=asst_msg_id, content=full)
                     try:
+                        db.update_message_meta(msg_id=asst_msg_id, meta_patch={"partial": False})
+                    except Exception:
+                        pass
+                    try:
                         hub.publish(
                             pid,
                             sid,
@@ -9624,6 +9681,7 @@ def install(app) -> None:
                 # Final persist + finalize meta (meta stays as-is in DB; we mark completion via events)
                 try:
                     db.set_message_content(msg_id=asst_msg_id, content=full)
+                    db.update_message_meta(msg_id=asst_msg_id, meta_patch={"partial": False})
                 except Exception:
                     pass
 
