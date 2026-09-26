@@ -33,8 +33,21 @@ class AppCorsManager:
             allow_origins=self.cors_origins,
             allow_origin_regex=self.cors_origin_regex,
             allow_credentials=False,
-            allow_methods=["*"],
-            allow_headers=["*"],
+            allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
+            allow_headers=[
+                "Accept",
+                "Authorization",
+                "Content-Type",
+                "X-Auth-Token",
+                "X-Events-Token",
+                "X-Guest-Id",
+                "X-Gui-Enabled-Plugins",
+                "X-Project-Id",
+                "X-Session-Id",
+                "X-Upload-Filename",
+                "X-User-Alias",
+                "X-ARTalk-FLAME-License-Accepted",
+            ],
         )
 
     def origin_allowed(self, origin: str) -> bool:
@@ -55,14 +68,20 @@ class AppCorsManager:
     def apply_headers(self, response: Response, origin: str) -> Response:
         if not origin:
             return response
-        allow_origin = "*" if "*" in self.cors_origins else origin
+        # Reflect an allowed origin. Firefox does not accept wildcard
+        # Allow-Headers for non-wildcard headers such as Authorization.
+        allow_origin = origin
         response.headers["Access-Control-Allow-Origin"] = allow_origin
-        response.headers["Access-Control-Allow-Methods"] = "*"
-        response.headers["Access-Control-Allow-Headers"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
+        response.headers["Access-Control-Allow-Headers"] = (
+            "Accept, Authorization, Content-Type, X-Auth-Token, X-Events-Token, "
+            "X-Guest-Id, X-Gui-Enabled-Plugins, X-Project-Id, X-Session-Id, "
+            "X-Upload-Filename, X-User-Alias, X-ARTalk-FLAME-License-Accepted"
+        )
         response.headers["Access-Control-Max-Age"] = "86400"
         vary = response.headers.get("Vary", "")
         vary_parts = [v.strip() for v in vary.split(",") if v.strip()]
-        if allow_origin != "*" and "Origin" not in vary_parts:
+        if "Origin" not in vary_parts:
             vary_parts.append("Origin")
         if vary_parts:
             response.headers["Vary"] = ", ".join(vary_parts)
