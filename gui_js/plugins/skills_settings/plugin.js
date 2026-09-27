@@ -121,7 +121,7 @@ function renderPanelHtml(ctx) {
   const gsProvider = draftValue("googleScholarProvider", savedGoogle.provider || "auto");
   const gsSearxngBase = draftValue("googleScholarSearxngBase", savedGoogle.searxng_base_url || "");
   const gsSearxngEngines = draftValue("googleScholarSearxngEngines", savedGoogle.searxng_engines || "google scholar");
-  const spawnerRemoteCap = draftValue("spawnAiJobRemoteCap", savedSpawner.remote_max_concurrent_jobs || "3");
+  const spawnerCap = draftValue("spawnAiJobCap", savedSpawner.max_concurrent_jobs || savedSpawner.remote_max_concurrent_jobs || "3");
   const customSkill = st.drafts.customSkillId || "";
   const customKey = st.drafts.customKey || "";
   const customValue = st.drafts.customValue || "";
@@ -142,9 +142,9 @@ function renderPanelHtml(ctx) {
       </div>
       <div class="skills-settings-card">
         <div class="skills-settings-title">Concurrent AI Job Spawner</div>
-        <div class="skills-settings-sub"><span class="skills-settings-code">workflow.spawn_ai_job</span> can start chat/router jobs or Agent Flow workflows in the background. Local llama-server jobs use the active model parallel slots; remote/unknown models use this cap.</div>
+        <div class="skills-settings-sub"><span class="skills-settings-code">workflow.spawn_ai_job</span> can start chat/router jobs or Agent Flow workflows in the background. Remote jobs use this cap; local llama-server jobs are clamped to the active model's process slots to avoid overloading the GPU.</div>
         <div class="skills-settings-grid">
-          <div class="skills-settings-field"><label>Remote max concurrent jobs</label><input class="skills-settings-input" data-ss-draft="spawnAiJobRemoteCap" type="number" min="1" max="64" step="1" value="${escapeHtml(spawnerRemoteCap)}" /></div>
+          <div class="skills-settings-field"><label>Max concurrent spawned jobs</label><input class="skills-settings-input" data-ss-draft="spawnAiJobCap" type="number" min="1" max="64" step="1" value="${escapeHtml(spawnerCap)}" /></div>
         </div>
         <div class="skills-settings-actions">
           <button class="primary" data-ss-save-spawner>Save Concurrent Job Settings</button>
@@ -197,11 +197,11 @@ function bindPanel(ctx, root) {
     }
   });
   root.querySelector("[data-ss-save-spawner]")?.addEventListener("click", async () => {
-    const cap = Math.max(1, Math.min(64, Number(st.drafts.spawnAiJobRemoteCap || 3) || 3));
+    const cap = Math.max(1, Math.min(64, Number(st.drafts.spawnAiJobCap || 3) || 3));
     try {
       await apiJson(ctx, `/v1/skills_settings/${encodeURIComponent("workflow.spawn_ai_job")}`, {
         method: "PUT",
-        body: JSON.stringify({ settings: { remote_max_concurrent_jobs: cap } }),
+        body: JSON.stringify({ settings: { max_concurrent_jobs: cap, remote_max_concurrent_jobs: cap } }),
       });
       st.message = "Saved concurrent AI job settings.";
       await loadSettings(ctx);
