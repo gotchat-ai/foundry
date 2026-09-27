@@ -4,5 +4,6 @@
   "kind": "ui",
   "description": "Agent Flow designer for router plugin flows.",
   "category": "Agent/Workflows",
-  "entry": "plugin.js"
+  "entry": "plugin.js",
+  "rev": "20260926-explicit-route-preserve-1"
 }
