@@ -22,6 +22,10 @@ PERMISSIONS = ["html.stitch_job_images", "html.*"]
 
 
 _IMG_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
+_CSS_URL_RE = re.compile(
+    r"url\(\s*(?P<quote>['\"]?)(?P<src>(?!data:)[^'\"\)]+)(?P=quote)\s*\)",
+    re.IGNORECASE,
+)
 
 
 def _template(value: Any, ctx: Dict[str, Any], params: Dict[str, Any]) -> Any:
@@ -90,6 +94,18 @@ def _set_attr(tag: str, name: str, value: Any) -> str:
     return tag[:-1].rstrip() + f' {name}="{escaped}">'
 
 
+def _set_css_url(match: re.Match[str], value: str) -> str:
+    quote = match.group("quote") or "'"
+    prefix = match.group(0)[: match.start("src") - match.start()]
+    suffix = match.group(0)[match.end("src") - match.start() :]
+    escaped = str(value or "").strip().replace("\\", "/")
+    if not escaped:
+        return match.group(0)
+    if not quote:
+        return f"url({escaped})"
+    return f"{prefix}{escaped}{suffix}"
+
+
 def run(ctx: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
     ctx = dict(ctx or {})
     params = dict(params or {})
@@ -114,36 +130,56 @@ def run(ctx: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
     job_ids = [str(_template(slot.get("job_id"), ctx, params) or "").strip() for slot in slots]
     jobs = {str(row.get("job_id") or "").strip(): row for row in _job_snapshot(app, job_ids)}
     html = html_path.read_text(encoding="utf-8", errors="replace")
-    matches = list(_IMG_RE.finditer(html))
-    if len(matches) < len(slots):
-        return {
-            "ok": False,
-            "data": {"html_path": str(html_path), "img_count": len(matches), "slot_count": len(slots)},
-            "warnings": ["not_enough_img_tags"],
-        }
+    targets: List[Dict[str, Any]] = []
+    for match in _CSS_URL_RE.finditer(html):
+        targets.append({"kind": "css_url", "match": match, "start": match.start()})
+    for match in _IMG_RE.finditer(html):
+        targets.append({"kind": "img", "match": match, "start": match.start()})
+    targets.sort(key=lambda row: int(row.get("start") or 0))
+    if len(targets) < len(slots):
+        insert_at = html.lower().rfind("</body>")
+        if insert_at < 0:
+            insert_at = len(html)
+        additions = []
+        for idx in range(len(targets), len(slots)):
+            alt = str(slots[idx].get("alt") or f"Generated image {idx + 1}").replace("&", "&amp;").replace('"', "&quot;")
+            additions.append(f'\n<img src="" alt="{alt}" loading="lazy" decoding="async">')
+        html = html[:insert_at] + "".join(additions) + html[insert_at:]
+        targets = []
+        for match in _CSS_URL_RE.finditer(html):
+            targets.append({"kind": "css_url", "match": match, "start": match.start()})
+        for match in _IMG_RE.finditer(html):
+            targets.append({"kind": "img", "match": match, "start": match.start()})
+        targets.sort(key=lambda row: int(row.get("start") or 0))
 
     replacements: List[Dict[str, Any]] = []
     missing: List[str] = []
     pieces: List[str] = []
     cursor = 0
     for idx, slot in enumerate(slots):
-        match = matches[idx]
+        if idx >= len(targets):
+            break
+        target = targets[idx]
+        match = target["match"]
         job_id = str(_template(slot.get("job_id"), ctx, params) or "").strip()
         job = jobs.get(job_id) or {}
         src = _image_ref(job)
         if not src:
             missing.append(job_id or f"slot_{idx}")
             src = str(slot.get("fallback_src") or "").strip()
-        tag = match.group(0)
-        if src:
-            tag = _set_attr(tag, "src", src)
-        for attr in ("alt", "width", "height", "loading", "decoding"):
-            if slot.get(attr) not in (None, ""):
-                tag = _set_attr(tag, attr, slot.get(attr))
+        if target.get("kind") == "css_url":
+            replacement = _set_css_url(match, src)
+        else:
+            replacement = match.group(0)
+            if src:
+                replacement = _set_attr(replacement, "src", src)
+            for attr in ("alt", "width", "height", "loading", "decoding"):
+                if slot.get(attr) not in (None, ""):
+                    replacement = _set_attr(replacement, attr, slot.get(attr))
         pieces.append(html[cursor:match.start()])
-        pieces.append(tag)
+        pieces.append(replacement)
         cursor = match.end()
-        replacements.append({"job_id": job_id, "src": src, "tag_index": idx})
+        replacements.append({"job_id": job_id, "src": src, "target_index": idx, "target_kind": target.get("kind")})
     pieces.append(html[cursor:])
     new_html = "".join(pieces)
     changed = new_html != html
@@ -159,6 +195,7 @@ def run(ctx: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
             "replacements": replacements,
             "missing": missing,
             "changed": changed,
+            "target_count": len(targets),
         },
         "warnings": [f"missing_image_job:{item}" for item in missing],
     }
