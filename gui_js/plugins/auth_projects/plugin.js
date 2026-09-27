@@ -2802,6 +2802,18 @@ const plugin = {
 
       const st = getCollabState(ctx2);
       if (payload?.handled) return;
+      const routeId = String(payload?.route_id || payload?.ext?.route_id || "").trim().toLowerCase();
+      const routerEnabled = Array.isArray(payload?.router_enabled_plugins)
+        ? payload.router_enabled_plugins
+        : (Array.isArray(payload?.ext?.router_enabled_plugins) ? payload.ext.router_enabled_plugins : []);
+      const hasExplicitRoute = Boolean(
+        (routeId && !["auto", "chat", "none", "__none__"].includes(routeId))
+        || routerEnabled.some((item) => String(item || "").trim())
+        || String(payload?.ext?.agent_flow_active_flow || payload?.ext?.agent_flow_default_flow || "").trim()
+      );
+      if (hasExplicitRoute) {
+        return;
+      }
 
       if (st.forceAiOnce) {
         // let normal flow continue (AI on)
