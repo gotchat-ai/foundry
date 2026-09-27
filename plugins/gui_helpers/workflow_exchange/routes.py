@@ -13,7 +13,7 @@ from typing import Any, Dict
 
 from fastapi import APIRouter, Body, Request
 
-from awf_pass_log import append_pass_log_row
+from awf_success_log import append_success_log_row
 from plugins.gui_helpers._framework.utils import require_gui_plugin_enabled
 from plugins.gui_helpers.agent_flow.skills.workflow import temp_library as workflow_temp_library
 from plugins.gui_helpers.agent_flow.skills.workflow import run_suite as workflow_run_suite
@@ -52,7 +52,7 @@ from .trust import summarize_trust
 
 
 GUI_PLUGIN_ID = "workflow_exchange"
-PASS_LOG_PATH = Path(__file__).resolve().parents[3] / "awf_imported_passes_20260620.csv"
+SUCCESS_LOG_PATH = Path(__file__).resolve().parents[3] / "awf_imported_successes_20260620.csv"
 
 
 def _load_settings(app) -> Dict[str, Any]:
@@ -120,7 +120,7 @@ def _temp_library_ctx(app, pid: str) -> Dict[str, Any]:
     return {"app": app, "pid": pid, "settings": _runtime_base_settings(app)}
 
 
-def _append_temp_library_pass_log(
+def _append_temp_library_success_log(
     *,
     request_id: str = "",
     request_dir: str = "",
@@ -134,8 +134,8 @@ def _append_temp_library_pass_log(
     if not isinstance(record, dict):
         return
     try:
-        append_pass_log_row(
-            PASS_LOG_PATH,
+        append_success_log_row(
+            SUCCESS_LOG_PATH,
             {
                 "request_id": str(request_id or "").strip(),
                 "request_dir": str(request_dir or "").strip(),
@@ -1370,7 +1370,7 @@ def install(app) -> None:
             if isinstance(reg, dict) and reg.get("ok"):
                 temp_record = reg.get("record") if isinstance(reg.get("record"), dict) else {}
                 temp_record_id = str(temp_record.get("id") or temp_record.get("workflow_id") or "").strip()
-                _append_temp_library_pass_log(
+                _append_temp_library_success_log(
                     request_id=temp_record_id or str(payload.get("import_id") or package_payload.get("workflow_id") or "").strip(),
                     source_file=str(payload.get("workflow_file") or workflow_file or "").strip(),
                     record=temp_record,
@@ -2528,3 +2528,5 @@ def install(app) -> None:
         return exchange_local_skill_repair.run({"app": request.app}, dict(payload or {}))
 
     app.include_router(r)
+
+
