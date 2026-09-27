@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Request, UploadFile, File, Query
 from pydantic import BaseModel, Field
 
-from awf_pass_log import append_pass_log_row
+from awf_success_log import append_success_log_row
 from plugins.gui_helpers._framework.services import get_plugin_service
 from plugins.gui_helpers._framework.utils import require_gui_plugin_enabled
 from .skills import register_agent_flow_skills, build_agent_flow_tool_registry, discover_agent_flow_skills
@@ -40,7 +40,7 @@ from .model_workflow_process import ModelWorkflowProcessManager
 
 
 GUI_PLUGIN_ID = "agent_flow"
-PASS_LOG_PATH = Path(__file__).resolve().parents[3] / "awf_imported_passes_20260620.csv"
+SUCCESS_LOG_PATH = Path(__file__).resolve().parents[3] / "awf_imported_successes_20260620.csv"
 
 
 def _require_user(app: Any, request: Request) -> Any:
@@ -189,7 +189,7 @@ def install(app) -> None:
     def _resolve_generated_path(raw_path: str) -> Path:
         return _resolve_cross_env_generated_path({"app": app}, str(raw_path or "").strip())
 
-    def _append_temp_library_pass_log(
+    def _append_temp_library_success_log(
         *,
         request_id: str = "",
         request_dir: str = "",
@@ -203,8 +203,8 @@ def install(app) -> None:
         if not isinstance(record, dict):
             return
         try:
-            append_pass_log_row(
-                PASS_LOG_PATH,
+            append_success_log_row(
+                SUCCESS_LOG_PATH,
                 {
                     "request_id": str(request_id or "").strip(),
                     "request_dir": str(request_dir or "").strip(),
@@ -508,6 +508,102 @@ def install(app) -> None:
         add_rows(_workflow_store.project_flow_records({"app": app, "pid": pid}, pid))
         add_rows(_workflow_store.default_flow_records({"app": app}))
         return {"by_id": by_id, "by_name": by_name}
+
+    def _mention_tokens(text: Any) -> List[str]:
+        raw = str(text or "").lower()
+        return [tok for tok in re.split(r"[^a-z0-9_]+", raw) if len(tok) >= 2]
+
+    def _workflow_mention_description(flow_name: str, flow_def: Any, record: Optional[Dict[str, Any]] = None) -> str:
+        rec = record if isinstance(record, dict) else {}
+        parts = [
+            rec.get("description"),
+            rec.get("summary"),
+            rec.get("source_request"),
+        ]
+        if isinstance(flow_def, dict):
+            parts.extend([
+                flow_def.get("description"),
+                flow_def.get("info"),
+                flow_def.get("short_info"),
+            ])
+            nodes = flow_def.get("nodes") if isinstance(flow_def.get("nodes"), dict) else {}
+            if nodes:
+                labels: List[str] = []
+                for node in list(nodes.values())[:4]:
+                    if not isinstance(node, dict):
+                        continue
+                    label = str(node.get("label") or node.get("node_id") or "").strip()
+                    if label:
+                        labels.append(label)
+                if labels:
+                    parts.append(" -> ".join(labels))
+        for part in parts:
+            text = str(part or "").strip()
+            if text:
+                return text
+        return f"Run workflow {flow_name}."
+
+    def _workflow_mention_shortkey(flow_name: str) -> str:
+        words = [tok for tok in re.split(r"[^A-Za-z0-9]+", str(flow_name or "")) if tok]
+        skip = {"models", "model", "workflow", "flow", "agent", "the", "and", "for"}
+        kept = [word for word in words if word.lower() not in skip]
+        if not kept:
+            kept = words
+        return "-".join(kept[:5]).lower()[:42] or str(flow_name or "workflow").lower()[:42]
+
+    def _is_model_workflow_name(flow_name: Any) -> bool:
+        return str(flow_name or "").strip().lower().startswith("models /")
+
+    def _model_workflows_only(flows: Any) -> Dict[str, Any]:
+        if not isinstance(flows, dict):
+            return {}
+        return {str(name): flow for name, flow in flows.items() if _is_model_workflow_name(name)}
+
+    def _workflow_mention_score(query: str, item: Dict[str, Any]) -> float:
+        q = str(query or "").strip().lower()
+        name = str(item.get("flow_name") or "").strip()
+        shortkey = str(item.get("shortkey") or "").strip()
+        desc = str(item.get("description") or "").strip()
+        hay = " ".join([name, shortkey, desc, " ".join(item.get("tags") or [])]).lower()
+        q_canon = re.sub(r"[^a-z0-9]+", "", q)
+        name_canon = re.sub(r"[^a-z0-9]+", "", name.lower())
+        shortkey_canon = re.sub(r"[^a-z0-9]+", "", shortkey.lower())
+        if not q:
+            base = 0.25
+        elif q_canon and q_canon in {name_canon, shortkey_canon}:
+            base = 1.0
+        elif q_canon and (name_canon.startswith(q_canon) or shortkey_canon.startswith(q_canon)):
+            base = 0.96
+        elif q_canon and (q_canon in name_canon or q_canon in shortkey_canon):
+            base = 0.9
+        elif shortkey.lower().startswith(q):
+            base = 1.0
+        elif name.lower().startswith(q):
+            base = 0.95
+        elif q in shortkey.lower():
+            base = 0.88
+        elif q in name.lower():
+            base = 0.82
+        else:
+            q_tokens = set(_mention_tokens(q))
+            h_tokens = set(_mention_tokens(hay))
+            overlap = len(q_tokens & h_tokens)
+            prefix_overlap = 0
+            if q_tokens and h_tokens:
+                for q_tok in q_tokens:
+                    if any(h_tok.startswith(q_tok) or q_tok.startswith(h_tok) for h_tok in h_tokens):
+                        prefix_overlap += 1
+            best_overlap = max(overlap, prefix_overlap)
+            base = (best_overlap / max(1, len(q_tokens))) * 0.72 if q_tokens else 0.0
+        stored = 0.0
+        for key in ("selection_score", "match_score", "record_score"):
+            try:
+                stored = max(stored, float(item.get(key) or 0.0))
+            except Exception:
+                pass
+        if stored > 1.0:
+            stored = min(stored / 100.0, 1.0)
+        return round(min(1.0, base * 0.82 + stored * 0.18), 4)
 
     def _find_temp_library_record_from_filesystem(flow_name: str = "", workflow_id: str = "") -> Optional[Dict[str, Any]]:
         wanted_id = str(workflow_id or "").strip()
@@ -939,7 +1035,7 @@ def install(app) -> None:
                     },
                 },
             )
-            _append_temp_library_pass_log(
+            _append_temp_library_success_log(
                 request_id=final_dir.name,
                 source_file=filename,
                 record=record,
@@ -4640,12 +4736,39 @@ def install(app) -> None:
 
                 if bool(locals().get("is_model_workflow")):
                     _startup_checkpoint("model_workflow_skip_chat_model_resolve")
+                    resolved_chat_model = None
                     core = RouterCore(chat_llm=None, backend_type="model_workflow", settings=settings)
                 else:
                     _startup_checkpoint("chat_model_resolve_before")
-                    core = RouterCore(chat_llm=_resolve_chat_model(), backend_type="auto", settings=settings)
+                    resolved_chat_model = _resolve_chat_model()
+                    core = RouterCore(chat_llm=resolved_chat_model, backend_type="auto", settings=settings)
                     _startup_checkpoint("chat_model_resolve_after")
                 core.settings["__resolve_chat_model"] = _resolve_chat_model
+
+                def _agent_flow_backend_hints() -> Dict[str, Any]:
+                    model_obj = resolved_chat_model
+                    hints: Dict[str, Any] = {}
+                    try:
+                        if getattr(model_obj, "is_remote_api_model", False):
+                            hints.update({
+                                "source": "remote",
+                                "backend": "remote",
+                                "backend_type": "remote",
+                                "backend_mode": "remote",
+                                "model_location": "remote",
+                            })
+                            return hints
+                    except Exception:
+                        pass
+                    try:
+                        backend_mode = str(getattr(model_obj, "backend_mode", "") or "").strip()
+                        if backend_mode:
+                            hints["backend_mode"] = backend_mode
+                            hints["backend_type"] = backend_mode
+                    except Exception:
+                        pass
+                    return hints
+
                 _startup_checkpoint("load_member_routes_before")
                 routes = load_routes(core) or []
                 _startup_checkpoint("load_member_routes_after")
@@ -4998,14 +5121,18 @@ def install(app) -> None:
                     if tool_name.startswith("sheet.") and not any(str(merged_params.get(k) or "").strip() for k in ("file", "path", "file_path")) and fallback_file_hint:
                         merged_params["path"] = fallback_file_hint
 
+                    backend_hints = _agent_flow_backend_hints()
+                    tool_ctx_ext = dict(step_ext) if isinstance(step_ext, dict) else {}
+                    tool_ctx_ext.update(backend_hints)
                     tool_ctx = {
                         "app": app,
                         "pid": pid,
                         "sid": sid,
                         "settings": settings,
-                        "ext": dict(step_ext) if isinstance(step_ext, dict) else {},
+                        "ext": tool_ctx_ext,
                         "user_text": request_seed_text,
                         "original_request": request_seed_text,
+                        **backend_hints,
                     }
                     if str(tool_name or "").startswith("models."):
                         try:
@@ -7119,6 +7246,9 @@ def install(app) -> None:
                                 for skill_id_pre in allowed_result_pre:
                                     sid_pre = str(skill_id_pre or "").strip().lower()
                                     params_pre: Dict[str, Any] = {"user_request": user_text}
+                                    tc_pre = ps_pre.get("tool_config") if isinstance(ps_pre.get("tool_config"), dict) else {}
+                                    tc_pre_params = tc_pre.get("params") if isinstance(tc_pre.get("params"), dict) else {}
+                                    tc_pre_fallback = tc_pre.get("fallback_params") if isinstance(tc_pre.get("fallback_params"), dict) else {}
                                     if sid_pre == "result.text":
                                         params_pre.update({
                                             "text": summary_text_pre,
@@ -7128,10 +7258,16 @@ def install(app) -> None:
                                             "actions": list((last_step_report or {}).get("actions") or []) if isinstance(last_step_report, dict) else [],
                                         })
                                     elif sid_pre in {"result.file", "result.files"}:
-                                        if file_seed_pre:
+                                        if str(tc_pre.get("tool") or "").strip().lower() == sid_pre and (tc_pre_params or tc_pre_fallback):
+                                            params_pre.update(dict(tc_pre_params))
+                                            params_pre.update(dict(tc_pre_fallback))
+                                        elif file_seed_pre:
                                             params_pre["files"] = list(file_seed_pre)
                                     elif sid_pre == "result.zip":
-                                        if file_seed_pre:
+                                        if str(tc_pre.get("tool") or "").strip().lower() == sid_pre and (tc_pre_params or tc_pre_fallback):
+                                            params_pre.update(dict(tc_pre_params))
+                                            params_pre.update(dict(tc_pre_fallback))
+                                        elif file_seed_pre:
                                             params_pre["files"] = list(file_seed_pre)
                                             params_pre["archive_name"] = archive_name_pre
                                     raw_pre = aw_call_pre(skill_id_pre, {"app": app, "pid": pid, "sid": sid, "settings": settings}, params_pre)
@@ -7245,7 +7381,7 @@ def install(app) -> None:
                         tc_direct = ps_direct.get("tool_config") if isinstance(ps_direct.get("tool_config"), dict) else {}
                         node_type_direct = str(ps_direct.get("node_type") or "").strip().lower()
                         tool_name = str(tc_direct.get("tool") or "").strip()
-                        if not tool_name and len(allowed_direct) == 1:
+                        if not tool_name and node_type_direct == "tool_node" and len(allowed_direct) == 1:
                             tool_name = str(allowed_direct[0] or "").strip()
                         if node_type_direct != "tool_node" and not tool_name:
                             return None
@@ -7626,15 +7762,19 @@ def install(app) -> None:
 
                             tool_settings = dict(settings)
                             tool_settings["__agent_flow_progress_callback"] = _model_tool_progress
+                            backend_hints = _agent_flow_backend_hints()
+                            tool_ctx_ext = dict(step_ext) if isinstance(step_ext, dict) else {}
+                            tool_ctx_ext.update(backend_hints)
                             tool_ctx = {
                                 "app": app,
                                 "pid": pid,
                                 "sid": sid,
                                 "settings": tool_settings,
-                                "ext": dict(step_ext) if isinstance(step_ext, dict) else {},
+                                "ext": tool_ctx_ext,
                                 "user_text": request_seed_text,
                                 "original_request": request_seed_text,
                                 "progress": _model_tool_progress,
+                                **backend_hints,
                             }
                             if str(tool_name or "").startswith("models."):
                                 seed_artifacts = state.get("artifacts") if isinstance(state.get("artifacts"), dict) else {}
@@ -7753,6 +7893,21 @@ def install(app) -> None:
                                 continue
                             if k not in tr_row["data"]:
                                 tr_row["data"][k] = v
+                        if tool_name == "workflow.spawn_ai_job":
+                            try:
+                                spawn_data = tr_row.get("data") if isinstance(tr_row.get("data"), dict) else {}
+                                cap_info = spawn_data.get("cap_info") if isinstance(spawn_data.get("cap_info"), dict) else {}
+                                _publish_step_stream(
+                                    "[agent_flow] "
+                                    f"{label}: spawn cap="
+                                    f"{spawn_data.get('cap')} active={spawn_data.get('active')} "
+                                    f"backend={cap_info.get('backend_mode')} source={cap_info.get('source')} "
+                                    f"requested={cap_info.get('requested_cap')} local_cap={cap_info.get('local_cap')} "
+                                    f"include_external={spawn_data.get('include_external_active_jobs')} "
+                                    f"spawned={len(spawn_data.get('spawned') or [])} skipped={len(spawn_data.get('skipped') or [])}"
+                                )
+                            except Exception:
+                                pass
                         status_word = "ok" if tr_row["ok"] else "failed"
                         try:
                             data_status = str((tr_row.get("data") if isinstance(tr_row.get("data"), dict) else {}).get("status") or "").strip().lower()
@@ -8184,14 +8339,18 @@ def install(app) -> None:
                                         if str(merged_params.get(k) or "").strip():
                                             merged_params[k] = file_hint
 
+                                backend_hints = _agent_flow_backend_hints()
+                                tool_ctx_ext = dict(step_ext) if isinstance(step_ext, dict) else {}
+                                tool_ctx_ext.update(backend_hints)
                                 tool_ctx = {
                                     "app": app,
                                     "pid": pid,
                                     "sid": sid,
                                     "settings": settings,
-                                    "ext": dict(step_ext) if isinstance(step_ext, dict) else {},
+                                    "ext": tool_ctx_ext,
                                     "user_text": request_seed_text,
                                     "original_request": request_seed_text,
+                                    **backend_hints,
                                 }
                                 if str(tool_name or "").startswith("models."):
                                     seed_artifacts = state.get("artifacts") if isinstance(state.get("artifacts"), dict) else {}
@@ -8607,15 +8766,24 @@ def install(app) -> None:
                                             ).strip()
                                             if _is_repo_analysis_only_request(user_text, flow_name_enf):
                                                 continue
-                                            file_seed = _tool_result_paths(last_step_report)
-                                            if not file_seed and isinstance(last_step_report_with_tools, dict):
-                                                file_seed = _tool_result_paths(last_step_report_with_tools)
-                                            if not file_seed and isinstance(prev_step_report_with_tools, dict):
-                                                file_seed = _tool_result_paths(prev_step_report_with_tools)
-                                            if file_seed:
-                                                params_enf = {"files": file_seed}
-                                                if sid_l == "result.zip":
-                                                    params_enf["archive_name"] = "agent_flow_result_bundle.zip"
+                                            tc_enf = ps_enf.get("tool_config") if isinstance(ps_enf.get("tool_config"), dict) else {}
+                                            if str(tc_enf.get("tool") or "").strip().lower() == sid_l:
+                                                p_cfg = tc_enf.get("params") if isinstance(tc_enf.get("params"), dict) else {}
+                                                p_fb = tc_enf.get("fallback_params") if isinstance(tc_enf.get("fallback_params"), dict) else {}
+                                                params_enf.update(dict(p_cfg))
+                                                params_enf.update(dict(p_fb))
+                                            if not params_enf:
+                                                file_seed = _tool_result_paths(last_step_report)
+                                                if not file_seed and isinstance(last_step_report_with_tools, dict):
+                                                    file_seed = _tool_result_paths(last_step_report_with_tools)
+                                                if not file_seed and isinstance(prev_step_report_with_tools, dict):
+                                                    file_seed = _tool_result_paths(prev_step_report_with_tools)
+                                                if file_seed:
+                                                    params_enf = {"files": file_seed}
+                                                    if sid_l == "result.zip":
+                                                        params_enf["archive_name"] = "agent_flow_result_bundle.zip"
+                                            if sid_l.startswith("result."):
+                                                params_enf.setdefault("user_request", user_text)
                                         else:
                                             tc_enf = ps_enf.get("tool_config") if isinstance(ps_enf.get("tool_config"), dict) else {}
                                             if str(tc_enf.get("tool") or "").strip().lower() == sid_l:
@@ -9638,6 +9806,22 @@ def install(app) -> None:
                                 content_res = ""
                         except Exception:
                             media_output_files = []
+                        try:
+                            generated_site_files: List[Path] = []
+                            for _fp_site in _collect_result_files_any(
+                                recent_changed_files,
+                                last_step_report,
+                                last_step_report_with_tools,
+                            ):
+                                norm_site = str(_fp_site).replace("\\", "/").lower()
+                                if "/generated_sites/" in norm_site and _fp_site.is_file() and int(_fp_site.stat().st_size or 0) > 0:
+                                    generated_site_files.append(_fp_site)
+                            if generated_site_files and str(final_result_mode or "").strip().lower() == "text":
+                                final_result_mode = "files"
+                                meta_res["flow_result_mode"] = "files"
+                                content_res = ""
+                        except Exception:
+                            pass
                         substantive_text_result = len(str(content_res or "").strip()) >= 80
                         text_mode_selected = str(final_result_mode or "").strip().lower() == "text"
                         analysis_repo_review_result = False
@@ -10747,6 +10931,121 @@ def install(app) -> None:
             "hidden_count": max(0, len(flows or {}) - len(visible_flows)),
         }
 
+    @r.get("/v1/projects/{pid}/sessions/{sid}/agent_flow/shortkeys/suggest")
+    @r.get("/v1/projects/{pid}/sessions/{sid}/agent_flow/workflow_mentions/suggest")
+    def agent_flow_shortkeys_suggest(
+        pid: str,
+        sid: str,
+        request: Request,
+        q: str = Query("", max_length=120),
+        limit: int = Query(8, ge=1, le=20),
+    ):
+        require_gui_plugin_enabled(request, gui_plugin_id=GUI_PLUGIN_ID)
+        u = _require_user(app, request)
+        _require_session_access(app, u, pid, sid)
+        query = str(q or "").strip()
+        data = _load_project_flows(pid)
+        project_flows = data.get("flows") if isinstance(data, dict) and isinstance(data.get("flows"), dict) else {}
+        flows = dict(project_flows or {})
+        default_model_flows = _model_workflows_only(_default_flow_library() or {})
+        if str(pid or "").strip() != "default":
+            try:
+                default_project_doc = _load_project_flows("default")
+                default_project_flows = default_project_doc.get("flows") if isinstance(default_project_doc, dict) and isinstance(default_project_doc.get("flows"), dict) else {}
+                default_model_flows.update(_model_workflows_only(default_project_flows))
+            except Exception:
+                pass
+        for model_name, model_flow in default_model_flows.items():
+            flows.setdefault(model_name, model_flow)
+        flows, _hydrated_from_model_deck_for_shortkeys = _hydrate_model_deck_ltx_workflow_flows(flows)
+        visible_flows = _filter_flows_for_user(u, flows)
+
+        records_by_name: Dict[str, Dict[str, Any]] = {}
+        for row in _workflow_store.project_flow_records({"app": app, "pid": pid}, pid):
+            name = str((row or {}).get("flow_name") or "").strip()
+            if name and name not in records_by_name:
+                records_by_name[name] = row
+        if str(pid or "").strip() != "default":
+            for row in _workflow_store.project_flow_records({"app": app, "pid": "default"}, "default"):
+                name = str((row or {}).get("flow_name") or "").strip()
+                if name and _is_model_workflow_name(name) and name not in records_by_name:
+                    records_by_name[name] = row
+        for row in _workflow_store.default_flow_records({"app": app}):
+            name = str((row or {}).get("flow_name") or "").strip()
+            if name and _is_model_workflow_name(name) and name not in records_by_name:
+                records_by_name[name] = row
+
+        suggestions: List[Dict[str, Any]] = []
+        seen_names: set[str] = set()
+
+        if query.lower() in {"ai", "a"} or not query:
+            ai_item = {
+                "kind": "ai",
+                "flow_name": "@ai",
+                "shortkey": "ai",
+                "description": "Turn AI on for this chat session.",
+                "score": 1.0 if query.lower() == "ai" else 0.74,
+                "source": "chat",
+            }
+            suggestions.append(ai_item)
+
+        for flow_name, flow_def in visible_flows.items():
+            name = str(flow_name or "").strip()
+            if not name:
+                continue
+            rec = records_by_name.get(name) or {}
+            item = {
+                "kind": "workflow",
+                "source": "model" if _is_model_workflow_name(name) and name not in project_flows else "project",
+                "flow_name": name,
+                "workflow_id": str(rec.get("workflow_id") or rec.get("id") or "").strip(),
+                "shortkey": _workflow_mention_shortkey(name),
+                "description": _workflow_mention_description(name, flow_def, rec),
+                "node_count": len((flow_def or {}).get("nodes") or {}) if isinstance(flow_def, dict) else 0,
+                "tags": list(rec.get("tags") or []) if isinstance(rec.get("tags"), list) else [],
+            }
+            item["score"] = _workflow_mention_score(query, item)
+            if item["score"] <= 0 and query:
+                continue
+            suggestions.append(item)
+            seen_names.add(name)
+
+        for rec in _workflow_store.list_temp_library_records({"app": app, "pid": pid}):
+            if not isinstance(rec, dict):
+                continue
+            name = str(rec.get("flow_name") or "").strip()
+            if not name or name in seen_names:
+                continue
+            if not _is_model_workflow_name(name):
+                continue
+            temp_flow_json = rec.get("flow_json") if isinstance(rec.get("flow_json"), dict) else {}
+            item = {
+                "kind": "workflow",
+                "source": "model",
+                "flow_name": name,
+                "workflow_id": str(rec.get("workflow_id") or rec.get("id") or "").strip(),
+                "shortkey": _workflow_mention_shortkey(name),
+                "description": _workflow_mention_description(name, temp_flow_json, rec),
+                "node_count": len(temp_flow_json.get("nodes") or {}) if isinstance(temp_flow_json, dict) else 0,
+                "tags": list(rec.get("tags") or []) if isinstance(rec.get("tags"), list) else [],
+                "selection_score": rec.get("selection_score"),
+                "match_score": rec.get("match_score"),
+                "record_score": rec.get("record_score"),
+            }
+            if isinstance(temp_flow_json, dict) and temp_flow_json:
+                item["flow_json"] = temp_flow_json
+            item["score"] = _workflow_mention_score(query, item)
+            if item["score"] <= 0 and query:
+                continue
+            suggestions.append(item)
+
+        suggestions.sort(key=lambda row: (float(row.get("score") or 0.0), str(row.get("source") or "") == "project"), reverse=True)
+        return {
+            "ok": True,
+            "query": query,
+            "items": suggestions[: max(1, min(int(limit or 8), 20))],
+        }
+
     @r.post("/v1/projects/{pid}/sessions/{sid}/agent_flow/flows")
     def agent_flow_flows_save(pid: str, sid: str, payload: Dict[str, Any], request: Request):
         require_gui_plugin_enabled(request, gui_plugin_id=GUI_PLUGIN_ID)
@@ -10961,3 +11260,5 @@ def install(app) -> None:
 
     app.include_router(r)
     print("[gui_helpers] agent_flow routes installed")
+
+
