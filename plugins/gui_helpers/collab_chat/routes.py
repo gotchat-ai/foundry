@@ -53,6 +53,7 @@ _INTERNAL_SESSION_PREFIXES: Tuple[str, ...] = (
     "parent_",
     "status_",
     "subflow_",
+    "tracked_site_worker_",
     "validate_",
 )
 
