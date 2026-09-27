@@ -10041,6 +10041,21 @@ const plugin = {
       if (!payload || typeof payload !== "object") return payload;
       const sid = payload.sid || ctx.state.ui.activeSid;
       if (!sid) return payload;
+      const payloadExt = payload.ext && typeof payload.ext === "object" ? payload.ext : {};
+      const payloadRouteId = String(payload.route_id || payloadExt.route_id || "").trim().toLowerCase();
+      const payloadRouters = [
+        ...(Array.isArray(payload.router_enabled_plugins) ? payload.router_enabled_plugins : []),
+        ...(Array.isArray(payloadExt.router_enabled_plugins) ? payloadExt.router_enabled_plugins : []),
+      ].map((item) => String(item || "").trim().toLowerCase()).filter(Boolean);
+      const payloadActiveFlow = String(payloadExt.agent_flow_active_flow || payloadExt.agent_flow_default_flow || "").trim();
+      const hasExplicitAgentFlowRoute = (
+        payloadRouteId === "agent_flow"
+        || payloadRouters.includes("agent_flow")
+        || (payloadActiveFlow && payloadActiveFlow !== NO_FLOW_VALUE && !isSpecialFlowSelectionValue(payloadActiveFlow))
+      );
+      if (hasExplicitAgentFlowRoute) {
+        return payload;
+      }
       if (directChatBypassBySid.has(String(sid))) {
         directChatBypassBySid.delete(String(sid));
         const ext = payload.ext && typeof payload.ext === "object" ? { ...payload.ext } : {};
