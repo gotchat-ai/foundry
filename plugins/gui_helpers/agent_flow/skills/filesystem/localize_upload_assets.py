@@ -22,7 +22,10 @@ NAME = "filesystem.localize_upload_assets"
 PERMISSIONS = ["filesystem.localize_upload_assets", "filesystem.*"]
 
 
-_UPLOAD_REF_RE = re.compile(r"(?P<quote>['\"])(?P<url>/uploads/(?P<name>[^'\"?#) >]+)(?:[?#][^'\") >]*)?)(?P=quote)")
+_UPLOAD_REF_RE = re.compile(
+    r"(?P<quote>['\"])(?P<url>(?:https?://[^'\"?#) >]+)?/uploads/(?P<name>[^'\"?#) >]+)(?:[?#][^'\") >]*)?)(?P=quote)",
+    re.IGNORECASE,
+)
 
 
 def _data_uploads_dir(ctx: Dict[str, Any]) -> Path:
@@ -44,6 +47,22 @@ def _unique_dest(dest_dir: Path, name: str) -> Path:
         if not next_candidate.exists():
             return next_candidate
     return dest_dir / f"{stem}-{len(list(dest_dir.glob(stem + '*')))}{suffix}"
+
+
+def _target_name(params: Dict[str, Any], idx: int, fallback: str) -> str:
+    names = params.get("filenames")
+    if isinstance(names, list) and idx < len(names):
+        text = str(names[idx] or "").strip()
+        if text:
+            return Path(text).name
+    return Path(fallback).name
+
+
+def _bool_param(params: Dict[str, Any], name: str, default: bool = False) -> bool:
+    value = params.get(name, default)
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def run(ctx: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
@@ -70,8 +89,9 @@ def run(ctx: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
     copied: List[Dict[str, str]] = []
     missing: List[str] = []
     replacements: Dict[str, str] = {}
+    overwrite_existing = _bool_param(params, "overwrite_existing", False)
 
-    for match in _UPLOAD_REF_RE.finditer(html):
+    for idx, match in enumerate(_UPLOAD_REF_RE.finditer(html)):
         url = match.group("url")
         name = match.group("name")
         if url in replacements:
@@ -80,7 +100,8 @@ def run(ctx: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
         if not src.is_file():
             missing.append(url)
             continue
-        dest = _unique_dest(asset_dir, src.name)
+        target_name = _target_name(params, idx, src.name)
+        dest = (asset_dir / target_name).resolve() if overwrite_existing else _unique_dest(asset_dir, target_name)
         shutil.copy2(src, dest)
         rel = dest.relative_to(html_path.parent).as_posix()
         if not rel.startswith("."):
@@ -121,6 +142,8 @@ TOOL_SPEC = {
         "properties": {
             "html_path": {"type": "string"},
             "asset_dir": {"type": "string"},
+            "filenames": {"type": "array", "items": {"type": "string"}},
+            "overwrite_existing": {"type": "boolean"},
             "cwd": {"type": "string"},
             "base_dir": {"type": "string"},
         },
