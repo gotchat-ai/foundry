@@ -43,11 +43,78 @@ def _filename(url: str, params: Dict[str, Any], resp: Any) -> str:
     return name or "download.bin"
 
 
+def _download_base(ctx: Dict[str, Any], params: Dict[str, Any]) -> str:
+    settings = (ctx or {}).get("settings") if isinstance(ctx, dict) else {}
+    settings = settings if isinstance(settings, dict) else {}
+    base = (
+        params.get("base_url")
+        or params.get("download_base_url")
+        or params.get("server_url")
+        or params.get("chat_server_url")
+        or params.get("chatServerUrl")
+        or settings.get("base_url")
+        or settings.get("download_base_url")
+        or settings.get("public_base_url")
+        or settings.get("server_url")
+        or settings.get("chat_server_url")
+        or settings.get("chatServerUrl")
+        or settings.get("__request_base_url")
+        or ""
+    )
+    return str(base or "").strip().rstrip("/")
+
+
+def _absolute_url(ctx: Dict[str, Any], params: Dict[str, Any], url: str) -> str:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme and parsed.netloc:
+        return url
+    base = _download_base(ctx, params)
+    if base and url.startswith("/"):
+        return f"{base}{url}"
+    if base and not parsed.scheme:
+        return f"{base}/{url.lstrip('/')}"
+    return url
+
+
+def _local_upload_source(ctx: Dict[str, Any], url: str) -> Path | None:
+    parsed = urllib.parse.urlparse(url)
+    path = parsed.path or url
+    if not path.startswith("/uploads/"):
+        return None
+    name = Path(urllib.parse.unquote(path)).name
+    if not name:
+        return None
+    src = _uploads_dir(ctx) / name
+    return src if src.is_file() else None
+
+
 def run(ctx: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
     params = params or {}
     url = str(params.get("url") or "").strip()
     if not url:
         return {"ok": False, "data": {}, "warnings": ["url_required"]}
+    local_src = _local_upload_source(ctx or {}, url)
+    if local_src is not None:
+        base_dir = resolve_path(ctx or {}, params or {}, str(params.get("output_dir") or "").strip()) if str(params.get("output_dir") or "").strip() else _uploads_dir(ctx or {})
+        base_dir.mkdir(parents=True, exist_ok=True)
+        name = str(params.get("filename") or "").strip() or local_src.name
+        out = base_dir / Path(name).name
+        if local_src.resolve() != out.resolve():
+            out.write_bytes(local_src.read_bytes())
+        return {
+            "ok": True,
+            "path": str(out),
+            "data": {
+                "url": url,
+                "path": str(out),
+                "filename": out.name,
+                "size_bytes": out.stat().st_size,
+                "content_type": "",
+                "source": str(local_src),
+            },
+            "warnings": [],
+        }
+    url = _absolute_url(ctx or {}, params, url)
     timeout = max(1.0, min(float(params.get("timeout") or 30.0), 120.0))
     headers = {"User-Agent": "llmloader2-agent-flow/1.0"}
     if isinstance(params.get("headers"), dict):
