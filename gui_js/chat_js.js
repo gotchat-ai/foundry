@@ -5654,12 +5654,18 @@ async function loadSessionMessages() {
       appendLog("Join required to send messages.", "warn");
       return;
     }
-    const text = app.dom.composerInput.value.trim();
+    let text = app.dom.composerInput.value.trim();
     if (!pid || !sid) {
       appendLog("Select a project and session first", "warn");
       return;
     }
     if (!text) return;
+    const aiShortkeyMention = /(^|\s)@ai(?=\s|$)/i.test(text);
+    if (aiShortkeyMention) {
+      setAiEnabledEverywhere(pid, sid, true);
+      const stripped = text.replace(/(^|\s)@ai(?=\s|$)/ig, " ").replace(/\s+/g, " ").trim();
+      if (stripped) text = stripped;
+    }
 
     const cleaned = cleanupSessionDrafts(sid);
     if (cleaned && sid === app.state.ui.activeSid) {
@@ -5711,7 +5717,7 @@ async function loadSessionMessages() {
 
   // Commit the user message immediately so the transcript updates without waiting on slow plugins.
   // Plugins can still mutate the message content by returning out.text from sendHooks.
-  const initialPayload = { pid, sid, text, client_msg_id: clientMsgId, handled: false };
+  const initialPayload = { pid, sid, text, client_msg_id: clientMsgId, handled: false, ext: {} };
   const userMsg = {
     msg_id: clientMsgId,
     role: "user",
@@ -5772,8 +5778,20 @@ async function loadSessionMessages() {
       } catch (_err) {}
       return;
     }
-    if (out?.text) payload.text = out.text;
-    if (out?.handled) payload.handled = true;
+    if (out && typeof out === "object") {
+      if (out.text !== undefined) payload.text = String(out.text || "");
+      if (out.handled) payload.handled = true;
+      if (out.route_id !== undefined) payload.route_id = out.route_id;
+      if (Array.isArray(out.router_enabled_plugins)) {
+        payload.router_enabled_plugins = out.router_enabled_plugins.slice();
+      }
+      if (out.ext && typeof out.ext === "object") {
+        payload.ext = {
+          ...(payload.ext && typeof payload.ext === "object" ? payload.ext : {}),
+          ...out.ext,
+        };
+      }
+    }
   }
 
   // Apply any text mutation from plugins to the already-inserted message.
@@ -5801,13 +5819,18 @@ async function loadSessionMessages() {
     const session = app.state.sessions[sid] || {};
     const routerCfg = getCompletionRouterConfig(sid);
     const enabledRouters = Array.isArray(routerCfg?.enabled) ? routerCfg.enabled.filter(Boolean) : [];
+    const hookRouters = Array.isArray(payload.router_enabled_plugins) ? payload.router_enabled_plugins.filter(Boolean) : [];
     appendLog(
-      `[send] backend stream pid=${pid || ""} sid=${sid || ""} source=${session.source || "local"} routers=${enabledRouters.length ? enabledRouters.join(",") : "none"}`,
+      `[send] backend stream pid=${pid || ""} sid=${sid || ""} source=${session.source || "local"} route=${payload.route_id || "auto"} routers=${hookRouters.length ? hookRouters.join(",") : (enabledRouters.length ? enabledRouters.join(",") : "none")} flow=${payload.ext?.agent_flow_active_flow || ""}`,
       "info",
     );
   } catch (_err) {}
 
-  await startCompletionStream(pid, sid, payload.text, clientMsgId);
+  await startCompletionStream(pid, sid, payload.text, clientMsgId, {
+    ext: payload.ext && typeof payload.ext === "object" ? payload.ext : {},
+    route_id: payload.route_id,
+    router_enabled_plugins: Array.isArray(payload.router_enabled_plugins) ? payload.router_enabled_plugins : undefined,
+  });
   consumeCurrentPendingUploads();
 }
 
@@ -6189,7 +6212,7 @@ async function startModelStream(pid, sid, prompt, clientMsgId) {
   }
 }
 
-async function startCompletionStream(pid, sid, prompt, clientMsgId) {
+async function startCompletionStream(pid, sid, prompt, clientMsgId, options = {}) {
   if (!app.state.remote.serverUrl) {
     appendLog("Server URL missing", "error");
     return;
@@ -6209,7 +6232,7 @@ async function startCompletionStream(pid, sid, prompt, clientMsgId) {
   };
   upsertMessage(sid, placeholder);
 
-  const payload = buildCompletionPayload(sid);
+  const payload = buildCompletionPayload(sid, options);
   payload.client_msg_id = clientMsgId;
   const controller = new AbortController();
   let sawDone = false;
@@ -6434,7 +6457,7 @@ async function sendAssistantResponse() {
   await startCompletionStream(pid, sid, "", clientMsgId);
 }
 
-function buildCompletionPayload(sid) {
+function buildCompletionPayload(sid, options = {}) {
   const session = app.state.sessions[sid] || { messages: [] };
   const messages = (session.messages || []).map((m) => ({
     role: m.role || "user",
@@ -6518,6 +6541,18 @@ function buildCompletionPayload(sid) {
   if (repoCtx && isPluginEnabled("repo_panel")) {
     payload.ext = { ...payload.ext, ...repoCtx };
   }
+  if (options && typeof options === "object") {
+    if (options.ext && typeof options.ext === "object") {
+      payload.ext = { ...payload.ext, ...options.ext };
+    }
+    if (Array.isArray(options.router_enabled_plugins)) {
+      payload.router_enabled_plugins = options.router_enabled_plugins.map((item) => String(item || "").trim()).filter(Boolean);
+      payload.ext = { ...payload.ext, router_enabled_plugins: payload.router_enabled_plugins.slice() };
+    }
+    if (options.route_id) {
+      payload.route_id = String(options.route_id || "").trim();
+    }
+  }
   const temp = parseFloat(app.state.prefs.temperature);
   const maxTokens = getEffectiveMaxTokensPreference();
   if (!Number.isNaN(temp)) payload.temperature = temp;
@@ -6543,7 +6578,6 @@ function buildCompletionPayload(sid) {
     delete hooked.ext.__route_debug;
   } else if (!finalRouterCfg.enabled.length) {
     hooked.ext = hooked.ext && typeof hooked.ext === "object" ? hooked.ext : {};
-    delete hooked.ext.agent_flow_active_flow;
     delete hooked.ext.__route_debug;
   }
   return hooked;
@@ -9124,6 +9158,23 @@ function sendComposerMessage() {
     }
   }
 
+  function setAiEnabledEverywhere(pid, sid, enabled) {
+    const ok = setAiEnabledInState(pid, sid, enabled);
+    try {
+      const p = String(pid || "").trim();
+      const s = String(sid || "").trim();
+      if (p && s) {
+        const key = `${p}:${s}`;
+        app.state.auth_projects = app.state.auth_projects || {};
+        app.state.auth_projects.collab = app.state.auth_projects.collab || {};
+        app.state.auth_projects.collab.aiToggleBySession = app.state.auth_projects.collab.aiToggleBySession || {};
+        app.state.auth_projects.collab.aiToggleBySession[key] = Boolean(enabled);
+      }
+    } catch (_err) {}
+    scheduleSave();
+    return ok;
+  }
+
 function getPluginContext() {
     const pid = app.plugins.currentRegistering || "";
     return {
@@ -9168,7 +9219,7 @@ function getPluginContext() {
         });
       },
       getAiEnabled: (pid, sid, fallback) => getAiEnabledFromState(pid, sid, fallback),
-      setAiEnabled: (pid, sid, enabled) => setAiEnabledInState(pid, sid, enabled),
+      setAiEnabled: (pid, sid, enabled) => setAiEnabledEverywhere(pid, sid, enabled),
       randomId: (prefix) => randomId(prefix || "id"),
       buildCompletionPayload: (sid) => buildCompletionPayload(sid),
       renderMessageWithPlugins: (msg, options) => renderMessageWithPlugins(msg, options),
@@ -10637,8 +10688,19 @@ function createPluginHost(fixedPluginId = null) {
     addSendHook(handler, options = {}) {
       const pid = fixedPid || app.plugins.currentRegistering;
       const timeoutMs = Math.max(1, Number(options?.timeoutMs) || 0) || undefined;
-      const entry = { pluginId: pid, fn: handler, ...(timeoutMs ? { timeoutMs } : {}) };
+      const entry = {
+        pluginId: pid,
+        fn: handler,
+        priority: Number(options?.priority || 0),
+        ...(timeoutMs ? { timeoutMs } : {}),
+      };
       app.plugins.slots.sendHooks.push(entry);
+      app.plugins.slots.sendHooks.sort((a, b) => {
+        const ap = Number(a?.priority || 0);
+        const bp = Number(b?.priority || 0);
+        if (bp !== ap) return bp - ap;
+        return String(a?.pluginId || "").localeCompare(String(b?.pluginId || ""));
+      });
       const reg = getPluginRegistry(pid);
       if (reg) reg.sendHooks.push(entry);
     },
