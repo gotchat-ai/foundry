@@ -100,6 +100,43 @@ def _resolve_existing_file(raw):
     return None
 
 
+def _target_root(ctx, params):
+    settings = (ctx or {}).get("settings") if isinstance(ctx, dict) else {}
+    settings = settings if isinstance(settings, dict) else {}
+    raw = (
+        (params or {}).get("target_repo_root")
+        or (params or {}).get("root")
+        or settings.get("target_repo_root")
+        or settings.get("selected_repo_root")
+        or ""
+    )
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    p = _Path(text)
+    candidates = [p] if p.is_absolute() else [
+        _Path.cwd() / p,
+        _Path.cwd() / "llmloader2" / p,
+    ]
+    for cand in candidates:
+        try:
+            resolved = cand.resolve()
+            if resolved.exists():
+                return resolved
+        except Exception:
+            continue
+    return None
+
+
+def _archive_name_for(fp, root):
+    if root is not None:
+        try:
+            return str(fp.relative_to(root)).replace("\\", "/")
+        except Exception:
+            pass
+    return fp.name
+
+
 def _unique_zip_name(name, run_id=""):
     base = _Path(str(name or "agent_flow_result.zip")).name or "agent_flow_result.zip"
     if not base.lower().endswith(".zip"):
@@ -126,9 +163,10 @@ def run(ctx, params):
         up = _uploads_dir(ctx)
         zip_name = _unique_zip_name(archive_name, run_id)
         zip_path = up / zip_name
+        root = _target_root(ctx, params)
         with _zipfile.ZipFile(str(zip_path), "w", compression=_zipfile.ZIP_DEFLATED) as zf:
             for fp in resolved:
-                zf.write(str(fp), arcname=fp.name)
+                zf.write(str(fp), arcname=_archive_name_for(fp, root))
         rel_url = f"/uploads/{zip_name}"
         base = _download_base(ctx, params)
         url = f"{base}{rel_url}" if base else rel_url
