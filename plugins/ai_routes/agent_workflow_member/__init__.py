@@ -78,6 +78,7 @@ PLUGIN_CONFIG_SCHEMA = [
             "tests.smoke",
             "tests.run_project",
             "code.apply_patch",
+            "code.write_file",
             "code.generate_patch_candidates",
             "debug.fix_from_errors",
             "learning.capture_feedback",
@@ -725,6 +726,32 @@ class AgentWorkflowMemberRoute(BaseRoute):
             )
 
         user_text = self._extract_user_text(req)
+        target_repo_root_runtime = self._resolve_target_repo_root(req)
+
+        def _normalize_artifact_path_for_repo(path_value: str) -> str:
+            raw = str(path_value or "").strip().replace("\\", "/")
+            if not raw:
+                return ""
+            try:
+                p_abs = Path(raw)
+                if p_abs.is_absolute() and target_repo_root_runtime:
+                    root_abs = Path(target_repo_root_runtime).resolve()
+                    try:
+                        return str(p_abs.resolve().relative_to(root_abs)).replace("\\", "/")
+                    except Exception:
+                        return raw
+            except Exception:
+                pass
+            prefixes = [
+                "data/agent_workflow/repo/",
+                "./data/agent_workflow/repo/",
+            ]
+            low = raw.lower()
+            for prefix in prefixes:
+                if low.startswith(prefix):
+                    return raw[len(prefix):].lstrip("/")
+            return raw
+
         node_context_chars = int(plugin_settings.get("member_context_chars") or 0)
         if node_context_chars > 0 and len(user_text) > node_context_chars:
             user_text = self._truncate_structured_context(user_text, node_context_chars)
@@ -934,7 +961,7 @@ class AgentWorkflowMemberRoute(BaseRoute):
             target_path_hint
             or re.search(r"\b(repo|repository|codebase|plugin|plugins|folder|directory|file|files)\b", request_low)
         )
-        write_capable = any(s in allowed_skills for s in ["repo.write", "code.apply_patch"])
+        write_capable = any(s in allowed_skills for s in ["repo.write", "code.apply_patch", "code.write_file"])
         build_role = role in {"coder", "staff_engineer", "gui_designer"}
         no_files_written_yet = not bool(changed_files_runtime)
         standalone_artifact_mode = bool(create_intent and not edit_intent and not repo_scope_intent)
@@ -945,17 +972,17 @@ class AgentWorkflowMemberRoute(BaseRoute):
                     "- This request targets an existing repo, plugin, folder, or file.\n"
                     "- You MUST inspect the requested repo area first using repo tools before changing code.\n"
                     "- Prefer precise edits to existing files over creating standalone artifacts.\n"
-                    "- If modifying code, emit write-capable tool calls (`repo.write` or `code.apply_patch`) against the real repo files.\n"
+                    "- If modifying code, emit write-capable tool calls against the real repo files.\n"
                     "- Do NOT create placeholder artifacts like `artifact.txt` for repo-edit requests.\n"
                     "- Do NOT invent a new root `index.html` unless the user explicitly asked for a new file.\n"
                 )
             else:
                 execution_clause = (
                     "- This is a create/build request and your role is part of implementation.\n"
-                    "- You MUST emit at least one write-capable tool call (`repo.write` or `code.apply_patch`).\n"
+                    "- You MUST emit at least one write-capable tool call.\n"
                     "- Do NOT return only `repo.read` or verification-only actions when no artifact exists yet.\n"
                     "- If creating a file, create it directly instead of claiming it already exists.\n"
-                    "- Prefer `code.apply_patch` over `repo.write` for large file creation.\n"
+                    "- Prefer the write skill named in Allowed action skills.\n"
                     "- For large files, use one `write` op followed by multiple `append` ops instead of one giant content string.\n"
                     "- Keep each `content` chunk reasonably small.\n"
                     "- For large file output, prefer the TAGGED protocol instead of JSON tool_calls.\n"
@@ -982,7 +1009,7 @@ class AgentWorkflowMemberRoute(BaseRoute):
                 "  <<<AW_RESPONSE>>>\n...\n<<<END_AW_RESPONSE>>>\n"
                 "  <<<AW_ACTIONS>>>\n- item\n<<<END_AW_ACTIONS>>>\n"
                 "  <<<AW_HANDOFF>>>\n...\n<<<END_AW_HANDOFF>>>\n"
-                "  <<<AW_TOOL_CALL>>>\nskill: code.apply_patch\nreason: ...\npath: relative/file.html\nop: write\n<<<AW_CONTENT>>>\nraw file content here\n<<<END_AW_CONTENT>>>\n<<<END_AW_TOOL_CALL>>>\n"
+                "  <<<AW_TOOL_CALL>>>\nskill: <one allowed write skill>\nreason: ...\npath: relative/file.html\nop: write\n<<<AW_CONTENT>>>\nraw file content here\n<<<END_AW_CONTENT>>>\n<<<END_AW_TOOL_CALL>>>\n"
                 "- For large files, emit additional <<<AW_TOOL_CALL>>> blocks with op: append.\n"
                 "- Do not wrap tagged output in markdown fences.\n"
             )
@@ -1010,7 +1037,7 @@ class AgentWorkflowMemberRoute(BaseRoute):
                 "  <<<AW_RESPONSE>>>\n...\n<<<END_AW_RESPONSE>>>\n"
                 "  <<<AW_ACTIONS>>>\n- item\n<<<END_AW_ACTIONS>>>\n"
                 "  <<<AW_HANDOFF>>>\n...\n<<<END_AW_HANDOFF>>>\n"
-                "  <<<AW_TOOL_CALL>>>\nskill: code.apply_patch\nreason: ...\npath: relative/file.html\nop: write\n<<<AW_CONTENT>>>\nraw file content here\n<<<END_AW_CONTENT>>>\n<<<END_AW_TOOL_CALL>>>\n"
+                "  <<<AW_TOOL_CALL>>>\nskill: <one allowed write skill>\nreason: ...\npath: relative/file.html\nop: write\n<<<AW_CONTENT>>>\nraw file content here\n<<<END_AW_CONTENT>>>\n<<<END_AW_TOOL_CALL>>>\n"
                 "- Return ONLY the JSON object when emitting tool_calls; do not wrap it in prose or markdown fences.\n"
                 "- Escape all newlines and quotes inside JSON string values.\n"
             )
@@ -1031,7 +1058,7 @@ class AgentWorkflowMemberRoute(BaseRoute):
             f"{protocol_output_contract}"
             "- For file creation/edit skills use `params.path`, not `file_path`.\n"
             "- Use only allowed skills.\n"
-            "- If this node is responsible for coding/building and `code.apply_patch` is allowed, you MUST emit tool_calls that create/modify files instead of only prose.\n"
+            "- If this node is responsible for coding/building and a write skill is allowed, you MUST emit tool_calls that create/modify files instead of only prose.\n"
             f"{protocol_clause}"
             f"{execution_clause}"
             "- Keep output plain text."
@@ -1272,6 +1299,26 @@ class AgentWorkflowMemberRoute(BaseRoute):
         handoff_text = ""
         desired_artifact_path = ""
         deferred_repo_paths: List[str] = []
+        configured_artifact_path = ""
+        tc_params_for_path = tool_config.get("params") if isinstance(tool_config.get("params"), dict) else {}
+        for key in ("path", "target", "file_path", "output_path"):
+            val = str(tc_params_for_path.get(key) or "").strip()
+            if val:
+                configured_artifact_path = _normalize_artifact_path_for_repo(val)
+                break
+        if not configured_artifact_path:
+            prompt_blob = "\n".join(
+                str(plugin_settings.get(k) or node.get(k) or "")
+                for k in ("system_prompt", "prompt", "user_prompt")
+                if str(plugin_settings.get(k) or node.get(k) or "").strip()
+            )
+            m_path = re.search(r"path\s+must\s+be\s+`([^`]+)`", prompt_blob, flags=re.IGNORECASE)
+            if not m_path:
+                m_path = re.search(r'"path"\s*:\s*"([^"]+)"', prompt_blob, flags=re.IGNORECASE)
+            if m_path:
+                configured_artifact_path = _normalize_artifact_path_for_repo(str(m_path.group(1) or "").strip())
+        if configured_artifact_path:
+            desired_artifact_path = configured_artifact_path
         if isinstance(parsed, dict):
             calls, schema_errors = self._normalize_tool_calls(parsed.get("tool_calls"), allowed_skills)
             for c0 in calls:
@@ -1299,6 +1346,36 @@ class AgentWorkflowMemberRoute(BaseRoute):
                 if isinstance(repaired, dict):
                     parsed = repaired
                     calls, schema_errors = self._normalize_tool_calls(parsed.get("tool_calls"), allowed_skills)
+            if configured_artifact_path and calls:
+                kept_calls: List[Dict[str, Any]] = []
+                dropped_wrong_path = 0
+                configured_norm = configured_artifact_path.strip().replace("\\", "/").strip("/")
+                for c in calls:
+                    if not isinstance(c, dict):
+                        continue
+                    skill_c = str(c.get("skill") or "").strip()
+                    if skill_c not in {"repo.write", "code.write_file", "code.apply_patch"}:
+                        kept_calls.append(c)
+                        continue
+                    params_c = c.get("params") if isinstance(c.get("params"), dict) else {}
+                    paths: List[str] = []
+                    if skill_c == "code.apply_patch":
+                        for op_c in params_c.get("ops") if isinstance(params_c.get("ops"), list) else []:
+                            if isinstance(op_c, dict):
+                                path_c = str(op_c.get("path") or "").strip().replace("\\", "/").strip("/")
+                                if path_c:
+                                    paths.append(path_c)
+                    else:
+                        path_c = str(params_c.get("path") or params_c.get("target") or params_c.get("file_path") or "").strip().replace("\\", "/").strip("/")
+                        if path_c:
+                            paths.append(path_c)
+                    if paths and all(p != configured_norm for p in paths):
+                        dropped_wrong_path += 1
+                        continue
+                    kept_calls.append(c)
+                if dropped_wrong_path:
+                    self._emit_diag({"member_stream": f"{self._role_display(role)}: dropped {dropped_wrong_path} write call(s) outside configured artifact path {configured_artifact_path}"})
+                calls = kept_calls
             if calls:
                 if repo_scope_intent:
                     safe_calls: List[Dict[str, Any]] = []
@@ -1443,14 +1520,24 @@ class AgentWorkflowMemberRoute(BaseRoute):
                 tool_results = self._merge_repo_read_chunks(tool_results, allowed_skills, req)
 
         tool_ok = any(bool((tr or {}).get("ok")) for tr in tool_results if isinstance(tr, dict))
+        def _contentful_write_result(tr: Dict[str, Any]) -> bool:
+            skill_name = str(tr.get("skill") or "").strip()
+            data = tr.get("data") if isinstance(tr.get("data"), dict) else {}
+            if skill_name == "code.write_file":
+                try:
+                    return int(data.get("size_bytes") or 0) > 0
+                except Exception:
+                    return False
+            return (
+                skill_name in {"repo.write", "code.apply_patch", "pdf.fill_form_fields"}
+                or bool(data.get("changed_files"))
+                or bool(data.get("output_path"))
+            )
+
         write_ok = any(
             isinstance(tr, dict)
             and bool(tr.get("ok"))
-            and (
-                str(tr.get("skill") or "").strip() in {"repo.write", "code.apply_patch", "pdf.fill_form_fields"}
-                or bool((tr.get("data") if isinstance(tr.get("data"), dict) else {}).get("changed_files"))
-                or bool((tr.get("data") if isinstance(tr.get("data"), dict) else {}).get("output_path"))
-            )
+            and _contentful_write_result(tr)
             for tr in tool_results
         )
         changed_write_files: List[str] = []
@@ -1514,13 +1601,13 @@ class AgentWorkflowMemberRoute(BaseRoute):
                     write_ok = any(
                         isinstance(tr, dict)
                         and bool(tr.get("ok"))
-                        and str(tr.get("skill") or "").strip() in {"repo.write", "code.apply_patch"}
+                        and str(tr.get("skill") or "").strip() in {"repo.write", "code.apply_patch", "code.write_file"}
                         for tr in auto_probe_results
                     ) or write_ok
                     for tr in auto_probe_results:
                         if not isinstance(tr, dict):
                             continue
-                        if str(tr.get("skill") or "").strip() not in {"repo.write", "code.apply_patch"}:
+                        if str(tr.get("skill") or "").strip() not in {"repo.write", "code.apply_patch", "code.write_file"}:
                             continue
                         data_tr = tr.get("data") if isinstance(tr.get("data"), dict) else {}
                         cfs = data_tr.get("changed_files") if isinstance(data_tr.get("changed_files"), list) else []
@@ -1581,13 +1668,13 @@ class AgentWorkflowMemberRoute(BaseRoute):
                             write_ok = any(
                                 isinstance(tr, dict)
                                 and bool(tr.get("ok"))
-                                and str(tr.get("skill") or "").strip() in {"repo.write", "code.apply_patch"}
+                                and _contentful_write_result(tr)
                                 for tr in retry_results
                             ) or write_ok
                             for tr in retry_results:
                                 if not isinstance(tr, dict):
                                     continue
-                                if str(tr.get("skill") or "").strip() not in {"repo.write", "code.apply_patch"}:
+                                if str(tr.get("skill") or "").strip() not in {"repo.write", "code.apply_patch", "code.write_file"}:
                                     continue
                                 data_tr = tr.get("data") if isinstance(tr.get("data"), dict) else {}
                                 cfs = data_tr.get("changed_files") if isinstance(data_tr.get("changed_files"), list) else []
@@ -1626,13 +1713,13 @@ class AgentWorkflowMemberRoute(BaseRoute):
                                 write_ok = any(
                                     isinstance(tr, dict)
                                     and bool(tr.get("ok"))
-                                    and str(tr.get("skill") or "").strip() in {"repo.write", "code.apply_patch"}
+                                    and _contentful_write_result(tr)
                                     for tr in retry_results2
                                 ) or write_ok
                                 for tr in retry_results2:
                                     if not isinstance(tr, dict):
                                         continue
-                                    if str(tr.get("skill") or "").strip() not in {"repo.write", "code.apply_patch"}:
+                                    if str(tr.get("skill") or "").strip() not in {"repo.write", "code.apply_patch", "code.write_file"}:
                                         continue
                                     data_tr = tr.get("data") if isinstance(tr.get("data"), dict) else {}
                                     cfs = data_tr.get("changed_files") if isinstance(data_tr.get("changed_files"), list) else []
@@ -1704,13 +1791,13 @@ class AgentWorkflowMemberRoute(BaseRoute):
                         write_ok = any(
                             isinstance(tr, dict)
                             and bool(tr.get("ok"))
-                            and str(tr.get("skill") or "").strip() in {"repo.write", "code.apply_patch"}
+                            and _contentful_write_result(tr)
                             for tr in gen_results
                         ) or write_ok
                         for tr in gen_results:
                             if not isinstance(tr, dict):
                                 continue
-                            if str(tr.get("skill") or "").strip() not in {"repo.write", "code.apply_patch"}:
+                            if str(tr.get("skill") or "").strip() not in {"repo.write", "code.apply_patch", "code.write_file"}:
                                 continue
                             data_tr = tr.get("data") if isinstance(tr.get("data"), dict) else {}
                             cfs = data_tr.get("changed_files") if isinstance(data_tr.get("changed_files"), list) else []
@@ -1725,7 +1812,60 @@ class AgentWorkflowMemberRoute(BaseRoute):
                         if not handoff_text:
                             handoff_text = "Verify the updated file and confirm the requested behavior."
 
-        if standalone_artifact_mode and build_role and write_capable and no_files_written_yet and not tool_ok:
+        if configured_artifact_path and build_role and write_capable and not write_ok:
+            artifact_path = configured_artifact_path
+            self._emit_diag({"member_stream": f"{self._role_display(role)}: forced configured artifact generation for {artifact_path}"})
+            artifact_content = self._generate_artifact_content(
+                original_request=original_request or user_text,
+                artifact_path=artifact_path,
+                max_tokens=max_tokens,
+                temp=temp,
+            )
+            if artifact_content:
+                if "code.write_file" in allowed_skills:
+                    fallback_skill = "code.write_file"
+                    fallback_params = {"path": artifact_path, "content": artifact_content, "mode": "overwrite"}
+                elif "code.apply_patch" in allowed_skills:
+                    fallback_skill = "code.apply_patch"
+                    fallback_params = {"ops": self._chunk_patch_write_ops(artifact_path, artifact_content)}
+                else:
+                    fallback_skill = "repo.write"
+                    fallback_params = {"path": artifact_path, "content": artifact_content}
+                forced_results = self._run_tool_calls(
+                    [
+                        {
+                            "skill": fallback_skill,
+                            "reason": "Forced write to configured artifact path after model omitted a valid contentful write",
+                            "params": fallback_params,
+                        }
+                    ],
+                    allowed_skills,
+                    req,
+                )
+                if forced_results:
+                    tool_results.extend(forced_results)
+                    tool_ok = any(bool((tr or {}).get("ok")) for tr in forced_results if isinstance(tr, dict)) or tool_ok
+                    write_ok = any(
+                        isinstance(tr, dict)
+                        and bool(tr.get("ok"))
+                        and _contentful_write_result(tr)
+                        for tr in forced_results
+                    ) or write_ok
+                    for tr in forced_results:
+                        if not isinstance(tr, dict):
+                            continue
+                        data_tr = tr.get("data") if isinstance(tr.get("data"), dict) else {}
+                        cfv = str(data_tr.get("path") or data_tr.get("output_path") or "").strip().replace("\\", "/")
+                        if cfv:
+                            changed_write_files.append(cfv)
+                    if not summary:
+                        summary = f"Created configured artifact '{artifact_path}'."
+                    if not actions:
+                        actions = [f"Write configured artifact {artifact_path}."]
+                    if not response_text:
+                        response_text = f"Wrote {artifact_path}."
+
+        if standalone_artifact_mode and build_role and write_capable and no_files_written_yet and not write_ok:
             artifact_path = str(desired_artifact_path or "").strip() or self._infer_artifact_path(original_request, user_text)
             self._emit_diag({"member_stream": f"{self._role_display(role)}: fallback artifact generation for {artifact_path}"})
             artifact_content = self._generate_artifact_content(
@@ -1735,15 +1875,20 @@ class AgentWorkflowMemberRoute(BaseRoute):
                 temp=temp,
             )
             if artifact_content:
+                if "code.write_file" in allowed_skills:
+                    fallback_skill = "code.write_file"
+                    fallback_params = {"path": artifact_path, "content": artifact_content, "mode": "overwrite"}
+                elif "code.apply_patch" in allowed_skills:
+                    fallback_skill = "code.apply_patch"
+                    fallback_params = {"ops": self._chunk_patch_write_ops(artifact_path, artifact_content)}
+                else:
+                    fallback_skill = "repo.write"
+                    fallback_params = {"path": artifact_path, "content": artifact_content}
                 fallback_calls = [
                     {
-                        "skill": "code.apply_patch" if "code.apply_patch" in allowed_skills else "repo.write",
+                        "skill": fallback_skill,
                         "reason": "Fallback write from raw artifact generation",
-                        "params": (
-                            {"ops": self._chunk_patch_write_ops(artifact_path, artifact_content)}
-                            if "code.apply_patch" in allowed_skills
-                            else {"path": artifact_path, "content": artifact_content}
-                        ),
+                        "params": fallback_params,
                     }
                 ]
                 extra_results = self._run_tool_calls(fallback_calls, allowed_skills, req)
@@ -2090,6 +2235,25 @@ class AgentWorkflowMemberRoute(BaseRoute):
             params = dict(params)
             if not skill:
                 continue
+            if skill == "code.apply_patch" and "code.apply_patch" not in allowed and "code.write_file" in allowed:
+                ops = params.get("ops") if isinstance(params.get("ops"), list) else []
+                if not ops:
+                    path0 = str(params.get("path") or params.get("target") or params.get("file_path") or "").strip()
+                    op0 = str(params.get("op") or "write").strip().lower()
+                    content0 = str(params.get("content") or "")
+                    if path0:
+                        ops = [{"op": op0 or "write", "path": path0, "content": content0}]
+                write_ops = [op for op in ops if isinstance(op, dict) and str(op.get("op") or "write").strip().lower() in {"write", "overwrite", "append"}]
+                if len(write_ops) == 1:
+                    op = write_ops[0]
+                    skill = "code.write_file"
+                    params = {
+                        "path": str(op.get("path") or "").strip(),
+                        "content": str(op.get("content") or ""),
+                        "mode": "append" if str(op.get("op") or "").strip().lower() == "append" else "overwrite",
+                    }
+                    if str(raw.get("target_repo_root") or "").strip():
+                        params["target_repo_root"] = str(raw.get("target_repo_root") or "").strip()
             if skill == "repo.read":
                 # Be resilient to model outputs that omit path/target for repo.read.
                 if not str(params.get("path") or params.get("target") or "").strip():
@@ -2271,6 +2435,14 @@ class AgentWorkflowMemberRoute(BaseRoute):
                 reason_s = str(reason if reason is not None else why if why is not None else "").strip()
                 out.append({"skill": "code.apply_patch", "params": patch_params, "reason": reason_s or "Translated from repo.write"})
                 continue
+            if skill == "repo.write" and "code.write_file" in allowed and "repo.write" not in allowed:
+                path = str(params.get("path") or params.get("target") or params.get("file_path") or "").strip()
+                content = str(params.get("content") or "")
+                reason = row.get("reason")
+                why = row.get("why")
+                reason_s = str(reason if reason is not None else why if why is not None else "").strip()
+                out.append({"skill": "code.write_file", "params": {"path": path, "content": content, "mode": "overwrite"}, "reason": reason_s or "Translated from repo.write"})
+                continue
             if skill == "code.apply_patch":
                 ops = params.get("ops")
                 if not isinstance(ops, list):
@@ -2295,6 +2467,21 @@ class AgentWorkflowMemberRoute(BaseRoute):
                         else:
                             new_ops.append(dict(op))
                     params["ops"] = new_ops
+                if "code.apply_patch" not in allowed and "code.write_file" in allowed:
+                    write_ops = [
+                        op for op in (params.get("ops") if isinstance(params.get("ops"), list) else [])
+                        if isinstance(op, dict) and str(op.get("op") or "write").strip().lower() in {"write", "overwrite", "append"}
+                    ]
+                    if len(write_ops) == 1:
+                        op = write_ops[0]
+                        path = str(op.get("path") or "").strip()
+                        content = str(op.get("content") or "")
+                        mode = "append" if str(op.get("op") or "").strip().lower() == "append" else "overwrite"
+                        reason = row.get("reason")
+                        why = row.get("why")
+                        reason_s = str(reason if reason is not None else why if why is not None else "").strip()
+                        out.append({"skill": "code.write_file", "params": {"path": path, "content": content, "mode": mode}, "reason": reason_s or "Translated from code.apply_patch"})
+                        continue
             if skill not in allowed:
                 errs.append(f"tool_call_{i}_skill_not_allowed:{skill}")
                 continue
@@ -2370,7 +2557,7 @@ class AgentWorkflowMemberRoute(BaseRoute):
             "Return TAGGED protocol only.\n"
             f"Allowed skills: {allow}\n"
             "You MUST emit concrete tool calls now.\n"
-            "If you already have enough repo context, emit code.apply_patch or repo.write for the real file path.\n"
+            "If you already have enough repo context, emit one allowed write skill for the real file path.\n"
             "If you still need one more inspection, emit repo.read for the exact file path.\n"
             "Do not create artifact.txt or any standalone artifact.\n"
             "Do not output prose outside the tagged blocks."
@@ -2420,9 +2607,9 @@ class AgentWorkflowMemberRoute(BaseRoute):
             "Return TAGGED protocol only.\n"
             f"Allowed skills: {allow}\n"
             "You MUST emit exactly one write-capable tool call now.\n"
-            "Prefer skill: code.apply_patch.\n"
+            "Prefer the write skill named in Allowed skills.\n"
             "Use the actual repo file path from the provided FILE blocks.\n"
-            "If the file is small, rewrite the full updated file using code.apply_patch with op: write.\n"
+            "If the file is small, rewrite the full updated file with op: write.\n"
             "Do not ask for more context. Do not output analysis-only text. Do not create artifact.txt."
         )
         repair_user = "Edit the following repo file(s) to satisfy the request:\n\n" + "\n\n".join(file_blocks)
@@ -2828,6 +3015,26 @@ class AgentWorkflowMemberRoute(BaseRoute):
                 body,
                 flags=re.DOTALL | re.IGNORECASE,
             )
+            body_stripped = str(body_wo_content or "").strip()
+            json_call: Dict[str, Any] | None = None
+            if body_stripped.startswith("{"):
+                try:
+                    parsed_call = json.loads(body_stripped)
+                except Exception:
+                    parsed_call = self._extract_json_block(body_stripped)
+                if isinstance(parsed_call, dict):
+                    json_call = parsed_call
+            if isinstance(json_call, dict):
+                skill = str(json_call.get("skill") or "").strip()
+                if not skill:
+                    continue
+                params0 = json_call.get("params") if isinstance(json_call.get("params"), dict) else {}
+                params = dict(params0)
+                if content and not str(params.get("content") or "").strip():
+                    params["content"] = content
+                reason = str(json_call.get("reason") or json_call.get("why") or "").strip()
+                tool_calls.append({"skill": skill, "reason": reason, "params": params})
+                continue
             meta: Dict[str, str] = {}
             for ln in body_wo_content.splitlines():
                 if ":" not in ln:
@@ -3332,7 +3539,7 @@ class AgentWorkflowMemberRoute(BaseRoute):
             "Rewrite the prior output into TAGGED protocol only.\n"
             "Do not use JSON.\n"
             "Use sections like <<<AW_SUMMARY>>> ... <<<END_AW_SUMMARY>>> and <<<AW_TOOL_CALL>>> blocks.\n"
-            "For file writes, prefer skill: code.apply_patch with path/op and raw content inside <<<AW_CONTENT>>>.\n"
+            "For file writes, prefer the write skill named in Allowed skills with path/op and raw content inside <<<AW_CONTENT>>>.\n"
             "Do not add markdown fences."
         )
         rewrite_user = f"Rewrite this output into tagged protocol:\n{source_text}"
