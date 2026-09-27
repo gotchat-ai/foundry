@@ -46,12 +46,31 @@ def _template(value: Any, params: Dict[str, Any], ctx: Dict[str, Any]) -> Any:
     pid = str(params.get("pid") or ctx.get("pid") or "").strip()
     sid = str(params.get("sid") or ctx.get("sid") or "").strip()
     request_text = str(ctx.get("user_text") or ctx.get("original_request") or params.get("request_text") or params.get("text") or "").strip()
+
+    def _stringify_context(raw: Any) -> str:
+        if raw in (None, "", [], {}):
+            return ""
+        if isinstance(raw, str):
+            return raw.strip()
+        try:
+            return json.dumps(raw, ensure_ascii=False, default=str)
+        except Exception:
+            return str(raw or "").strip()
+
+    previous_step_context = _stringify_context(
+        params.get("previous_step_context")
+        or params.get("agent_flow_previous_output_text")
+        or params.get("agent_flow_previous_step_report")
+        or ext.get("agent_flow_previous_output_text")
+        or ext.get("agent_flow_previous_step_report")
+    )
     return (
         value.replace("{run_id}", run_id)
         .replace("{pid}", pid)
         .replace("{sid}", sid)
         .replace("{request_text}", request_text)
         .replace("{original_request}", request_text)
+        .replace("{previous_step_context}", previous_step_context)
     )
 
 
@@ -77,16 +96,37 @@ def _base_url(ctx: Dict[str, Any], params: Dict[str, Any]) -> str:
     ).rstrip("/")
 
 
-def _http_json(base: str, token: str, method: str, path: str, payload: Any = None, *, enabled_plugins: str = "agent_flow", timeout: int = 120) -> Dict[str, Any]:
+def _scoped_headers(token: str, enabled_plugins: str, *, pid: str = "", sid: str = "") -> Dict[str, str]:
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "X-Gui-Enabled-Plugins": enabled_plugins,
+    }
+    if pid:
+        headers["X-Project-Id"] = str(pid)
+    if sid:
+        headers["X-Session-Id"] = str(sid)
+    return headers
+
+
+def _force_scope(ext: Dict[str, Any], pid: str, sid: str) -> Dict[str, Any]:
+    scoped = dict(ext or {})
+    scoped["project_id"] = pid
+    scoped["pid"] = pid
+    scoped["__pid"] = pid
+    scoped["session_id"] = sid
+    scoped["session-id"] = sid
+    scoped["sid"] = sid
+    scoped["__sid"] = sid
+    return scoped
+
+
+def _http_json(base: str, token: str, method: str, path: str, payload: Any = None, *, enabled_plugins: str = "agent_flow", timeout: int = 120, pid: str = "", sid: str = "") -> Dict[str, Any]:
     data = None if payload is None else json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         base + path,
         data=data,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-            "X-Gui-Enabled-Plugins": enabled_plugins,
-        },
+        headers=_scoped_headers(token, enabled_plugins, pid=pid, sid=sid),
         method=method,
     )
     try:
@@ -102,16 +142,11 @@ def _http_json(base: str, token: str, method: str, path: str, payload: Any = Non
         raise RuntimeError(f"{method} {path} -> HTTP {getattr(exc, 'code', 'error')}: {body[:500]}") from exc
 
 
-def _consume_sse(base: str, token: str, path: str, payload: Dict[str, Any], *, enabled_plugins: str, timeout: int = 0) -> Dict[str, Any]:
+def _consume_sse(base: str, token: str, path: str, payload: Dict[str, Any], *, enabled_plugins: str, timeout: int = 0, pid: str = "", sid: str = "") -> Dict[str, Any]:
     req = urllib.request.Request(
         base + path,
         data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream",
-            "X-Gui-Enabled-Plugins": enabled_plugins,
-        },
+        headers={**_scoped_headers(token, enabled_plugins, pid=pid, sid=sid), "Accept": "text/event-stream"},
         method="POST",
     )
     chunks: List[str] = []
@@ -272,32 +307,87 @@ def _configured_parallel(app: Any) -> int:
     return 1
 
 
-def _cap_for_backend(app: Any, params: Dict[str, Any]) -> Dict[str, Any]:
-    if params.get("max_concurrent_jobs") not in (None, ""):
-        cap = _safe_int(params.get("max_concurrent_jobs"), 3, minimum=1, maximum=64)
-        return {"cap": cap, "source": "params.max_concurrent_jobs", "backend_mode": "override"}
+def _backend_hint(params: Dict[str, Any], ctx: Dict[str, Any]) -> str:
+    settings = _dict((ctx or {}).get("settings"))
+    ext = _dict((ctx or {}).get("ext"))
+    candidates = [
+        params.get("backend_mode"),
+        params.get("backend_type"),
+        params.get("backend"),
+        params.get("source"),
+        params.get("model_location"),
+        ctx.get("backend_mode"),
+        ctx.get("backend_type"),
+        ctx.get("backend"),
+        ctx.get("source"),
+        ctx.get("model_location"),
+        ext.get("backend_mode"),
+        ext.get("backend_type"),
+        ext.get("backend"),
+        ext.get("source"),
+        ext.get("model_location"),
+        settings.get("backend_mode"),
+        settings.get("backend_type"),
+        settings.get("model_location"),
+        settings.get("remote_provider_id"),
+    ]
+    for value in candidates:
+        text = str(value or "").strip().lower()
+        if not text or text == "auto":
+            continue
+        if text in {"remote", "remote_api", "openai", "openai_api", "anthropic", "gemini", "api"}:
+            return "remote"
+        if text in {"llama_server", "local_llama_server"}:
+            return "llama_server"
+        if text in {"local", "embedded"}:
+            return text
+    return ""
 
+
+def _cap_for_backend(app: Any, params: Dict[str, Any], ctx: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    ctx = dict(ctx or {})
+    cap_source = "skills_settings.max_concurrent_jobs_or_remote_max_concurrent_jobs"
+    if params.get("max_concurrent_jobs") not in (None, ""):
+        requested_cap = _safe_int(params.get("max_concurrent_jobs"), 3, minimum=1, maximum=64)
+        cap_source = "params.max_concurrent_jobs"
+    else:
+        requested_cap = _safe_int(
+            _skill_setting(
+                app,
+                "max_concurrent_jobs",
+                _skill_setting(app, "remote_max_concurrent_jobs", 3),
+            ),
+            3,
+            minimum=1,
+            maximum=64,
+        )
     active = _active_model(app)
-    backend_mode = str(getattr(active, "backend_mode", "") or "").strip().lower()
+    backend_mode = _backend_hint(params, ctx) or str(getattr(active, "backend_mode", "") or "").strip().lower()
     if backend_mode == "llama_server":
         configured = _configured_parallel(app)
         llama_parallel = getattr(active, "parallel_slots", None)
         llama_parallel = _safe_int(llama_parallel, 0, minimum=0, maximum=64) if llama_parallel not in (None, "") else 0
         cont_batching = getattr(active, "cont_batching", None)
-        cap = configured
-        if configured <= 1 and cont_batching is not False and llama_parallel > 0:
-            cap = max(1, llama_parallel)
+        local_cap = configured
+        if cont_batching is not False and llama_parallel > 0:
+            local_cap = llama_parallel
+        local_cap = max(1, local_cap)
         return {
-            "cap": max(1, cap),
-            "source": "local_llama_server_parallel_slots",
+            "cap": min(requested_cap, local_cap),
+            "source": f"{cap_source}_clamped_by_local_llama_server",
             "backend_mode": backend_mode,
+            "requested_cap": requested_cap,
+            "local_cap": local_cap,
             "parallel_slots": llama_parallel or None,
             "per_model_parallel": configured,
             "cont_batching": cont_batching,
         }
 
-    default_remote_cap = _safe_int(_skill_setting(app, "remote_max_concurrent_jobs", 3), 3, minimum=1, maximum=64)
-    return {"cap": default_remote_cap, "source": "skills_settings.remote_max_concurrent_jobs", "backend_mode": backend_mode or "remote_or_unknown"}
+    return {
+        "cap": requested_cap,
+        "source": cap_source,
+        "backend_mode": backend_mode or "remote_or_unknown",
+    }
 
 
 def _runtime_state(app: Any) -> Dict[str, Any]:
@@ -327,7 +417,8 @@ def _route_lock(app: Any, route_id: str) -> threading.Lock:
         return lock
 
 
-def _active_job_ids(app: Any) -> set[str]:
+def _active_job_ids(app: Any, exclude: set[str] | None = None, *, include_external: bool = False) -> set[str]:
+    exclude = {str(x or "").strip() for x in (exclude or set()) if str(x or "").strip()}
     ids: set[str] = set()
     runtime = _runtime_state(app)
     now = time.time()
@@ -343,30 +434,34 @@ def _active_job_ids(app: Any) -> set[str]:
             if now - float(row.get("started_ts") or now) > 24 * 3600:
                 active.pop(job_id, None)
                 continue
-            ids.add(str(job_id))
-    try:
-        reg = getattr(getattr(app, "state", None), "ai_jobs", None)
-        rows = reg.snapshot() if reg is not None and hasattr(reg, "snapshot") else []
-        for row in rows or []:
-            if not isinstance(row, dict):
-                continue
-            status = str(row.get("status") or row.get("state") or "").strip().lower()
-            if status in {"queued", "running", "pending"}:
-                jid = str(row.get("job_id") or "").strip()
-                if jid:
-                    ids.add(jid)
-    except Exception:
-        pass
+            key = str(job_id)
+            if key not in exclude:
+                ids.add(key)
+    if include_external:
+        try:
+            reg = getattr(getattr(app, "state", None), "ai_jobs", None)
+            snapshot = reg.snapshot() if reg is not None and hasattr(reg, "snapshot") else []
+            for row in snapshot or []:
+                if not isinstance(row, dict):
+                    continue
+                job_id = str(row.get("job_id") or row.get("id") or "").strip()
+                if not job_id or job_id in exclude:
+                    continue
+                status = str(row.get("status") or "").strip().lower()
+                if status in {"running", "processing", "in_progress", "started", "active"}:
+                    ids.add(job_id)
+        except Exception:
+            pass
     return ids
 
 
-def _active_count(app: Any) -> int:
-    return len(_active_job_ids(app))
+def _active_count(app: Any, exclude: set[str] | None = None, *, include_external: bool = False) -> int:
+    return len(_active_job_ids(app, exclude=exclude, include_external=include_external))
 
 
-def _reserve(app: Any, job_id: str, meta: Dict[str, Any], cap: int) -> bool:
+def _reserve(app: Any, job_id: str, meta: Dict[str, Any], cap: int, *, exclude: set[str] | None = None, include_external: bool = False) -> bool:
     runtime = _runtime_state(app)
-    registry_ids = _active_job_ids(app)
+    registry_ids = _active_job_ids(app, exclude=exclude, include_external=include_external)
     registry_ids.discard(str(job_id))
     if len(registry_ids) >= cap:
         return False
@@ -375,7 +470,8 @@ def _reserve(app: Any, job_id: str, meta: Dict[str, Any], cap: int) -> bool:
         for old_id, row in list(active.items()):
             if not isinstance(row, dict) or row.get("done"):
                 active.pop(old_id, None)
-        if len(active) >= cap:
+        active_count = len([old_id for old_id in active if str(old_id) not in (exclude or set())])
+        if active_count >= cap:
             return False
         active[job_id] = {**meta, "started_ts": time.time(), "done": False}
         return True
@@ -441,13 +537,38 @@ def _job_snapshot(app: Any, job_ids: List[str] | None = None) -> List[Dict[str, 
             rows.append(dict(row))
     except Exception:
         pass
+    seen = {str(row.get("job_id") or "").strip() for row in rows if isinstance(row, dict)}
+    try:
+        runtime = _runtime_state(app)
+        with runtime["lock"]:
+            active = dict(runtime.get("active") or {})
+        for jid, row in active.items():
+            job_id = str(jid or "").strip()
+            if not job_id or job_id in seen:
+                continue
+            if wanted and job_id not in wanted:
+                continue
+            meta = dict(row) if isinstance(row, dict) else {}
+            rows.append(
+                {
+                    "job_id": job_id,
+                    "status": "running",
+                    "state": "running",
+                    "kind": str(meta.get("kind") or ""),
+                    "pid": str(meta.get("pid") or ""),
+                    "sid": str(meta.get("sid") or ""),
+                    "reserved": True,
+                }
+            )
+    except Exception:
+        pass
     return rows
 
 
-def _status_summary(app: Any, params: Dict[str, Any], cap: int, cap_info: Dict[str, Any]) -> Dict[str, Any]:
+def _status_summary(app: Any, params: Dict[str, Any], cap: int, cap_info: Dict[str, Any], *, include_external: bool = False) -> Dict[str, Any]:
     job_ids = [str(_template(x, params, {}) or "").strip() for x in _list(params.get("job_ids")) if str(_template(x, params, {}) or "").strip()]
     jobs = _job_snapshot(app, job_ids if job_ids else None)
-    active = _active_count(app)
+    active = _active_count(app, include_external=include_external)
     return {
         "action": "status",
         "active": active,
@@ -455,6 +576,7 @@ def _status_summary(app: Any, params: Dict[str, Any], cap: int, cap_info: Dict[s
         "available": max(0, cap - active),
         "can_spawn": active < cap,
         "cap_info": cap_info,
+        "include_external_active_jobs": include_external,
         "jobs": jobs,
     }
 
@@ -473,7 +595,7 @@ def _wait_for_jobs(app: Any, params: Dict[str, Any], cap: int, cap_info: Dict[st
             for missing in [jid for jid in job_ids if jid not in seen]:
                 jobs.append({"job_id": missing, "status": "missing"})
         statuses = [str(row.get("status") or row.get("state") or "").strip().lower() for row in jobs]
-        if jobs and all(status in terminal or status == "missing" for status in statuses):
+        if jobs and all(status in terminal for status in statuses):
             break
         if timeout_s <= 0 or time.time() >= deadline:
             break
@@ -697,6 +819,7 @@ def _project_flow_map(pid: str, flow_name: str) -> Dict[str, Any]:
 
 
 def _spawn_workflow(app: Any, base: str, token: str, job_id: str, pid: str, sid: str, text: str, ext: Dict[str, Any], job: Dict[str, Any], username: str) -> None:
+    ext = _force_scope(ext, pid, sid)
     flow_name = str(job.get("flow_name") or ext.get("agent_flow_active_flow") or ext.get("agent_flow_default_flow") or "").strip()
     flows = job.get("flows") if isinstance(job.get("flows"), dict) else ext.get("agent_flow_flows")
     if not isinstance(flows, dict) and flow_name:
@@ -714,7 +837,7 @@ def _spawn_workflow(app: Any, base: str, token: str, job_id: str, pid: str, sid:
     run_id = ""
     final_state: Dict[str, Any] = {}
     try:
-        run = _http_json(base, token, "POST", f"/v1/projects/{pid}/sessions/{sid}/agent_flow/run", {"text": text, "ext": ext}, enabled_plugins=enabled, timeout=180)
+        run = _http_json(base, token, "POST", f"/v1/projects/{pid}/sessions/{sid}/agent_flow/run", {"text": text, "ext": ext}, enabled_plugins=enabled, timeout=180, pid=pid, sid=sid)
         run_id = str(run.get("run_id") or "").strip()
         if run_id and run_id != job_id:
             _mark_job(app, job_id, run_id=run_id, status="running")
@@ -728,7 +851,7 @@ def _spawn_workflow(app: Any, base: str, token: str, job_id: str, pid: str, sid:
                 except Exception:
                     pass
                 break
-            st = _http_json(base, token, "GET", f"/v1/projects/{pid}/sessions/{sid}/agent_flow/status?run_id={run_id}", None, enabled_plugins=enabled, timeout=60)
+            st = _http_json(base, token, "GET", f"/v1/projects/{pid}/sessions/{sid}/agent_flow/status?run_id={run_id}", None, enabled_plugins=enabled, timeout=60, pid=pid, sid=sid)
             state = st.get("state") if isinstance(st.get("state"), dict) else {}
             final_state = state
             if not state.get("running"):
@@ -772,13 +895,18 @@ def _spawn_workflow(app: Any, base: str, token: str, job_id: str, pid: str, sid:
 
 
 def _spawn_router(app: Any, base: str, token: str, job_id: str, pid: str, sid: str, text: str, ext: Dict[str, Any], job: Dict[str, Any], username: str) -> None:
-    route_id = str(job.get("route_id") or ext.get("route_id") or "").strip()
+    ext = _force_scope(ext, pid, sid)
+    requested_kind = str(job.get("kind") or job.get("type") or "").strip().lower()
+    force_plain_chat = requested_kind in {"chat", "message", "messages"}
+    route_id = "chat" if force_plain_chat else str(job.get("route_id") or ext.get("route_id") or "").strip()
     kind = "ai_router" if route_id and route_id.lower() not in {"chat", "none", "__none__"} else "messages"
-    enabled = [str(x or "").strip() for x in _list(job.get("router_enabled_plugins") or ext.get("router_enabled_plugins")) if str(x or "").strip()]
+    enabled = [] if force_plain_chat else [str(x or "").strip() for x in _list(job.get("router_enabled_plugins") or ext.get("router_enabled_plugins")) if str(x or "").strip()]
     if route_id and route_id.lower() not in {"auto", "chat", "none", "__none__"} and route_id not in enabled:
         enabled.append(route_id)
     route_settings = _dict(ext.get("router_plugin_settings"))
     route_settings.update(_dict(job.get("router_plugin_settings")))
+    if force_plain_chat:
+        route_settings = {}
     ext["router_plugin_settings"] = route_settings
     ext["route_id"] = route_id or ext.get("route_id") or "chat"
     ext["router_enabled_plugins"] = enabled
@@ -791,6 +919,8 @@ def _spawn_router(app: Any, base: str, token: str, job_id: str, pid: str, sid: s
         "router_enabled_plugins": enabled,
         "backend_type": str(job.get("backend_type") or "auto"),
         "ext": ext,
+        "pid": pid,
+        "sid": sid,
     }
     if job.get("temperature") not in (None, ""):
         payload["temperature"] = job.get("temperature")
@@ -814,7 +944,7 @@ def _spawn_router(app: Any, base: str, token: str, job_id: str, pid: str, sid: s
             except Exception as exc:
                 direct_error = str(exc)
         if not router_result:
-            res = _consume_sse(base, token, "/v1/chat/completions_stream", payload, enabled_plugins=",".join(["ai_jobs", *enabled]) or "ai_jobs", timeout=_safe_int(job.get("timeout_s"), 0, minimum=0, maximum=86400))
+            res = _consume_sse(base, token, "/v1/chat/completions_stream", payload, enabled_plugins=",".join(["ai_jobs", *enabled]) or "ai_jobs", timeout=_safe_int(job.get("timeout_s"), 0, minimum=0, maximum=86400), pid=pid, sid=sid)
             router_result = _router_result_from_sse(res if isinstance(res, dict) else {})
         artifact_text = _summarize_router_artifacts(router_result)
         result_text = str((res or {}).get("text") or "").strip()
@@ -896,6 +1026,19 @@ def _start_background(target: Any, *args: Any) -> None:
     thread.start()
 
 
+def _queued_start(app: Any, job_id: str, meta: Dict[str, Any], cap: int, exclude: set[str], include_external: bool, target: Any, args: tuple, timeout_s: int) -> None:
+    deadline = time.time() + max(1, int(timeout_s or 86400))
+    while time.time() < deadline:
+        if _cancelled(app, job_id):
+            _mark_job(app, job_id, status="cancelled")
+            return
+        if _reserve(app, job_id, meta, cap, exclude=exclude, include_external=include_external):
+            target(*args)
+            return
+        time.sleep(1.0)
+    _mark_job(app, job_id, status="error", error="queued_start_timed_out")
+
+
 def run(ctx: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
     ctx = dict(ctx or {})
     params = dict(params or {})
@@ -904,15 +1047,26 @@ def run(ctx: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": False, "data": {}, "warnings": ["app_unavailable"]}
 
     action = str(params.get("action") or params.get("mode") or "spawn").strip().lower()
+    ext = _dict(ctx.get("ext"))
+    active_exclude = {
+        str(params.get("run_id") or "").strip(),
+        str(params.get("agent_flow_run_id") or "").strip(),
+        str(params.get("workflow_run_id") or "").strip(),
+        str(ext.get("run_id") or "").strip(),
+        str(ext.get("agent_flow_run_id") or "").strip(),
+        str(ext.get("workflow_run_id") or "").strip(),
+    }
+    active_exclude = {x for x in active_exclude if x}
 
     pid = str(params.get("pid") or ctx.get("pid") or "project2").strip() or "project2"
     username = str(params.get("username") or ctx.get("username") or "admin").strip() or "admin"
     base = _base_url(ctx, params)
-    cap_info = _cap_for_backend(app, params)
+    cap_info = _cap_for_backend(app, params, ctx)
     cap = int(cap_info.get("cap") or 3)
-    active = _active_count(app)
+    include_external_active = str(cap_info.get("backend_mode") or "").strip().lower() == "llama_server"
+    active = _active_count(app, exclude=active_exclude, include_external=include_external_active)
     if action in {"status", "capacity", "cap", "inspect"}:
-        return {"ok": True, "data": _status_summary(app, params, cap, cap_info), "warnings": []}
+        return {"ok": True, "data": _status_summary(app, params, cap, cap_info, include_external=include_external_active), "warnings": []}
     if action in {"wait", "join", "results", "result"}:
         data = _wait_for_jobs(app, params, cap, cap_info)
         warnings = ["wait_timed_out"] if data.get("timed_out") else []
@@ -943,11 +1097,9 @@ def run(ctx: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
     skipped: List[Dict[str, Any]] = []
 
     for index, job in enumerate(jobs):
-        active_before = _active_count(app)
+        if bool(params.get("keep_job_record")) and "keep_job_record" not in job:
+            job["keep_job_record"] = True
         job_id = str(_template(job.get("job_id"), params, ctx) or f"spawn_{secrets.token_hex(8)}").strip()
-        if active_before >= cap:
-            skipped.append({"index": index, "job_id": job_id, "reason": "concurrency_cap_reached", "active": active_before, "cap": cap})
-            continue
         kind = str(job.get("kind") or job.get("type") or params.get("kind") or "router").strip().lower()
         text = str(_template(job.get("text") or job.get("request_text") or job.get("prompt") or params.get("text") or params.get("request_text") or ctx.get("user_text") or ctx.get("original_request") or "", params, ctx) or "").strip()
         if not text and kind not in {"workflow"}:
@@ -958,32 +1110,42 @@ def run(ctx: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
             sid = f"{str(params.get('sid_prefix') or 'spawn').strip() or 'spawn'}_{secrets.token_hex(4)}"
         ext = _common_ext(ctx, params, job)
         _ensure_session(app, pid, sid, username)
-        if not _reserve(app, job_id, {"pid": pid, "sid": sid, "kind": kind}, cap):
-            skipped.append({"index": index, "job_id": job_id, "reason": "concurrency_cap_reached", "active": _active_count(app), "cap": cap})
-            continue
+        target = None
+        target_args: tuple = ()
         if kind in {"workflow", "agent_flow", "flow"}:
-            _start_background(_spawn_workflow, app, base, token, job_id, pid, sid, text, ext, job, username)
+            target = _spawn_workflow
+            target_args = (app, base, token, job_id, pid, sid, text, ext, job, username)
             public_kind = "agent_flow"
         elif kind in {"mpc", "generic_mpc"}:
-            _start_background(_spawn_mpc, app, job_id, pid, sid, text, ctx, job, username)
+            target = _spawn_mpc
+            target_args = (app, job_id, pid, sid, text, ctx, job, username)
             public_kind = "mpc"
         elif kind in {"router", "ai_router", "route", "plugin", "chat", "message", "ai_job"}:
-            _start_background(_spawn_router, app, base, token, job_id, pid, sid, text, ext, job, username)
+            target = _spawn_router
+            target_args = (app, base, token, job_id, pid, sid, text, ext, job, username)
             public_kind = "ai_router" if kind not in {"chat", "message"} else "messages"
         else:
-            _release(app, job_id)
             skipped.append({"index": index, "job_id": job_id, "reason": f"unsupported_kind:{kind}"})
             continue
-        spawned.append({"index": index, "job_id": job_id, "pid": pid, "sid": sid, "kind": public_kind, "status": "started"})
+        meta = {"pid": pid, "sid": sid, "kind": public_kind}
+        if _reserve(app, job_id, meta, cap, exclude=active_exclude, include_external=include_external_active):
+            _start_background(target, *target_args)
+            spawned.append({"index": index, "job_id": job_id, "pid": pid, "sid": sid, "kind": public_kind, "status": "started"})
+        else:
+            queue_timeout = _safe_int(job.get("queue_timeout_s") or params.get("queue_timeout_s"), 86400, minimum=1, maximum=86400)
+            _mark_job(app, job_id, status="queued", kind=public_kind, owner_username=username, owner_alias=username, pid=pid, sid=sid)
+            _start_background(_queued_start, app, job_id, meta, cap, active_exclude, include_external_active, target, target_args, queue_timeout)
+            spawned.append({"index": index, "job_id": job_id, "pid": pid, "sid": sid, "kind": public_kind, "status": "queued"})
 
     return {
         "ok": True,
         "data": {
             "spawned": spawned,
             "skipped": skipped,
-            "active": _active_count(app),
+            "active": _active_count(app, exclude=active_exclude, include_external=include_external_active),
             "cap": cap,
             "cap_info": cap_info,
+            "include_external_active_jobs": include_external_active,
         },
         "warnings": ["some_jobs_skipped"] if skipped else [],
     }
@@ -993,7 +1155,7 @@ TOOL_SPEC = {
     "id": NAME,
     "category": "workflow",
     "label": "Workflow: Spawn AI Job",
-    "description": "Inspect capacity, start another chat/router/MPC/Agent Flow workflow concurrently, wait for spawned job results, or build a deterministic report from preserved job records. Call action=status first when planning fan-out; spawn respects local llama-server slots or the configured remote cap.",
+    "description": "Inspect capacity, start another chat/router/MPC/Agent Flow workflow concurrently, wait for spawned job results, or build a deterministic report from preserved job records. Call action=status first when planning fan-out; remote runs use the configured skill cap, while local llama-server runs are clamped to the active model process slots.",
     "permissions": PERMISSIONS,
     "metadata": {
         "version": "1.0",
@@ -1046,7 +1208,7 @@ TOOL_SPEC = {
             "keep_job_record": {"type": "boolean"},
             "timeout_s": {"type": "integer"},
             "poll_interval_s": {"type": "number"},
-            "max_concurrent_jobs": {"type": "integer", "description": "Optional per-call override. Defaults to local llama-server parallel slots or remote skill setting."},
+            "max_concurrent_jobs": {"type": "integer", "description": "Optional requested per-call cap. Local llama-server runs are still clamped to the active model process slots."},
             "pid": {"type": "string"},
             "sid": {"type": "string"},
             "same_session": {"type": "boolean"},
