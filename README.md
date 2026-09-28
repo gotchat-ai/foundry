@@ -12,6 +12,7 @@ GotChat is already a running solution. A developer, independent builder, or vibe
 - Add protected routes, integrations, storage, tools, model behavior, and business logic with backend plugins.
 - Combine both sides into one independently installable full-stack plugin.
 - Test and improve the differentiating capability without repeatedly rebuilding the underlying chat application.
+- Built-in workflow ochestration and sub-agents spawning capability
 
 This plugin-first approach can save months of infrastructure work and debugging. It gives builders a dependable starting point while preserving the freedom to create nearly any experience the product requires.
 
